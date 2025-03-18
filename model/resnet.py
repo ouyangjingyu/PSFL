@@ -672,34 +672,36 @@ def resnet110_SFL_local_tier_7(classes, tier=5, **kwargs):
         net_glob_client: 客户端模型
         net_glob_server: 服务器端模型
     """
+    # 从kwargs中提取local_loss参数，如果不存在则默认为True
+    local_loss = kwargs.pop('local_loss', True) if 'local_loss' in kwargs else True
     if tier == 1:
         # 客户端包含所有层，服务器只有分类器
-        net_glob_client = ResNet(Bottleneck, [6, 6, 6, 6, 6, 6], num_classes=classes, tier=tier, local_loss=True, **kwargs) 
-        net_glob_server = ResNet_server(Bottleneck, [0, 0, 0, 0, 0, 0], num_classes=classes, tier=tier, local_loss=True, **kwargs)
+        net_glob_client = ResNet(Bottleneck, [6, 6, 6, 6, 6, 6], num_classes=classes, tier=tier, local_loss=local_loss, **kwargs) 
+        net_glob_server = ResNet_server(Bottleneck, [0, 0, 0, 0, 0, 0], num_classes=classes, tier=tier, local_loss=local_loss, **kwargs)
     elif tier == 2:
         # 客户端到layer5，服务器包含layer6
-        net_glob_client = ResNet(Bottleneck, [6, 6, 6, 6, 6, 0], num_classes=classes, tier=tier, local_loss=True, **kwargs) 
-        net_glob_server = ResNet_server(Bottleneck, [0, 0, 0, 0, 0, 6], num_classes=classes, tier=tier, local_loss=True, **kwargs)
+        net_glob_client = ResNet(Bottleneck, [6, 6, 6, 6, 6, 0], num_classes=classes, tier=tier, local_loss=local_loss, **kwargs) 
+        net_glob_server = ResNet_server(Bottleneck, [0, 0, 0, 0, 0, 6], num_classes=classes, tier=tier, local_loss=local_loss, **kwargs)
     elif tier == 3:
         # 客户端到layer4，服务器包含layer5和layer6
-        net_glob_client = ResNet(Bottleneck, [6, 6, 6, 6, 0, 0], num_classes=classes, tier=tier, local_loss=True, **kwargs) 
-        net_glob_server = ResNet_server(Bottleneck, [0, 0, 0, 0, 6, 6], num_classes=classes, tier=tier, local_loss=True, **kwargs)
+        net_glob_client = ResNet(Bottleneck, [6, 6, 6, 6, 0, 0], num_classes=classes, tier=tier, local_loss=local_loss, **kwargs) 
+        net_glob_server = ResNet_server(Bottleneck, [0, 0, 0, 0, 6, 6], num_classes=classes, tier=tier, local_loss=local_loss, **kwargs)
     elif tier == 4:
         # 客户端到layer3，服务器包含layer4、layer5和layer6
-        net_glob_client = ResNet(Bottleneck, [6, 6, 6, 0, 0, 0], num_classes=classes, tier=tier, local_loss=True, **kwargs) 
-        net_glob_server = ResNet_server(Bottleneck, [0, 0, 0, 6, 6, 6], num_classes=classes, tier=tier, local_loss=True, **kwargs)
+        net_glob_client = ResNet(Bottleneck, [6, 6, 6, 0, 0, 0], num_classes=classes, tier=tier, local_loss=local_loss, **kwargs) 
+        net_glob_server = ResNet_server(Bottleneck, [0, 0, 0, 6, 6, 6], num_classes=classes, tier=tier, local_loss=local_loss, **kwargs)
     elif tier == 5:
         # 客户端到layer2，服务器包含layer3、layer4、layer5和layer6
-        net_glob_client = ResNet(Bottleneck, [6, 6, 0, 0, 0, 0], num_classes=classes, tier=tier, local_loss=True, **kwargs)
-        net_glob_server = ResNet_server(Bottleneck, [0, 0, 6, 6, 6, 6], num_classes=classes, tier=tier, local_loss=True, **kwargs)
+        net_glob_client = ResNet(Bottleneck, [6, 6, 0, 0, 0, 0], num_classes=classes, tier=tier, local_loss=local_loss, **kwargs)
+        net_glob_server = ResNet_server(Bottleneck, [0, 0, 6, 6, 6, 6], num_classes=classes, tier=tier, local_loss=local_loss, **kwargs)
     elif tier == 6:
         # 客户端到layer1，服务器包含layer2、layer3、layer4、layer5和layer6
-        net_glob_client = ResNet(Bottleneck, [6, 0, 0, 0, 0, 0], num_classes=classes, tier=tier, local_loss=True, **kwargs) 
-        net_glob_server = ResNet_server(Bottleneck, [0, 6, 6, 6, 6, 6], num_classes=classes, tier=tier, local_loss=True, **kwargs)
+        net_glob_client = ResNet(Bottleneck, [6, 0, 0, 0, 0, 0], num_classes=classes, tier=tier, local_loss=local_loss, **kwargs) 
+        net_glob_server = ResNet_server(Bottleneck, [0, 6, 6, 6, 6, 6], num_classes=classes, tier=tier, local_loss=local_loss, **kwargs)
     elif tier == 7:
         # 客户端只有基础层，服务器包含所有层
-        net_glob_client = ResNet(Bottleneck, [0, 0, 0, 0, 0, 0], num_classes=classes, tier=tier, local_loss=True, **kwargs)
-        net_glob_server = ResNet_server(Bottleneck, [6, 6, 6, 6, 6, 6], num_classes=classes, tier=tier, local_loss=True, **kwargs)
+        net_glob_client = ResNet(Bottleneck, [0, 0, 0, 0, 0, 0], num_classes=classes, tier=tier, local_loss=local_loss, **kwargs)
+        net_glob_server = ResNet_server(Bottleneck, [6, 6, 6, 6, 6, 6], num_classes=classes, tier=tier, local_loss=local_loss, **kwargs)
 
     return net_glob_client, net_glob_server
 

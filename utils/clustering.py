@@ -1,3 +1,13 @@
+import torch
+import torch.nn.functional as F
+import numpy as np
+from sklearn.cluster import KMeans
+import copy
+import random
+from torch.utils.data import TensorDataset, ConcatDataset
+from sklearn.preprocessing import StandardScaler
+from sklearn.mixture import GaussianMixture
+from sklearn.metrics import silhouette_score, calinski_harabasz_score
 def extract_behavior_features(client_models, eval_dataset, device='cuda'):
     """
     提取客户端模型在统一评估数据集上的行为特征
@@ -10,9 +20,7 @@ def extract_behavior_features(client_models, eval_dataset, device='cuda'):
     Returns:
         模型行为特征矩阵
     """
-    import torch
-    import torch.nn.functional as F
-    import numpy as np
+
     
     behavior_features = []
     
@@ -186,9 +194,7 @@ def create_proxy_dataset(client_datasets, sample_per_client=10):
     Returns:
         代理评估数据集
     """
-    import torch
-    import random
-    from torch.utils.data import TensorDataset, ConcatDataset
+
     
     proxy_datasets = []
     
@@ -230,10 +236,7 @@ def cluster_based_on_behavior(behavior_features, n_clusters=None, max_clusters=1
     Returns:
         聚类标签, 聚类中心
     """
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.mixture import GaussianMixture
-    from sklearn.metrics import silhouette_score, calinski_harabasz_score
-    import numpy as np
+
     
     # 数据规范化
     scaler = StandardScaler()
@@ -319,56 +322,97 @@ def cluster_based_on_behavior(behavior_features, n_clusters=None, max_clusters=1
     return labels, centers
 
 
-def data_distribution_aware_clustering(client_models, client_datasets=None, eval_dataset=None, 
-                                      n_clusters=None, device='cuda'):
+def data_distribution_aware_clustering(client_models, client_datasets, eval_dataset, n_clusters, device):
     """
-    数据分布感知的客户端聚类主函数
+    根据客户端模型的预测分布对客户端进行聚类
     
     Args:
         client_models: 客户端模型列表
-        client_datasets: 客户端数据集列表(用于创建代理数据集)
-        eval_dataset: 外部评估数据集(如果没有则由client_datasets创建)
-        n_clusters: 指定的聚类数量(None表示自动确定)
-        device: 计算设备
+        client_datasets: 客户端数据集列表 (可选)
+        eval_dataset: 评估数据集，用于获取模型预测分布
+        n_clusters: 聚类数量
+        device: 运行设备
         
     Returns:
-        聚类标签, 聚类信息
+        聚类标签和聚类信息
     """
-    import numpy as np
+    print("\n执行数据分布感知的客户端聚类...")
     
-    # 1. 准备评估数据集
-    if eval_dataset is None and client_datasets is not None:
-        print("正在从客户端数据集创建代理评估数据集...")
-        eval_dataset = create_proxy_dataset(client_datasets)
+    # 创建评估数据加载器
+    eval_loader = torch.utils.data.DataLoader(
+        eval_dataset, 
+        batch_size=64, 
+        shuffle=False
+    )
     
-    if eval_dataset is None:
-        raise ValueError("必须提供eval_dataset或client_datasets以创建评估数据集")
+    # 收集每个客户端模型的预测分布
+    prediction_distributions = []
     
-    # 2. 提取行为特征
-    print("正在提取客户端模型的行为特征...")
-    behavior_features = extract_behavior_features(client_models, eval_dataset, device)
+    for i, model in enumerate(client_models):
+        print(f"分析客户端 {i} 的预测分布...")
+        model.eval()
+        model.to(device)
+        
+        # 初始化预测分布
+        prediction_counts = torch.zeros(10, dtype=torch.float)  # 假设10个类别
+        total_samples = 0
+        
+        with torch.no_grad():
+            for data, _ in eval_loader:
+                data = data.to(device)
+                outputs = model(data)
+                
+                # 处理可能的元组输出
+                if isinstance(outputs, tuple):
+                    outputs = outputs[0]
+                
+                # 获取预测
+                _, predictions = torch.max(outputs, 1)
+                
+                # 更新预测计数
+                for cls in range(10):  # 假设10个类别
+                    prediction_counts[cls] += (predictions == cls).sum().item()
+                
+                total_samples += predictions.size(0)
+        
+        # 将计数转换为概率分布
+        prediction_dist = prediction_counts / total_samples
+        prediction_distributions.append(prediction_dist.cpu().numpy())
+        
+        # 打印预测分布
+        print(f"客户端 {i} 预测分布:")
+        for cls, pct in enumerate(prediction_dist.numpy()):
+            print(f"  类别 {cls}: {pct*100:.2f}%")
     
-    # 3. 基于行为特征进行聚类
-    print("正在执行数据分布感知的聚类...")
-    labels, centers = cluster_based_on_behavior(behavior_features, n_clusters)
+    # 转换为numpy数组
+    prediction_distributions = np.array(prediction_distributions)
     
-    # 4. 创建聚类分配信息
-    cluster_assignments = {}
-    for i, label in enumerate(labels):
-        if label not in cluster_assignments:
-            cluster_assignments[label] = []
-        cluster_assignments[label].append(i)
+    # 检查预测分布的异常值
+    for i, dist in enumerate(prediction_distributions):
+        max_prob = np.max(dist)
+        if max_prob > 0.5:  # 如果某一类别预测概率超过50%
+            print(f"警告: 客户端 {i} 预测严重不平衡，最高类别占比 {max_prob*100:.2f}%")
     
-    # 5. 针对每个聚类分析tier分布情况
-    if hasattr(client_models[0], 'tier'):
-        print("\n各聚类的tier分布:")
-        for cluster_id, client_indices in cluster_assignments.items():
-            tier_counts = {}
-            for idx in client_indices:
-                tier = client_models[idx].tier
-                tier_counts[tier] = tier_counts.get(tier, 0) + 1
-            
-            print(f"聚类 {cluster_id} tier分布: {tier_counts}")
+    # 使用KMeans聚类
+    from sklearn.cluster import KMeans
+    print(f"执行KMeans聚类 (n_clusters={n_clusters})...")
+    kmeans = KMeans(n_clusters=n_clusters, random_state=0)
+    labels = kmeans.fit_predict(prediction_distributions)
     
-    return labels, cluster_assignments
-
+    # 计算聚类信息
+    cluster_info = {}
+    for i in range(n_clusters):
+        cluster_indices = np.where(labels == i)[0]
+        cluster_info[i] = {
+            'count': len(cluster_indices),
+            'indices': cluster_indices,
+            'centroid': kmeans.cluster_centers_[i]
+        }
+        
+        # 打印聚类结果
+        print(f"聚类 {i}: {len(cluster_indices)} 个客户端")
+        print(f"  平均预测分布:")
+        for cls, pct in enumerate(kmeans.cluster_centers_[i]):
+            print(f"    类别 {cls}: {pct*100:.2f}%")
+    
+    return labels, cluster_info

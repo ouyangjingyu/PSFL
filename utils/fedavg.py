@@ -1,115 +1,116 @@
 import torch
 import copy
 from collections import OrderedDict
+import numpy as np
 
-def aggregate_clients_models(cluster_clients, w_locals_client_idx, num_clusters, whether_local_loss, client_sample, idxs_users, **kwargs):
-    local_v2 = kwargs.get('local_v2', False)
+# def aggregate_clients_models(cluster_clients, w_locals_client_idx, num_clusters, whether_local_loss, client_sample, idxs_users, **kwargs):
+#     local_v2 = kwargs.get('local_v2', False)
     
-    # 初始化存储结构
-    largest_client = 0
-    id_largest_client = {}
-    client_model = {}
+#     # 初始化存储结构
+#     largest_client = 0
+#     id_largest_client = {}
+#     client_model = {}
     
-    # # 要忽略的层
-    # keys_to_remove = {
-    #     'classifier.fc1.weight', 'classifier.fc1.bias', 
-    #     'classifier.fc2.weight', 'classifier.fc2.bias', 
-    #     'classifier.fc3.weight', 'classifier.fc3.bias',
-    #     'module.classifier.fc1.weight', 'module.classifier.fc1.bias',
-    #     'module.classifier.fc2.weight', 'module.classifier.fc2.bias',
-    #     'module.classifier.fc3.weight', 'module.classifier.fc3.bias'
-    # }
+#     # # 要忽略的层
+#     # keys_to_remove = {
+#     #     'classifier.fc1.weight', 'classifier.fc1.bias', 
+#     #     'classifier.fc2.weight', 'classifier.fc2.bias', 
+#     #     'classifier.fc3.weight', 'classifier.fc3.bias',
+#     #     'module.classifier.fc1.weight', 'module.classifier.fc1.bias',
+#     #     'module.classifier.fc2.weight', 'module.classifier.fc2.bias',
+#     #     'module.classifier.fc3.weight', 'module.classifier.fc3.bias'
+#     # }
     
-    # 第一步：找出每个cluster中最大的客户端模型
-    for cluster_id in range(num_clusters):
-        print(f"Processing cluster {cluster_id} with clients: {cluster_clients[cluster_id]}")
+#     # 第一步：找出每个cluster中最大的客户端模型
+#     for cluster_id in range(num_clusters):
+#         print(f"Processing cluster {cluster_id} with clients: {cluster_clients[cluster_id]}")
         
-        if len(cluster_clients[cluster_id]) > 0:
-            # 初始化该cluster的最大客户端
-            max_size = -1
-            max_client = None
+#         if len(cluster_clients[cluster_id]) > 0:
+#             # 初始化该cluster的最大客户端
+#             max_size = -1
+#             max_client = None
             
-            for client_idx in cluster_clients[cluster_id]:
-                if client_idx not in w_locals_client_idx:
-                    print(f"Warning: Client {client_idx} not found in w_locals_client_idx")
-                    continue
-                # 客户端模型去除分类器部分，其余层的权重信息保留在client_model[client_idx]中    
-                if whether_local_loss and not local_v2:
-                    client_model[client_idx] = {
-                        k: v for k, v in w_locals_client_idx[client_idx].items()
-                        if 'projection' not in k
-                    }
-                else:
-                    client_model[client_idx] = w_locals_client_idx[client_idx].copy()
+#             for client_idx in cluster_clients[cluster_id]:
+#                 if client_idx not in w_locals_client_idx:
+#                     print(f"Warning: Client {client_idx} not found in w_locals_client_idx")
+#                     continue
+#                 # 客户端模型去除分类器部分，其余层的权重信息保留在client_model[client_idx]中    
+#                 if whether_local_loss and not local_v2:
+#                     client_model[client_idx] = {
+#                         k: v for k, v in w_locals_client_idx[client_idx].items()
+#                         if 'projection' not in k
+#                     }
+#                 else:
+#                     client_model[client_idx] = w_locals_client_idx[client_idx].copy()
                 
-                current_size = len(client_model[client_idx])
-                if current_size > max_size:
-                    max_size = current_size
-                    max_client = client_idx
+#                 current_size = len(client_model[client_idx])
+#                 if current_size > max_size:
+#                     max_size = current_size
+#                     max_client = client_idx
             
-            if max_client is not None:
-                id_largest_client[cluster_id] = max_client
-                # largest_client = max(largest_client, max_size)
+#             if max_client is not None:
+#                 id_largest_client[cluster_id] = max_client
+#                 # largest_client = max(largest_client, max_size)
     
-    aggregated_client_state_dict = {}
+#     aggregated_client_state_dict = {}
     
-    # 对每个cluster进行处理
-    for cluster_id in range(num_clusters):
-        if cluster_id not in id_largest_client:
-            print(f"Warning: No valid clients found in cluster {cluster_id}")
-            continue
+#     # 对每个cluster进行处理
+#     for cluster_id in range(num_clusters):
+#         if cluster_id not in id_largest_client:
+#             print(f"Warning: No valid clients found in cluster {cluster_id}")
+#             continue
             
-        largest_client_idx = id_largest_client[cluster_id]
-        aggregated_client_state_dict[cluster_id] = {}
+#         largest_client_idx = id_largest_client[cluster_id]
+#         aggregated_client_state_dict[cluster_id] = {}
         
-        # 使用字典记录每个参数的累积和和权重和
-        param_sums = {}
-        client_weights_sum = {}
+#         # 使用字典记录每个参数的累积和和权重和
+#         param_sums = {}
+#         client_weights_sum = {}
         
-        valid_clients = 0  # 记录有效客户端数量
+#         valid_clients = 0  # 记录有效客户端数量
         
-        # 对cluster中的每个客户端进行处理
-        for client_idx in cluster_clients[cluster_id]:
-            if client_idx not in client_model:
-                print(f"Skipping client {client_idx} as it has no model")
-                continue
+#         # 对cluster中的每个客户端进行处理
+#         for client_idx in cluster_clients[cluster_id]:
+#             if client_idx not in client_model:
+#                 print(f"Skipping client {client_idx} as it has no model")
+#                 continue
                 
-            valid_clients += 1
-            client_weight = client_sample[client_idx]
+#             valid_clients += 1
+#             client_weight = client_sample[client_idx]
             
-            for k, v in client_model[client_idx].items():
-                if any(classifier_key in k for classifier_key in ['projection']):
-                    continue
+#             for k, v in client_model[client_idx].items():
+#                 if any(classifier_key in k for classifier_key in ['projection']):
+#                     continue
 
-                if k not in param_sums:
-                    param_sums[k] = torch.zeros_like(v)
-                    client_weights_sum[k] = 0.0
+#                 if k not in param_sums:
+#                     param_sums[k] = torch.zeros_like(v)
+#                     client_weights_sum[k] = 0.0
                 
-                if param_sums[k].shape != v.shape:
-                    print(f"Warning: Parameter '{k}' shape mismatch. Expected {param_sums[k].shape}, got {v.shape}")
-                    continue
+#                 if param_sums[k].shape != v.shape:
+#                     print(f"Warning: Parameter '{k}' shape mismatch. Expected {param_sums[k].shape}, got {v.shape}")
+#                     continue
                 
-                if v.dtype == torch.int64:
-                    param_sums[k] = torch.maximum(param_sums[k], v)
-                else:
-                    param_sums[k] += v * client_weight
-                    client_weights_sum[k] += client_weight
+#                 if v.dtype == torch.int64:
+#                     param_sums[k] = torch.maximum(param_sums[k], v)
+#                 else:
+#                     param_sums[k] += v * client_weight
+#                     client_weights_sum[k] += client_weight
         
-        print(f"Cluster {cluster_id}: Processed {valid_clients} valid clients")
+#         print(f"Cluster {cluster_id}: Processed {valid_clients} valid clients")
         
-        # 只有当有有效客户端时才进行聚合
-        if valid_clients > 0:
-            # 计算最终的聚合结果
-            for k in param_sums:
-                if client_model[largest_client_idx][k].dtype == torch.int64:
-                    aggregated_client_state_dict[cluster_id][k] = param_sums[k]
-                else:
-                    if client_weights_sum[k] > 0:
-                        aggregated_client_state_dict[cluster_id][k] = param_sums[k] / client_weights_sum[k]
-                    else:
-                        aggregated_client_state_dict[cluster_id][k] = torch.zeros_like(param_sums[k])
+#         # 只有当有有效客户端时才进行聚合
+#         if valid_clients > 0:
+#             # 计算最终的聚合结果
+#             for k in param_sums:
+#                 if client_model[largest_client_idx][k].dtype == torch.int64:
+#                     aggregated_client_state_dict[cluster_id][k] = param_sums[k]
+#                 else:
+#                     if client_weights_sum[k] > 0:
+#                         aggregated_client_state_dict[cluster_id][k] = param_sums[k] / client_weights_sum[k]
+#                     else:
+#                         aggregated_client_state_dict[cluster_id][k] = torch.zeros_like(param_sums[k])
     
-    return aggregated_client_state_dict
+#     return aggregated_client_state_dict
  
 
 
@@ -522,3 +523,310 @@ def aggregated_fedavg(w_locals_tier, w_locals_client, num_tiers, num_users,
     print("=== 聚合完成 ===")
     
     return w_glob
+
+def weighted_average_params(param_list):
+    """计算参数的加权平均"""
+    if not param_list:
+        return None
+    
+    # 初始化为零张量
+    result = torch.zeros_like(param_list[0][0])
+    
+    # 加权求和
+    for param, weight in param_list:
+        result.add_(param * weight)
+    
+    return result
+
+
+def median_bn_params(param_list):
+    """使用中位数计算BN均值参数"""
+    if not param_list:
+        return None
+    
+    # 收集所有参数
+    params = [p[0].cpu().numpy() for p in param_list]
+    
+    # 计算中位数
+    median_param = np.median(params, axis=0)
+    
+    # 转回张量
+    result = torch.tensor(median_param, dtype=param_list[0][0].dtype, device=param_list[0][0].device)
+    
+    return result
+
+
+def robust_variance_aggregation(param_list):
+    """使用稳健方法聚合BN层方差参数"""
+    if not param_list:
+        return None
+    
+    # 收集所有参数
+    params = [p[0].cpu().numpy() for p in param_list]
+    weights = [p[1] for p in param_list]
+    
+    # 计算加权平均
+    weighted_avg = np.zeros_like(params[0])
+    for param, weight in zip(params, weights):
+        weighted_avg += param * weight
+    
+    # 限制方差参数范围
+    weighted_avg = np.clip(weighted_avg, 0.01, 5.0)
+    
+    # 转回张量
+    result = torch.tensor(weighted_avg, dtype=param_list[0][0].dtype, device=param_list[0][0].device)
+    
+    return result
+
+
+def max_bn_tracked(param_list):
+    """使用最大值聚合BN层追踪批次数参数"""
+    if not param_list:
+        return None
+    
+    # 找出最大值
+    max_val = max([p[0].item() for p in param_list])
+    
+    # 转为张量
+    result = torch.tensor(max_val, dtype=param_list[0][0].dtype, device=param_list[0][0].device)
+    
+    return result
+
+
+def intra_cluster_aggregation(client_models, client_weights, bn_fix=True):
+    """
+    聚类内部聚合方法，处理单个聚类内的客户端模型
+    
+    Args:
+        client_models: 聚类内的客户端模型参数列表
+        client_weights: 对应的客户端权重
+        bn_fix: 是否特殊处理BN层
+        
+    Returns:
+        聚合后的模型参数
+    """
+    if not client_models:
+        return None
+    
+    # 归一化权重
+    total_weight = sum(client_weights)
+    if total_weight == 0:
+        normalized_weights = [1.0/len(client_weights)] * len(client_weights)
+    else:
+        normalized_weights = [w/total_weight for w in client_weights]
+    
+    # 初始化聚合模型参数
+    aggregated_model = {}
+    
+    # 根据参数类型分组
+    bn_params = {}  # BatchNorm层参数
+    other_params = {}  # 其他参数
+    
+    # 第一步：分离BatchNorm层和其他层
+    for client_idx, model in enumerate(client_models):
+        for key, param in model.items():
+            is_bn_param = any(x in key for x in ['running_mean', 'running_var', 'num_batches_tracked'])
+            
+            if is_bn_param and bn_fix:
+                if key not in bn_params:
+                    bn_params[key] = []
+                bn_params[key].append((param, normalized_weights[client_idx]))
+            else:
+                if key not in other_params:
+                    other_params[key] = []
+                other_params[key].append((param, normalized_weights[client_idx]))
+    
+    # 第二步：聚合非BN参数 (加权平均)
+    for key, param_list in other_params.items():
+        aggregated_model[key] = weighted_average_params(param_list)
+    
+    # 第三步：特殊处理BN参数
+    if bn_fix:
+        for key, param_list in bn_params.items():
+            if 'running_mean' in key:
+                # 使用中位数而非平均值
+                aggregated_model[key] = median_bn_params(param_list)
+            elif 'running_var' in key:
+                # 使用稳健的方差聚合
+                aggregated_model[key] = robust_variance_aggregation(param_list)
+            elif 'num_batches_tracked' in key:
+                # 使用最大值
+                aggregated_model[key] = max_bn_tracked(param_list)
+    
+    return aggregated_model
+
+def aggregate_clients_models(client_clusters, client_weights, num_clusters, whether_local_loss, client_sample, idxs_users):
+    """
+    基于聚类的客户端模型聚合方法
+    
+    Args:
+        client_clusters: 客户端聚类结果
+        client_weights: 客户端模型权重字典
+        num_clusters: 聚类数量
+        whether_local_loss: 是否使用本地损失
+        client_sample: 客户端数据样本量
+        idxs_users: 参与用户索引列表
+        
+    Returns:
+        聚类聚合结果字典
+    """
+    print("\n使用改进的客户端模型聚合方法...")
+    
+    aggregated_models = {}
+    
+    # 遍历每个聚类
+    for cluster_id in client_clusters:
+        print(f"\n处理聚类 {cluster_id} 的客户端")
+        
+        # 获取当前聚类的客户端索引
+        client_indices = client_clusters[cluster_id]
+        
+        # 收集该聚类的客户端模型和权重
+        cluster_models = []
+        cluster_weights = []
+        
+        for idx in client_indices:
+            if idx in client_weights:  # 确保客户端模型存在
+                cluster_models.append(client_weights[idx])
+                
+                # 获取客户端权重 (基于样本量)
+                if idx in idxs_users.tolist():
+                    client_idx = idxs_users.tolist().index(idx)
+                    if client_idx < len(client_sample):
+                        cluster_weights.append(client_sample[client_idx])
+                    else:
+                        # 默认权重
+                        cluster_weights.append(1.0)
+                else:
+                    # 默认权重
+                    cluster_weights.append(1.0)
+        
+        # 对该聚类执行内部聚合
+        if cluster_models:
+            print(f"聚类 {cluster_id}: 聚合 {len(cluster_models)} 个客户端模型")
+            
+            # 聚合该聚类的模型
+            aggregated_models[cluster_id] = intra_cluster_aggregation(
+                client_models=cluster_models,
+                client_weights=cluster_weights,
+                bn_fix=True  # 启用BN层特殊处理
+            )
+    
+    return aggregated_models
+
+def enhanced_aggregated_fedavg(w_locals_tier, w_locals_client, num_tiers, num_users, whether_local_loss, client_sample, idxs_users, target_device='cpu'):
+    """
+    改进的联邦平均聚合函数，包含BN层特殊处理
+    
+    Args:
+        w_locals_tier: 按tier分组的本地模型权重
+        w_locals_client: 客户端模型权重列表
+        num_tiers: tier数量
+        num_users: 用户数量
+        whether_local_loss: 是否使用本地损失
+        client_sample: 客户端样本量
+        idxs_users: 参与用户索引
+        target_device: 目标设备
+        
+    Returns:
+        聚合后的全局模型权重
+    """
+    print("\n执行增强版联邦平均聚合...")
+    
+    # 初始化聚合权重
+    w_glob = {}
+    
+    # 为不同tier的聚合添加调试信息
+    for tier in range(1, num_tiers+1):
+        if not w_locals_client:
+            print(f"警告: Tier {tier} 没有客户端权重")
+            continue
+        
+        print(f"\n处理 Tier {tier} 的客户端聚合...")
+        
+        # 获取当前tier的客户端索引和权重
+        current_tier_indices = []
+        current_tier_weights = []
+        
+        for i, idx in enumerate(idxs_users):
+            if i < len(idxs_users) and client_tier[idx] == tier:
+                if i < len(client_sample):  # 确保索引有效
+                    current_tier_indices.append(i)
+                    current_tier_weights.append(client_sample[i])
+        
+        if not current_tier_indices:
+            print(f"Tier {tier} 没有活跃客户端，跳过")
+            continue
+        
+        print(f"Tier {tier} 有 {len(current_tier_indices)} 个活跃客户端")
+        
+        # 收集当前tier的客户端权重
+        w_current_tier = [w_locals_client[i] for i in current_tier_indices]
+        
+        # 归一化权重
+        total_weight = sum(current_tier_weights)
+        if total_weight > 0:
+            normalized_weights = [w/total_weight for w in current_tier_weights]
+        else:
+            normalized_weights = [1.0/len(current_tier_weights)] * len(current_tier_weights)
+        
+        # 执行特殊的BN层聚合
+        if w_current_tier:
+            w_tier = {}
+            
+            # 获取第一个模型的所有键作为基础
+            keys = w_current_tier[0].keys()
+            
+            for k in keys:
+                # 检查是否是BN层参数
+                is_bn = 'running_mean' in k or 'running_var' in k or 'num_batches_tracked' in k
+                
+                if is_bn:
+                    # 收集该参数的所有值
+                    values = [model[k] for model in w_current_tier if k in model]
+                    weights = normalized_weights[:len(values)]
+                    
+                    if 'running_mean' in k:
+                        # 打印方差范围
+                        min_val = min(tensor.min().item() for tensor in values)
+                        max_val = max(tensor.max().item() for tensor in values)
+                        print(f"  {k}: mean范围 [{min_val:.4f}, {max_val:.4f}]")
+                        
+                        if max_val > 2.0 or min_val < -2.0:
+                            # 使用中位数聚合
+                            stacked = torch.stack(values)
+                            median_val, _ = torch.median(stacked, dim=0)
+                            w_tier[k] = torch.clamp(median_val, min=-2.0, max=2.0)
+                        else:
+                            # 常规加权平均
+                            w_tier[k] = sum(w * v for w, v in zip(weights, values)) / sum(weights)
+                            
+                    elif 'running_var' in k:
+                        # 打印方差范围
+                        min_val = min(tensor.min().item() for tensor in values)
+                        max_val = max(tensor.max().item() for tensor in values)
+                        print(f"  {k}: var范围 [{min_val:.4f}, {max_val:.4f}]")
+                        
+                        if max_val > 5.0 or min_val < 0.01:
+                            print(f"  修复 {k} 的异常方差值")
+                            # 特殊处理方差
+                            w_tier[k] = sum(w * torch.clamp(v, min=0.01, max=5.0) for w, v in zip(weights, values)) / sum(weights)
+                        else:
+                            # 常规加权平均
+                            w_tier[k] = sum(w * v for w, v in zip(weights, values)) / sum(weights)
+                            
+                    elif 'num_batches_tracked' in k:
+                        # 使用最大值
+                        w_tier[k] = max(values)
+                else:
+                    # 非BN层参数，常规加权平均
+                    w_tier[k] = sum(w * model[k] for w, model in zip(normalized_weights, w_current_tier) if k in model) / sum(normalized_weights)
+            
+            # 更新全局模型
+            for k in w_tier.keys():
+                if k not in w_glob:
+                    w_glob[k] = w_tier[k]
+    
+    print("\n联邦聚合完成")
+    return w_glob
+
