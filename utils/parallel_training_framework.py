@@ -79,6 +79,10 @@ class ParallelClusterTrainer:
             'evaluation_metrics': {}
         }
         
+        # 确保全局分类器在device上
+        if 'global_classifier' in kwargs and kwargs['global_classifier'] is not None:
+            kwargs['global_classifier'] = kwargs['global_classifier'].to(device)
+        
         # 在该聚类中串行训练每个客户端
         for client_id in client_ids:
             # 如果该客户端模型不存在，跳过
@@ -86,19 +90,39 @@ class ParallelClusterTrainer:
                 print(f"客户端 {client_id} 模型不存在，跳过")
                 continue
             
-            # 获取客户端和服务器模型
-            client_model = copy.deepcopy(self.client_models[client_id]).to(device)
-            server_model = copy.deepcopy(self.server_models[client_id]).to(device)
+            # 获取客户端和服务器模型，并确保深度复制和完全转移到正确设备
+            client_model = copy.deepcopy(self.client_models[client_id])
+            server_model = copy.deepcopy(self.server_models[client_id])
+            
+            # 将模型彻底移至指定设备
+            client_model = client_model.to(device)
+            server_model = server_model.to(device)
+            
+            # 修改：确保模型的所有参数都在正确设备上（解决深层嵌套模块问题）
+            for param in client_model.parameters():
+                param.data = param.data.to(device)
+            for param in server_model.parameters():
+                param.data = param.data.to(device)
             
             # 如果存在共享分类器，使用共享分类器替换服务器模型的分类器
+            # 注意：在新架构中，服务器可能没有分类器，此处代码保留以兼容旧代码
             if self.shared_classifier is not None:
                 if hasattr(server_model, 'classifier'):
-                    server_model.classifier = copy.deepcopy(self.shared_classifier).to(device)
+                    server_classifier = copy.deepcopy(self.shared_classifier).to(device)
+                    # 确保分类器的所有参数都在正确设备上
+                    for param in server_classifier.parameters():
+                        param.data = param.data.to(device)
+                    server_model.classifier = server_classifier
                 elif hasattr(server_model, 'fc'):
-                    server_model.fc = copy.deepcopy(self.shared_classifier).to(device)
+                    server_fc = copy.deepcopy(self.shared_classifier).to(device)
+                    # 确保分类器的所有参数都在正确设备上
+                    for param in server_fc.parameters():
+                        param.data = param.data.to(device)
+                    server_model.fc = server_fc
             
             # 训练客户端
             try:
+                # 修改：确保device参数也正确传递
                 train_result = train_fn(
                     client_id=client_id,
                     client_model=client_model,
@@ -122,12 +146,23 @@ class ParallelClusterTrainer:
                 
                 # 评估客户端
                 if eval_fn is not None:
+                    # 创建评估专用的参数字典，移除训练特有的参数
+                    eval_kwargs = kwargs.copy()
+                    if 'local_epochs' in eval_kwargs:
+                        del eval_kwargs['local_epochs']  # 移除评估函数不需要的参数
+                    if 'split_rounds' in eval_kwargs:
+                        del eval_kwargs['split_rounds']  # 移除评估函数不需要的参数
+                    
+                    # 确保global_classifier参数在正确的设备上
+                    if 'global_classifier' in eval_kwargs and eval_kwargs['global_classifier'] is not None:
+                        eval_kwargs['global_classifier'] = eval_kwargs['global_classifier'].to(device)
+                    
                     eval_result = eval_fn(
                         client_id=client_id,
                         client_model=client_model,
                         server_model=server_model,
                         device=device,
-                        **kwargs
+                        **eval_kwargs
                     )
                     cluster_result['evaluation_metrics'][client_id] = eval_result
             
@@ -474,6 +509,10 @@ class TrainingCoordinator:
             self.logger.error("训练器未初始化，请先调用setup_training")
             return None, None, 0
         
+        # 添加全局分类器到kwargs
+        if self.shared_classifier is not None and 'global_classifier' not in kwargs:
+            kwargs['global_classifier'] = self.shared_classifier
+        
         # 执行并行训练
         start_time = time.time()
         self.logger.info("开始并行训练...")
@@ -503,7 +542,7 @@ class TrainingCoordinator:
         
         # 返回训练结果
         return cluster_results, client_stats, total_time
-    
+        
     def collect_trained_models(self, cluster_results):
         """
         收集训练后的模型
@@ -512,7 +551,8 @@ class TrainingCoordinator:
             cluster_results: 聚类训练结果
             
         Returns:
-            客户端模型参数字典，客户端权重字典
+            client_models_params: 客户端模型参数字典
+            client_weights: 客户端权重字典
         """
         client_models_params = {}
         client_weights = {}
@@ -521,16 +561,38 @@ class TrainingCoordinator:
             # 过滤掉错误
             if 'error' in result:
                 continue
-                
-            # 收集客户端模型
-            for client_id, model in result.get('client_models', {}).items():
-                client_models_params[client_id] = model.state_dict()
-                
-                # 基于训练数据量设置权重
-                metrics = result.get('training_metrics', {}).get(client_id, {})
-                data_size = metrics.get('data_size', 1.0)
-                client_weights[client_id] = float(data_size)
+            
+            # 收集训练指标
+            training_metrics = result.get('training_metrics', {})
+            
+            # 收集每个客户端的训练后模型状态
+            for client_id, metrics in training_metrics.items():
+                # 如果训练成功并保存了模型状态
+                if 'client_model_state' in metrics and 'server_model_state' in metrics:
+                    # 使用训练后保存的模型状态
+                    client_models_params[client_id] = metrics['client_model_state']
+                    
+                    # 基于训练数据量设置权重
+                    data_size = metrics.get('data_size', 1.0)
+                    client_weights[client_id] = float(data_size)
+                elif not isinstance(metrics, dict):
+                    # 跳过非字典类型的指标
+                    continue
+                else:
+                    # 如果没有直接保存模型状态但有模型
+                    if client_id in result.get('client_models', {}):
+                        # 获取模型状态字典
+                        model = result['client_models'][client_id]
+                        if hasattr(model, 'state_dict'):
+                            client_models_params[client_id] = model.state_dict()
+                        else:
+                            client_models_params[client_id] = model
+                        
+                        # 基于训练数据量设置权重
+                        data_size = metrics.get('data_size', 1.0)
+                        client_weights[client_id] = float(data_size)
         
+        print(f"收集到 {len(client_models_params)} 个客户端的训练后模型")
         return client_models_params, client_weights
 
 

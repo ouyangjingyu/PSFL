@@ -60,7 +60,8 @@ class UnifiedClassifier(nn.Module):
         
         for i, dim in enumerate(hidden_dims):
             layers.append(nn.Linear(prev_dim, dim))
-            layers.append(nn.BatchNorm1d(dim))
+            # 使用LayerNorm替代BatchNorm1d，避免单样本问题
+            layers.append(nn.LayerNorm(dim))
             layers.append(nn.ReLU(inplace=True))
             layers.append(nn.Dropout(dropout_rate))
             prev_dim = dim
@@ -197,29 +198,83 @@ def create_enhanced_client_model(base_model, tier, target_dim=256):
 
 
 # 创建增强的服务器模型
-def create_enhanced_server_model(base_server_model, tier, target_dim=256, num_classes=10):
-    """基于tier级别创建适当的服务器模型"""
-    # 定义不同tier级别的输入维度
-    tier_input_dims = {
-        1: 256,  # 完整的客户端模型
-        2: 256,  # 客户端到layer5
-        3: 128,  # 客户端到layer4
-        4: 128,  # 客户端到layer3
-        5: 64,   # 客户端到layer2
-        6: 64,   # 客户端到layer1
-        7: 16    # 只有基础层
-    }
+def create_enhanced_server_model(base_server_model, tier, target_dim=256, num_classes=10, classifier_mode='feature_only'):
+    """
+    基于tier级别创建适当的服务器模型
     
-    # 获取当前tier的输入维度
-    input_dim = tier_input_dims.get(tier, 64)
-    
-    # 创建增强的服务器模型
-    enhanced_model = EnhancedServerModel(
-        base_server_model,
-        input_dim,
-        target_dim,
-        [128, 64],  # 隐藏层维度
-        num_classes
-    )
+    Args:
+        base_server_model: 基础服务器模型
+        tier: tier级别
+        target_dim: 目标特征维度
+        num_classes: 类别数量
+        classifier_mode: 分类器模式，'feature_only'表示只输出特征，不包含分类器
+        
+    Returns:
+        增强的服务器模型
+    """
+    # 服务器模型现在已经输出扁平化的特征，所以不需要太多处理
+    # 创建特征提取器模型
+    if classifier_mode == 'feature_only':
+        # 只包含特征提取层，不包含分类器
+        class FeatureOnlyServerModel(nn.Module):
+            def __init__(self, base_model, target_dim):
+                super(FeatureOnlyServerModel, self).__init__()
+                self.base_model = base_model
+                self.target_dim = target_dim
+                
+                # 添加一个简单的特征适配层，确保输出维度是target_dim
+                # 避免使用BatchNorm1d，改用LayerNorm或直接使用普通激活函数
+                self.feature_adapter = nn.Sequential(
+                    nn.Linear(target_dim, target_dim),  # 恒等变换
+                    nn.LayerNorm(target_dim),  # 使用LayerNorm代替BatchNorm1d
+                    nn.ReLU(inplace=True)
+                )
+            
+            def forward(self, x):
+                # 通过基础服务器模型处理特征
+                features = self.base_model(x)
+                
+                # 应用特征适配层
+                adapted_features = self.feature_adapter(features)
+                
+                return adapted_features
+        
+        # 创建特征提取器模型并设为评估模式
+        enhanced_model = FeatureOnlyServerModel(
+            base_server_model,
+            target_dim
+        )
+        # 确保测试时是评估模式
+        enhanced_model.eval()
+    else:
+        # 包含分类器的完整服务器模型（原始实现）
+        class EnhancedServerModelWithClassifier(nn.Module):
+            def __init__(self, base_model, target_dim, hidden_dims, num_classes):
+                super(EnhancedServerModelWithClassifier, self).__init__()
+                self.base_model = base_model
+                
+                # 添加分类器
+                self.classifier = UnifiedClassifier(
+                    target_dim, hidden_dims, num_classes
+                )
+            
+            def forward(self, x):
+                # 通过基础服务器模型处理特征
+                features = self.base_model(x)
+                
+                # 通过分类器
+                logits = self.classifier(features)
+                
+                return logits
+        
+        # 创建带分类器的服务器模型
+        enhanced_model = EnhancedServerModelWithClassifier(
+            base_server_model,
+            target_dim,
+            [128, 64],  # 隐藏层维度
+            num_classes
+        )
+        # 确保测试时是评估模式
+        enhanced_model.eval()
     
     return enhanced_model

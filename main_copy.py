@@ -278,28 +278,111 @@ def create_models(args, class_num):
 
     # 为每个tier创建基础模型
     for tier in range(1, num_tiers + 1):
-        client_model, server_model = SFL_model_func(classes=class_num, tier=tier, local_loss=args.whether_local_loss)
+        # 强制设置local_loss=True，确保客户端有自己的分类器
+        client_model, server_model = SFL_model_func(classes=class_num, tier=tier, local_loss=True)
         client_base_models[tier] = client_model
         server_base_models[tier] = server_model
+        
+        # 打印每个tier的模型输入输出维度
+        # 使用dummy输入来获取输出维度
+        with torch.no_grad():
+            dummy_input = torch.randn(1, 3, 32, 32)  # 假设输入是32x32的图像
+            
+            # 获取客户端模型输出
+            client_output = client_model(dummy_input)
+            # 客户端模型应该返回(logits, features)元组
+            if isinstance(client_output, tuple):
+                client_logits, client_features = client_output
+                client_output_dim = client_features.shape[1] if len(client_features.shape) > 1 else client_features.shape[0]
+                if len(client_features.shape) > 2:  # 如果是卷积特征，需要获取通道数
+                    client_output_spatial = f"{client_features.shape[2]}x{client_features.shape[3]}"
+                    client_output_info = f"{client_output_dim} channels, {client_output_spatial}"
+                else:
+                    client_output_info = f"{client_output_dim}"
+            else:
+                print(f"警告: Tier {tier} 客户端模型没有返回特征，可能没有正确设置local_loss=True")
+                client_output_info = "未知"
+            
+            # 打印tier信息和模型维度
+            print(f"Tier {tier}:")
+            print(f"  - 客户端模型: 输入 = 3 channels, 32x32 | 输出特征 = {client_output_info} | 分类器输出 = {class_num}")
+            
+            # 服务器模型信息
+            if isinstance(client_output, tuple):
+                server_input = client_features
+            else:
+                server_input = client_output
+                
+            if isinstance(server_model, nn.Module):  # 确保是PyTorch模型
+                # 尝试获取服务器模型输出
+                try:
+                    server_output = server_model(server_input)
+                    server_output_dim = server_output.shape[1] if len(server_output.shape) > 1 else server_output.shape[0]
+                    if len(server_output.shape) > 2:  # 如果是卷积特征，需要获取通道数
+                        server_output_spatial = f"{server_output.shape[2]}x{server_output.shape[3]}"
+                        server_output_info = f"{server_output_dim} channels, {server_output_spatial}"
+                    else:
+                        server_output_info = f"{server_output_dim}"
+                    print(f"  - 服务器模型: 输入 = {client_output_info} | 输出特征 = {server_output_info}")
+                except Exception as e:
+                    print(f"  - 服务器模型: 输入 = {client_output_info} | 输出测试失败: {str(e)}")
     
-    # 创建统一分类器
-    target_dim = 256  # 统一特征维度
+    # 定义目标特征维度 - 所有服务器输出应该调整到这个维度
+    target_dim = 256
+    
+    # 创建全局统一分类器
     unified_classifier = UnifiedClassifier(target_dim, [128, 64], class_num, dropout_rate=0.5)
+    print(f"\n全局统一分类器: 输入 = {target_dim} | 隐藏层 = [128, 64] | 输出 = {class_num}")
     
-    # 增强模型，添加特征适配层和统一分类器
+    # 修改增强模型的创建方式
     enhanced_client_models = {}
     enhanced_server_models = {}
+    
     for tier in range(1, num_tiers + 1):
-        enhanced_client_models[tier] = create_enhanced_client_model(
-            client_base_models[tier], tier, target_dim=target_dim
-        )
+        # 客户端模型只需要保留原始结构，不需要添加特征适配层
+        # 因为客户端已经有了自己的分类器
+        enhanced_client_models[tier] = client_base_models[tier]
+        
+        # 服务器模型需要添加特征适配层，将输出调整为统一维度
         enhanced_server_models[tier] = create_enhanced_server_model(
-            server_base_models[tier], tier, target_dim=target_dim, num_classes=class_num
+            server_base_models[tier], 
+            tier, 
+            target_dim=target_dim, 
+            num_classes=class_num,
+            classifier_mode='feature_only'  # 服务器端只输出特征，不包含分类器
         )
+        
+        # 获取原始和增强后的维度信息
+        with torch.no_grad():
+            # 设置所有模型为评估模式，避免BatchNorm的问题
+            client_base_models[tier].eval()
+            server_base_models[tier].eval()
+            enhanced_server_models[tier].eval()
+            
+            dummy_input = torch.randn(1, 3, 32, 32)
+            client_output = client_base_models[tier](dummy_input)
+            
+            if isinstance(client_output, tuple):
+                _, client_features = client_output
+            else:
+                client_features = client_output
+                
+            # 测试服务器模型输出
+            try:
+                # 测试增强后的服务器模型
+                enhanced_server_model = enhanced_server_models[tier]
+                server_enhanced_output = enhanced_server_model(client_features)
+                server_output_dim = server_enhanced_output.shape[1] if len(server_enhanced_output.shape) > 1 else server_enhanced_output.shape[0]
+                
+                print(f"\nTier {tier} 增强模型:")
+                print(f"  - 客户端模型: 保持原始结构，有独立分类器")
+                print(f"  - 服务器模型: 添加特征适配层，将输出调整至统一维度 {server_output_dim}")
+            except Exception as e:
+                print(f"\nTier {tier} 增强模型测试失败: {str(e)}")
+                print(f"  - 客户端特征形状: {client_features.shape}")
+                print(f"  - 调试信息: 客户端tier={tier}, 期望的特征维度={target_dim}")
     
     return enhanced_client_models, enhanced_server_models, unified_classifier, init_glob_model, num_tiers
-
-
 def setup_clients(args, dataset, client_resources, client_models, server_models):
     """设置客户端管理器和客户端"""
     # 提取数据集信息
@@ -429,23 +512,32 @@ def pretrain_and_cluster(client_manager, client_models_dict, args, device):
 
 
 def train_client_function(client_id, client_model, server_model, device, 
-                         client_manager, round_idx, local_epochs=None, split_rounds=1):
-    """客户端训练函数（用于并行训练框架）"""
+                         client_manager, round_idx, global_classifier=None, local_epochs=None, split_rounds=1):
+    """客户端训练函数（用于并行训练框架）- 记录本地和全局分类器结果"""
     try:
         client = client_manager.get_client(client_id)
         if client is None:
             return {'error': f"客户端 {client_id} 不存在"}
         
+        # 确保客户端设备与传入的设备一致
+        client.device = device
+        print(f"客户端 {client_id} 使用设备: {device}")
+        
         # 记录开始时间
         start_time = time.time()
         
-        # 第1步：本地训练
-        client_state, local_stats = client.local_train(client_model, local_epochs)
+        # 第1步：本地训练 - 确保深度复制模型，避免引用相同的模型
+        client_model_copy = copy.deepcopy(client_model)
+        client_state, local_stats = client.local_train(client_model_copy, local_epochs)
         local_train_time = local_stats['time']
         
-        # 第2步：拆分学习训练
+        # 第2步：拆分学习训练 - 传递全局分类器
+        # 使用已经本地训练过的模型继续拆分学习训练
         client_state_sl, server_state, sl_stats = client.train_split_learning(
-            client_model, server_model, rounds=split_rounds
+            client_model_copy, 
+            copy.deepcopy(server_model), 
+            global_classifier=global_classifier,  # 添加全局分类器参数
+            rounds=split_rounds
         )
         sl_train_time = sl_stats['time']
         
@@ -465,20 +557,53 @@ def train_client_function(client_id, client_model, server_model, device,
         merged_stats = {
             'local_train': local_stats,
             'split_learning': sl_stats,
-            'loss': sl_stats['loss'],  # 使用拆分学习的损失作为总体损失
-            'accuracy': sl_stats['accuracy'],  # 使用拆分学习的准确率作为总体准确率
+            
+            # 全局分类器结果（用于兼容旧代码）
+            'loss': sl_stats['loss'],
+            'accuracy': sl_stats['accuracy'],
+            
+            # 本地分类器的拆分学习结果
+            'local_sl_loss': sl_stats.get('local_loss', 0),
+            'local_sl_accuracy': sl_stats.get('local_accuracy', 0),
+            
+            # 全局分类器的拆分学习结果
+            'global_sl_loss': sl_stats.get('global_loss', 0), 
+            'global_sl_accuracy': sl_stats.get('global_accuracy', 0),
+            
+            # 本地训练结果
+            'local_train_loss': local_stats.get('loss', 0),
+            'local_train_accuracy': local_stats.get('accuracy', 0),
+            
             'time': total_time,
             'local_train_time': local_train_time,
             'sl_train_time': sl_train_time,
             'data_size': data_size,
             'communication_mb': communication_size_mb,
-            'lr': local_lr
+            'lr': local_lr,
+            
+            # 保存训练后的模型状态
+            'client_model_state': client_state_sl,
+            'server_model_state': server_state
         }
         
         # 记录到wandb
         client_metrics = {
+            # 客户端本地训练结果
+            f"client_{client_id}/round_{round_idx}/local_train_loss": local_stats.get('loss', 0),
+            f"client_{client_id}/round_{round_idx}/local_train_accuracy": local_stats.get('accuracy', 0),
+            
+            # 拆分学习本地分类器结果
+            f"client_{client_id}/round_{round_idx}/local_sl_loss": sl_stats.get('local_loss', 0),
+            f"client_{client_id}/round_{round_idx}/local_sl_accuracy": sl_stats.get('local_accuracy', 0),
+            
+            # 拆分学习全局分类器结果
+            f"client_{client_id}/round_{round_idx}/global_sl_loss": sl_stats.get('global_loss', 0),
+            f"client_{client_id}/round_{round_idx}/global_sl_accuracy": sl_stats.get('global_accuracy', 0),
+            
+            # 兼容旧代码
             f"client_{client_id}/round_{round_idx}/train_loss": sl_stats['loss'],
             f"client_{client_id}/round_{round_idx}/train_accuracy": sl_stats['accuracy'],
+            
             f"client_{client_id}/round_{round_idx}/local_train_time": local_train_time,
             f"client_{client_id}/round_{round_idx}/sl_train_time": sl_train_time,
             f"client_{client_id}/round_{round_idx}/total_time": total_time,
@@ -496,32 +621,46 @@ def train_client_function(client_id, client_model, server_model, device,
         error_msg = f"客户端 {client_id} 训练失败: {str(e)}\n{traceback.format_exc()}"
         print(error_msg)
         return {'error': error_msg}
-
-
-def evaluate_client_function(client_id, client_model, server_model, device, client_manager, round_idx):
-    """客户端评估函数（用于并行训练框架）"""
+def evaluate_client_function(client_id, client_model, server_model, device, client_manager, round_idx, global_classifier=None, **kwargs):
+    """客户端评估函数（用于并行训练框架）- 记录本地和全局分类器结果"""
     try:
         client = client_manager.get_client(client_id)
         if client is None:
             return {'error': f"客户端 {client_id} 不存在"}
         
-        # 执行评估
+        # 执行评估 - 传递全局分类器
         eval_start_time = time.time()
-        eval_stats = client.evaluate(client_model, server_model)
+        eval_stats = client.evaluate(client_model, server_model, global_classifier=global_classifier)
         eval_time = time.time() - eval_start_time
         
         # 添加评估时间
         eval_stats['time'] = eval_time
         
-        # 记录到wandb
+        # 记录到wandb - 同时记录本地和全局分类器结果
         eval_metrics = {
+            # 本地分类器结果
+            f"client_{client_id}/round_{round_idx}/local_test_loss": eval_stats['local_loss'],
+            f"client_{client_id}/round_{round_idx}/local_test_accuracy": eval_stats['local_accuracy'],
+            
+            # 全局分类器结果
+            f"client_{client_id}/round_{round_idx}/global_test_loss": eval_stats['global_loss'],
+            f"client_{client_id}/round_{round_idx}/global_test_accuracy": eval_stats['global_accuracy'],
+            
+            # 兼容旧代码
             f"client_{client_id}/round_{round_idx}/test_loss": eval_stats['loss'],
             f"client_{client_id}/round_{round_idx}/test_accuracy": eval_stats['accuracy'],
+            
             f"client_{client_id}/round_{round_idx}/test_time": eval_time
         }
         
-        # 记录每个类别的准确率
-        for i, acc in enumerate(eval_stats.get('per_class_accuracy', [])):
+        # 记录本地分类器每个类别的准确率
+        for i, acc in enumerate(eval_stats.get('local_per_class_accuracy', [])):
+            eval_metrics[f"client_{client_id}/round_{round_idx}/local_class_{i}_accuracy"] = acc
+        
+        # 记录全局分类器每个类别的准确率
+        for i, acc in enumerate(eval_stats.get('global_per_class_accuracy', [])):
+            eval_metrics[f"client_{client_id}/round_{round_idx}/global_class_{i}_accuracy"] = acc
+            # 兼容旧代码
             eval_metrics[f"client_{client_id}/round_{round_idx}/class_{i}_accuracy"] = acc
         
         wandb.log(eval_metrics)
@@ -630,17 +769,36 @@ def main():
     
     # 设置共享分类器
     training_framework.set_shared_classifier(unified_classifier)
-    
-    # 创建表格来记录训练进度
+
+    # 定义更多的度量指标
     wandb.define_metric("round")
     wandb.define_metric("global/test_accuracy", step_metric="round")
     wandb.define_metric("global/test_loss", step_metric="round")
+
+    # 添加本地分类器指标
+    wandb.define_metric("client/local_train_accuracy", step_metric="round")  # 客户端本地训练准确率
+    wandb.define_metric("client/local_train_loss", step_metric="round")      # 客户端本地训练损失
+    wandb.define_metric("client/local_test_accuracy", step_metric="round")   # 客户端本地测试准确率
+    wandb.define_metric("client/local_test_loss", step_metric="round")       # 客户端本地测试损失
+
+    # 添加全局分类器指标
+    wandb.define_metric("client/global_train_accuracy", step_metric="round") # 客户端全局训练准确率
+    wandb.define_metric("client/global_train_loss", step_metric="round")     # 客户端全局训练损失
+    wandb.define_metric("client/global_test_accuracy", step_metric="round")  # 客户端全局测试准确率
+    wandb.define_metric("client/global_test_loss", step_metric="round")      # 客户端全局测试损失
+
+    # 原有指标（兼容旧代码）
     wandb.define_metric("server/avg_train_accuracy", step_metric="round")
     wandb.define_metric("server/avg_test_accuracy", step_metric="round")
     wandb.define_metric("server/training_time", step_metric="round")
-    
+
     # 为每个聚类创建表格
     for cluster_id in client_clusters.keys():
+        wandb.define_metric(f"cluster_{cluster_id}/local_train_accuracy", step_metric="round")
+        wandb.define_metric(f"cluster_{cluster_id}/local_test_accuracy", step_metric="round")
+        wandb.define_metric(f"cluster_{cluster_id}/global_train_accuracy", step_metric="round")
+        wandb.define_metric(f"cluster_{cluster_id}/global_test_accuracy", step_metric="round")
+        # 兼容原有指标
         wandb.define_metric(f"cluster_{cluster_id}/avg_train_accuracy", step_metric="round")
         wandb.define_metric(f"cluster_{cluster_id}/avg_test_accuracy", step_metric="round")
     
@@ -657,6 +815,9 @@ def main():
             max_workers=args.max_workers
         )
         
+        # 设置共享分类器
+        training_framework.set_shared_classifier(unified_classifier)
+
         # 执行并行训练
         cluster_results, client_stats, training_time = training_framework.execute_training(
             train_client_function,
@@ -751,25 +912,49 @@ def main():
         per_class_acc = [100.0 * c / t if t > 0 else 0 for c, t in zip(class_correct, class_total)]
         
         # 更新最佳准确率
+
         is_best = accuracy > best_accuracy
         if is_best:
             best_accuracy = accuracy
             # 保存最佳模型
             torch.save(global_eval_model.state_dict(), f"{args.running_name}_best_model.pth")
-        
+
         # 计算训练统计信息
-        # 1. 计算所有客户端的平均训练准确率和损失
+        # 1. 收集所有客户端的训练/测试数据
+        all_client_local_train_acc = []     # 本地分类器训练准确率
+        all_client_local_train_loss = []    # 本地分类器训练损失
+        all_client_global_train_acc = []    # 全局分类器训练准确率
+        all_client_global_train_loss = []   # 全局分类器训练损失
+
+        all_client_local_test_acc = []      # 本地分类器测试准确率
+        all_client_local_test_loss = []     # 本地分类器测试损失
+        all_client_global_test_acc = []     # 全局分类器测试准确率
+        all_client_global_test_loss = []    # 全局分类器测试损失
+
+        # 兼容原有代码
         all_client_train_acc = []
         all_client_train_loss = []
         all_client_test_acc = []
         all_client_test_loss = []
-        
+
         # 2. 计算各聚类内客户端的平均准确率和损失
-        cluster_train_metrics = defaultdict(list)
-        cluster_test_metrics = defaultdict(list)
-        
+        cluster_train_metrics = defaultdict(dict)
+        cluster_test_metrics = defaultdict(dict)
+
         # 3. 收集每个客户端的指标
         for cluster_id, clients in client_clusters.items():
+            # 初始化聚类指标列表
+            cluster_local_train_acc = []
+            cluster_local_train_loss = []
+            cluster_global_train_acc = []
+            cluster_global_train_loss = []
+            
+            cluster_local_test_acc = []
+            cluster_local_test_loss = []
+            cluster_global_test_acc = []
+            cluster_global_test_loss = []
+            
+            # 兼容原有代码
             cluster_clients_train_acc = []
             cluster_clients_train_loss = []
             cluster_clients_test_acc = []
@@ -779,6 +964,35 @@ def main():
                 # 获取训练指标
                 if client_id in client_stats:
                     client_metrics = client_stats.get(client_id, {})
+                    
+                    # 本地分类器训练指标
+                    if 'local_train_accuracy' in client_metrics:
+                        local_train_acc = client_metrics['local_train_accuracy']
+                        all_client_local_train_acc.append(local_train_acc)
+                        cluster_local_train_acc.append(local_train_acc)
+                    
+                    if 'local_train_loss' in client_metrics:
+                        local_train_loss = client_metrics['local_train_loss']
+                        all_client_local_train_loss.append(local_train_loss)
+                        cluster_local_train_loss.append(local_train_loss)
+                    
+                    # 本地分类器拆分学习指标
+                    if 'local_sl_accuracy' in client_metrics:
+                        local_sl_acc = client_metrics['local_sl_accuracy']
+                        # 这里不添加到全局列表，因为是拆分学习过程中的指标
+                    
+                    # 全局分类器训练指标（拆分学习）
+                    if 'global_sl_accuracy' in client_metrics:
+                        global_train_acc = client_metrics['global_sl_accuracy']
+                        all_client_global_train_acc.append(global_train_acc)
+                        cluster_global_train_acc.append(global_train_acc)
+                    
+                    if 'global_sl_loss' in client_metrics:
+                        global_train_loss = client_metrics['global_sl_loss']
+                        all_client_global_train_loss.append(global_train_loss)
+                        cluster_global_train_loss.append(global_train_loss)
+                    
+                    # 兼容原有代码
                     if 'accuracy' in client_metrics:
                         train_acc = client_metrics['accuracy']
                         all_client_train_acc.append(train_acc)
@@ -789,10 +1003,34 @@ def main():
                         all_client_train_loss.append(train_loss)
                         cluster_clients_train_loss.append(train_loss)
                 
-                # 获取测试指标（来自评估函数）
+                # 获取测试指标
                 for result in cluster_results.values():
                     if 'evaluation_metrics' in result and client_id in result['evaluation_metrics']:
                         test_metrics = result['evaluation_metrics'][client_id]
+                        
+                        # 本地分类器测试指标
+                        if 'local_accuracy' in test_metrics:
+                            local_test_acc = test_metrics['local_accuracy']
+                            all_client_local_test_acc.append(local_test_acc)
+                            cluster_local_test_acc.append(local_test_acc)
+                        
+                        if 'local_loss' in test_metrics:
+                            local_test_loss = test_metrics['local_loss']
+                            all_client_local_test_loss.append(local_test_loss)
+                            cluster_local_test_loss.append(local_test_loss)
+                        
+                        # 全局分类器测试指标
+                        if 'global_accuracy' in test_metrics:
+                            global_test_acc = test_metrics['global_accuracy']
+                            all_client_global_test_acc.append(global_test_acc)
+                            cluster_global_test_acc.append(global_test_acc)
+                        
+                        if 'global_loss' in test_metrics:
+                            global_test_loss = test_metrics['global_loss']
+                            all_client_global_test_loss.append(global_test_loss)
+                            cluster_global_test_loss.append(global_test_loss)
+                        
+                        # 兼容原有代码
                         if 'accuracy' in test_metrics:
                             test_acc = test_metrics['accuracy']
                             all_client_test_acc.append(test_acc)
@@ -804,56 +1042,122 @@ def main():
                             cluster_clients_test_loss.append(test_loss)
             
             # 计算聚类平均指标
+            # 本地分类器
+            if cluster_local_train_acc:
+                cluster_train_metrics[cluster_id]['local_train_accuracy'] = np.mean(cluster_local_train_acc)
+            if cluster_local_train_loss:
+                cluster_train_metrics[cluster_id]['local_train_loss'] = np.mean(cluster_local_train_loss)
+            if cluster_local_test_acc:
+                cluster_test_metrics[cluster_id]['local_test_accuracy'] = np.mean(cluster_local_test_acc)
+            if cluster_local_test_loss:
+                cluster_test_metrics[cluster_id]['local_test_loss'] = np.mean(cluster_local_test_loss)
+            
+            # 全局分类器
+            if cluster_global_train_acc:
+                cluster_train_metrics[cluster_id]['global_train_accuracy'] = np.mean(cluster_global_train_acc)
+            if cluster_global_train_loss:
+                cluster_train_metrics[cluster_id]['global_train_loss'] = np.mean(cluster_global_train_loss)
+            if cluster_global_test_acc:
+                cluster_test_metrics[cluster_id]['global_test_accuracy'] = np.mean(cluster_global_test_acc)
+            if cluster_global_test_loss:
+                cluster_test_metrics[cluster_id]['global_test_loss'] = np.mean(cluster_global_test_loss)
+            
+            # 兼容原有代码
             if cluster_clients_train_acc:
-                cluster_train_metrics[cluster_id].append(np.mean(cluster_clients_train_acc))
+                cluster_train_metrics[cluster_id]['avg_train_accuracy'] = np.mean(cluster_clients_train_acc)
             if cluster_clients_train_loss:
-                cluster_train_metrics[cluster_id].append(np.mean(cluster_clients_train_loss))
+                cluster_train_metrics[cluster_id]['avg_train_loss'] = np.mean(cluster_clients_train_loss)
             if cluster_clients_test_acc:
-                cluster_test_metrics[cluster_id].append(np.mean(cluster_clients_test_acc))
+                cluster_test_metrics[cluster_id]['avg_test_accuracy'] = np.mean(cluster_clients_test_acc)
             if cluster_clients_test_loss:
-                cluster_test_metrics[cluster_id].append(np.mean(cluster_clients_test_loss))
-        
+                cluster_test_metrics[cluster_id]['avg_test_loss'] = np.mean(cluster_clients_test_loss)
+
         # 计算全局平均指标
+        # 本地分类器
+        avg_local_train_acc = np.mean(all_client_local_train_acc) if all_client_local_train_acc else 0
+        avg_local_train_loss = np.mean(all_client_local_train_loss) if all_client_local_train_loss else 0
+        avg_local_test_acc = np.mean(all_client_local_test_acc) if all_client_local_test_acc else 0
+        avg_local_test_loss = np.mean(all_client_local_test_loss) if all_client_local_test_loss else 0
+
+        # 全局分类器
+        avg_global_train_acc = np.mean(all_client_global_train_acc) if all_client_global_train_acc else 0
+        avg_global_train_loss = np.mean(all_client_global_train_loss) if all_client_global_train_loss else 0
+        avg_global_test_acc = np.mean(all_client_global_test_acc) if all_client_global_test_acc else 0
+        avg_global_test_loss = np.mean(all_client_global_test_loss) if all_client_global_test_loss else 0
+
+        # 兼容原有代码
         avg_train_acc = np.mean(all_client_train_acc) if all_client_train_acc else 0
         avg_train_loss = np.mean(all_client_train_loss) if all_client_train_loss else 0
         avg_test_acc = np.mean(all_client_test_acc) if all_client_test_acc else 0
         avg_test_loss = np.mean(all_client_test_loss) if all_client_test_loss else 0
-        
+
         # 记录轮次时间
         round_time = time.time() - round_start_time
-        
+
         # 记录结果
         logger.info(f"全局模型测试结果 - 准确率: {accuracy:.2f}%, 损失: {test_loss:.4f}")
-        logger.info(f"服务器平均训练指标 - 准确率: {avg_train_acc:.2f}%, 损失: {avg_train_loss:.4f}")
-        logger.info(f"服务器平均测试指标 - 准确率: {avg_test_acc:.2f}%, 损失: {avg_test_loss:.4f}")
+        logger.info(f"客户端本地分类器平均训练指标 - 准确率: {avg_local_train_acc:.2f}%, 损失: {avg_local_train_loss:.4f}")
+        logger.info(f"客户端本地分类器平均测试指标 - 准确率: {avg_local_test_acc:.2f}%, 损失: {avg_local_test_loss:.4f}")
+        logger.info(f"全局分类器平均训练指标 - 准确率: {avg_global_train_acc:.2f}%, 损失: {avg_global_train_loss:.4f}")
+        logger.info(f"全局分类器平均测试指标 - 准确率: {avg_global_test_acc:.2f}%, 损失: {avg_global_test_loss:.4f}")
         logger.info(f"轮次耗时: {round_time:.2f}秒")
-        
+
         # 记录到wandb
         round_metrics = {
             "round": round_idx + 1,
+            
+            # 全局模型测试结果
             "global/test_accuracy": accuracy,
             "global/test_loss": test_loss,
             "global/best_accuracy": best_accuracy,
             "global/is_best_model": 1 if is_best else 0,
+            
+            # 客户端本地分类器平均指标
+            "client/local_train_accuracy": avg_local_train_acc,
+            "client/local_train_loss": avg_local_train_loss,
+            "client/local_test_accuracy": avg_local_test_acc,
+            "client/local_test_loss": avg_local_test_loss,
+            
+            # 全局分类器平均指标
+            "client/global_train_accuracy": avg_global_train_acc,
+            "client/global_train_loss": avg_global_train_loss,
+            "client/global_test_accuracy": avg_global_test_acc,
+            "client/global_test_loss": avg_global_test_loss,
+            
+            # 兼容原有代码
             "server/avg_train_accuracy": avg_train_acc,
             "server/avg_train_loss": avg_train_loss,
             "server/avg_test_accuracy": avg_test_acc,
             "server/avg_test_loss": avg_test_loss,
+            
             "server/training_time": training_time,
             "time/round_seconds": round_time
         }
-        
+
         # 记录每个类别的准确率
         for i, acc in enumerate(per_class_acc):
             round_metrics[f"global/class_{i}_accuracy"] = acc
-        
+
         # 记录每个聚类的指标
         for cluster_id in client_clusters.keys():
-            if cluster_id in cluster_train_metrics and cluster_train_metrics[cluster_id]:
-                round_metrics[f"cluster_{cluster_id}/avg_train_accuracy"] = cluster_train_metrics[cluster_id][0]
-            if cluster_id in cluster_test_metrics and cluster_test_metrics[cluster_id]:
-                round_metrics[f"cluster_{cluster_id}/avg_test_accuracy"] = cluster_test_metrics[cluster_id][0]
-        
+            # 本地分类器
+            if cluster_id in cluster_train_metrics and 'local_train_accuracy' in cluster_train_metrics[cluster_id]:
+                round_metrics[f"cluster_{cluster_id}/local_train_accuracy"] = cluster_train_metrics[cluster_id]['local_train_accuracy']
+            if cluster_id in cluster_test_metrics and 'local_test_accuracy' in cluster_test_metrics[cluster_id]:
+                round_metrics[f"cluster_{cluster_id}/local_test_accuracy"] = cluster_test_metrics[cluster_id]['local_test_accuracy']
+            
+            # 全局分类器
+            if cluster_id in cluster_train_metrics and 'global_train_accuracy' in cluster_train_metrics[cluster_id]:
+                round_metrics[f"cluster_{cluster_id}/global_train_accuracy"] = cluster_train_metrics[cluster_id]['global_train_accuracy']
+            if cluster_id in cluster_test_metrics and 'global_test_accuracy' in cluster_test_metrics[cluster_id]:
+                round_metrics[f"cluster_{cluster_id}/global_test_accuracy"] = cluster_test_metrics[cluster_id]['global_test_accuracy']
+            
+            # 兼容原有代码
+            if cluster_id in cluster_train_metrics and 'avg_train_accuracy' in cluster_train_metrics[cluster_id]:
+                round_metrics[f"cluster_{cluster_id}/avg_train_accuracy"] = cluster_train_metrics[cluster_id]['avg_train_accuracy']
+            if cluster_id in cluster_test_metrics and 'avg_test_accuracy' in cluster_test_metrics[cluster_id]:
+                round_metrics[f"cluster_{cluster_id}/avg_test_accuracy"] = cluster_test_metrics[cluster_id]['avg_test_accuracy']
+
         wandb.log(round_metrics)
         
         # 定期记录系统资源使用情况

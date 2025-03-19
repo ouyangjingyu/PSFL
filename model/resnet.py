@@ -236,7 +236,10 @@ class ResNet(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def forward(self, x):  
+    def forward(self, x):
+        """
+        前向传播，每个tier级别都会返回(logits, features)元组
+        """
         # Tier 1：客户端有所有层
         if self.tier == 1:  
             x = self.conv1(x)
@@ -250,16 +253,15 @@ class ResNet(nn.Module):
             x = self.layer6(x)
             
             extracted_features = x
-    
-            if self.local_loss == True:
-                x = self.avgpool(x)
-                x = x.view(x.size(0), -1)
-                x = self.projection(x)  # 对于tier 1，这将是个Identity操作
-                logits = self.classifier(x)
-                return logits, extracted_features            
             
-            return extracted_features
-    
+            # 确保每个tier都有分类器
+            x_pool = self.avgpool(x)
+            x_flat = x_pool.view(x_pool.size(0), -1)
+            x_proj = self.projection(x_flat)  # 对于tier 1，这将是个Identity操作
+            logits = self.classifier(x_proj)
+            
+            return logits, extracted_features
+        
         # Tier 2：客户端到layer5
         elif self.tier == 2:  
             x = self.conv1(x)
@@ -271,16 +273,15 @@ class ResNet(nn.Module):
             x = self.layer4(x)
             x = self.layer5(x)
             extracted_features = x
-    
-            if self.local_loss == True:
-                x = self.avgpool(x)
-                x = x.view(x.size(0), -1)
-                x = self.projection(x)  # 对于tier 2，这将是个Identity操作
-                logits = self.classifier(x)
-                return logits, extracted_features            
             
-            return extracted_features             
+            # 分类器输出
+            x_pool = self.avgpool(x)
+            x_flat = x_pool.view(x_pool.size(0), -1)
+            x_proj = self.projection(x_flat)
+            logits = self.classifier(x_proj)
             
+            return logits, extracted_features  
+        
         # Tier 3：客户端到layer4
         elif self.tier == 3: 
             x = self.conv1(x)
@@ -292,16 +293,15 @@ class ResNet(nn.Module):
             x = self.layer4(x)
             
             extracted_features = x
-    
-            if self.local_loss == True:
-                x = self.avgpool(x)
-                x = x.view(x.size(0), -1)
-                x = self.projection(x)  # 使用投影层调整维度
-                logits = self.classifier(x)
-                return logits, extracted_features            
             
-            return extracted_features      
+            # 分类器输出
+            x_pool = self.avgpool(x)
+            x_flat = x_pool.view(x_pool.size(0), -1)
+            x_proj = self.projection(x_flat)
+            logits = self.classifier(x_proj)
             
+            return logits, extracted_features
+        
         # Tier 4：客户端到layer3
         elif self.tier == 4:  
             x = self.conv1(x)
@@ -311,16 +311,15 @@ class ResNet(nn.Module):
             x = self.layer2(x)
             x = self.layer3(x)
             extracted_features = x
-    
-            if self.local_loss == True:
-                x = self.avgpool(x)
-                x = x.view(x.size(0), -1)
-                x = self.projection(x)  # 使用投影层调整维度
-                logits = self.classifier(x)
-                return logits, extracted_features            
             
-            return extracted_features              
-                        
+            # 分类器输出
+            x_pool = self.avgpool(x)
+            x_flat = x_pool.view(x_pool.size(0), -1)
+            x_proj = self.projection(x_flat)
+            logits = self.classifier(x_proj)
+            
+            return logits, extracted_features
+        
         # Tier 5：客户端到layer2
         elif self.tier == 5:  
             x = self.conv1(x)
@@ -330,15 +329,14 @@ class ResNet(nn.Module):
             x = self.layer2(x)
             extracted_features = x
             
-            if self.local_loss == True:
-                x = self.avgpool(x)
-                x = x.view(x.size(0), -1)
-                x = self.projection(x)  # 使用投影层调整维度
-                logits = self.classifier(x)
-                return logits, extracted_features            
+            # 分类器输出
+            x_pool = self.avgpool(x)
+            x_flat = x_pool.view(x_pool.size(0), -1)
+            x_proj = self.projection(x_flat)
+            logits = self.classifier(x_proj)
             
-            return extracted_features           
-
+            return logits, extracted_features
+        
         # Tier 6：客户端到layer1
         elif self.tier == 6:  
             x = self.conv1(x)
@@ -346,16 +344,15 @@ class ResNet(nn.Module):
             x = self.relu(x)
             x = self.layer1(x)
             extracted_features = x  
-
-            if self.local_loss == True:
-                x = self.avgpool(x)
-                x = x.view(x.size(0), -1)
-                x = self.projection(x)  # 使用投影层调整维度
-                logits = self.classifier(x)
-                return logits, extracted_features            
             
-            return extracted_features           
+            # 分类器输出
+            x_pool = self.avgpool(x)
+            x_flat = x_pool.view(x_pool.size(0), -1)
+            x_proj = self.projection(x_flat)
+            logits = self.classifier(x_proj)
             
+            return logits, extracted_features
+        
         # Tier 7：客户端只有基础层
         elif self.tier == 7:  
             x = self.conv1(x)
@@ -363,14 +360,13 @@ class ResNet(nn.Module):
             x = self.relu(x)
             extracted_features = x  
             
-            if self.local_loss == True:
-                x = self.avgpool(x)
-                x = x.view(x.size(0), -1)
-                x = self.projection(x)  # 使用投影层调整维度
-                logits = self.classifier(x)
-                return logits, extracted_features            
+            # 分类器输出
+            x_pool = self.avgpool(x)
+            x_flat = x_pool.view(x_pool.size(0), -1)
+            x_proj = self.projection(x_flat)
+            logits = self.classifier(x_proj)
             
-            return extracted_features           
+            return logits, extracted_features          
 
             
 class ResNet_server(nn.Module):
@@ -501,84 +497,110 @@ class ResNet_server(nn.Module):
 
         return nn.Sequential(*layers)
 
+
     def forward(self, x):
+        """
+        前向传播，返回特征而不是分类结果
+        """
         # Tier 1 处理
         if self.tier == 1:
-            # Tier 1 直接进入分类
-            x = self.avgpool(x)
-            x = x.view(x.size(0), -1)
-            x = self.projection(x)  # 使用投影层进行特征映射
-            x = self.classifier(x)
-            return x
-    
+            # Tier 1 直接返回输入特征
+            features = x
+            
+            # 提取特征，不进行分类
+            if len(features.shape) > 2:  # 如果是卷积特征
+                features = self.avgpool(features)
+                features = features.view(features.size(0), -1)
+                features = self.projection(features)  # 使用投影层进行特征映射
+            
+            return features
+        
         # Tier 2：服务器只有 layer6
         elif self.tier == 2:
-            x = self.layer6(x)
-            x = self.avgpool(x)
-            x = x.view(x.size(0), -1)
-            x = self.projection(x)  # 如果输入特征已经是所需维度，Identity层不进行转换
-            x = self.classifier(x)
-            return x
-    
+            features = self.layer6(x)
+            
+            # 提取特征，不进行分类
+            if len(features.shape) > 2:  # 如果是卷积特征
+                features = self.avgpool(features)
+                features = features.view(features.size(0), -1)
+                features = self.projection(features)  # 如果输入特征已经是所需维度，Identity层不进行转换
+            
+            return features
+        
         # Tier 3：服务器有 layer5, layer6
         elif self.tier == 3:
-            x = self.layer5(x)
-            x = self.layer6(x)
-            x = self.avgpool(x)
-            x = x.view(x.size(0), -1)
-            x = self.projection(x)
-            x = self.classifier(x)
-            return x
+            features = self.layer5(x)
+            features = self.layer6(features)
+            
+            # 提取特征，不进行分类
+            if len(features.shape) > 2:  # 如果是卷积特征
+                features = self.avgpool(features)
+                features = features.view(features.size(0), -1)
+                features = self.projection(features)
+            
+            return features
             
         # Tier 4：服务器有 layer4, layer5, layer6
         elif self.tier == 4:
-            x = self.layer4(x)
-            x = self.layer5(x)
-            x = self.layer6(x)
-            x = self.avgpool(x)
-            x = x.view(x.size(0), -1)
-            x = self.projection(x)
-            x = self.classifier(x)
-            return x
-              
+            features = self.layer4(x)
+            features = self.layer5(features)
+            features = self.layer6(features)
+            
+            # 提取特征，不进行分类
+            if len(features.shape) > 2:  # 如果是卷积特征
+                features = self.avgpool(features)
+                features = features.view(features.size(0), -1)
+                features = self.projection(features)
+            
+            return features
+            
         # Tier 5：服务器有 layer3, layer4, layer5, layer6
         elif self.tier == 5:
-            x = self.layer3(x)
-            x = self.layer4(x)
-            x = self.layer5(x)
-            x = self.layer6(x)
-            x = self.avgpool(x)
-            x = x.view(x.size(0), -1)
-            x = self.projection(x)
-            x = self.classifier(x)
-            return x
+            features = self.layer3(x)
+            features = self.layer4(features)
+            features = self.layer5(features)
+            features = self.layer6(features)
+            
+            # 提取特征，不进行分类
+            if len(features.shape) > 2:  # 如果是卷积特征
+                features = self.avgpool(features)
+                features = features.view(features.size(0), -1)
+                features = self.projection(features)
+            
+            return features
 
         # Tier 6：服务器有 layer2, layer3, layer4, layer5, layer6
         elif self.tier == 6:
-            x = self.layer2(x)
-            x = self.layer3(x)
-            x = self.layer4(x)
-            x = self.layer5(x)
-            x = self.layer6(x)
-            x = self.avgpool(x)
-            x = x.view(x.size(0), -1)
-            x = self.projection(x)
-            x = self.classifier(x)
-            return x
+            features = self.layer2(x)
+            features = self.layer3(features)
+            features = self.layer4(features)
+            features = self.layer5(features)
+            features = self.layer6(features)
+            
+            # 提取特征，不进行分类
+            if len(features.shape) > 2:  # 如果是卷积特征
+                features = self.avgpool(features)
+                features = features.view(features.size(0), -1)
+                features = self.projection(features)
+            
+            return features
             
         # Tier 7：服务器有所有层
         elif self.tier == 7:
-            x = self.layer1(x)
-            x = self.layer2(x)
-            x = self.layer3(x)
-            x = self.layer4(x)
-            x = self.layer5(x)
-            x = self.layer6(x)
-            x = self.avgpool(x)
-            x = x.view(x.size(0), -1)
-            x = self.projection(x)
-            x = self.classifier(x)
-            return x
+            features = self.layer1(x)
+            features = self.layer2(features)
+            features = self.layer3(features)
+            features = self.layer4(features)
+            features = self.layer5(features)
+            features = self.layer6(features)
+            
+            # 提取特征，不进行分类
+            if len(features.shape) > 2:  # 如果是卷积特征
+                features = self.avgpool(features)
+                features = features.view(features.size(0), -1)
+                features = self.projection(features)
+            
+            return features
 
 def resnet56_server(c, pretrained=False, path=None, tier=5, **kwargs):
     """

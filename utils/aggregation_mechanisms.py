@@ -39,12 +39,41 @@ def cluster_aware_aggregation(client_models, client_weights, cluster_map):
         else:
             normalized_weights = [1.0 / len(cluster_client_weights)] * len(cluster_client_weights)
         
-        # 执行聚合
-        aggregated_model = aggregate_models(
-            cluster_client_models, 
-            normalized_weights,
-            special_bn_treatment=True
-        )
+        # 执行聚合 - 修改对同构模型的要求
+        # 在这里，我们假设每个聚类内的客户端可能有相同的tier和模型结构
+        # 先使用第一个客户端的模型结构作为基础
+        base_model = cluster_client_models[0]
+        aggregated_model = OrderedDict()
+        
+        # 遍历基础模型的键
+        for key in base_model.keys():
+            # 收集所有拥有这个键的模型的参数
+            params_list = []
+            params_weights = []
+            
+            for idx, model in enumerate(cluster_client_models):
+                if key in model and model[key].shape == base_model[key].shape:
+                    params_list.append(model[key])
+                    params_weights.append(normalized_weights[idx])
+            
+            # 如果没有匹配的参数，使用基础模型的参数
+            if not params_list:
+                aggregated_model[key] = base_model[key].clone()
+                continue
+            
+            # 重新归一化权重
+            weight_sum = sum(params_weights)
+            if weight_sum > 0:
+                params_weights = [w / weight_sum for w in params_weights]
+            else:
+                params_weights = [1.0 / len(params_weights)] * len(params_weights)
+            
+            # 聚合参数
+            weighted_param = params_list[0].clone() * 0.0
+            for param, weight in zip(params_list, params_weights):
+                weighted_param += param.to(dtype=torch.float32) * weight
+            
+            aggregated_model[key] = weighted_param
         
         # 存储聚类聚合结果
         cluster_models[cluster_id] = aggregated_model
@@ -101,32 +130,38 @@ def aggregate_models(model_list, weights, special_bn_treatment=True, preserve_cl
     if not model_list:
         return None
     
-    # 初始化聚合模型
+    # 初始化聚合模型 - 使用第一个模型作为基础
+    base_model = model_list[0]
     aggregated_model = OrderedDict()
     
-    # 获取所有键的并集
-    all_keys = set()
-    for model in model_list:
-        all_keys.update(model.keys())
-    
-    # 对于每个参数，收集所有模型中的值
-    for key in all_keys:
-        # 跳过一些特殊参数（如num_batches_tracked）
+    # 遍历基础模型的所有键
+    for key in base_model.keys():
+        # 跳过特殊参数（如num_batches_tracked）
         if 'num_batches_tracked' in key:
+            aggregated_model[key] = base_model[key].clone()
             continue
-            
-        # 收集所有模型中该参数的值
+        
+        # 收集所有相同形状的参数
         param_values = []
         param_weights = []
         
         for i, model in enumerate(model_list):
-            if key in model:
+            if key in model and model[key].shape == base_model[key].shape:
                 param_values.append(model[key])
                 param_weights.append(weights[i])
         
+        # 如果没有匹配的参数，使用基础模型的参数
         if not param_values:
+            aggregated_model[key] = base_model[key].clone()
             continue
-            
+        
+        # 归一化权重
+        weight_sum = sum(param_weights)
+        if weight_sum > 0:
+            param_weights = [w / weight_sum for w in param_weights]
+        else:
+            param_weights = [1.0 / len(param_weights)] * len(param_weights)
+        
         # 特殊处理BatchNorm层
         if special_bn_treatment and ('running_mean' in key or 'running_var' in key):
             # 对于BN层，使用中位数或限制范围
@@ -150,9 +185,9 @@ def aggregate_models(model_list, weights, special_bn_treatment=True, preserve_cl
     
     # 如果保留分类器，使用第一个模型的分类器参数
     if preserve_classifier:
-        for key in model_list[0].keys():
+        for key in base_model.keys():
             if 'classifier' in key or 'fc' in key:
-                aggregated_model[key] = model_list[0][key]
+                aggregated_model[key] = base_model[key].clone()
     
     return aggregated_model
 
