@@ -245,9 +245,18 @@ def adaptive_clustering(client_models, eval_dataset, device, n_clusters=3, min_c
     for i in range(n_clients):
         # 确保特征向量有效
         if len(prediction_features[i]) > 0 and len(model_features[i]) > 0:
-            # 标准化特征
-            pred_feat = prediction_features[i] / np.sum(prediction_features[i])
+            # 处理预测特征，支持字典或数组格式
+            if isinstance(prediction_features[i], dict) and 'prediction_counts' in prediction_features[i]:
+                # 是字典格式，提取计数数组
+                counts = prediction_features[i]['prediction_counts']
+                if isinstance(counts, list):
+                    counts = np.array(counts)
+                pred_feat = counts / np.sum(counts) if np.sum(counts) > 0 else counts
+            else:
+                # 是数组格式，直接归一化
+                pred_feat = prediction_features[i] / np.sum(prediction_features[i]) if np.sum(prediction_features[i]) > 0 else prediction_features[i]
             
+            # 标准化模型特征
             if np.sum(np.abs(model_features[i])) > 0:
                 model_feat = model_features[i] / np.linalg.norm(model_features[i])
             else:

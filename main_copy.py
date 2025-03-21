@@ -76,7 +76,67 @@ if torch.cuda.is_available():
     torch.backends.cudnn.deterministic = True
     print(f"使用GPU: {torch.cuda.get_device_name(0)}")
 
-
+def print_model_architecture(model, name="模型", detail_level=0):
+    """
+    打印模型架构信息
+    
+    Args:
+        model: 要分析的模型
+        name: 模型名称
+        detail_level: 详细程度，0=基本信息，1=中等细节，2=完整细节
+    """
+    print(f"\n==== {name} 架构信息 ====")
+    
+    # 基本模型信息
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"总参数数量: {total_params:,}")
+    print(f"可训练参数: {trainable_params:,}")
+    print(f"模型类型: {type(model).__name__}")
+    
+    # 打印模型层次结构
+    if detail_level >= 1:
+        print("\n层级结构:")
+        for name, module in model.named_children():
+            print(f"- {name}: {type(module).__name__}")
+            
+            if detail_level >= 2:
+                # 打印子模块
+                for sub_name, sub_module in module.named_children():
+                    print(f"  - {name}.{sub_name}: {type(sub_module).__name__}")
+    
+    # 打印状态字典键，按层组织
+    if detail_level >= 1:
+        print("\n状态字典键:")
+        state_dict = model.state_dict()
+        layers = {}
+        
+        # 组织键
+        for key in state_dict.keys():
+            parts = key.split('.')
+            if len(parts) > 1:
+                layer = parts[0]
+                if layer not in layers:
+                    layers[layer] = []
+                layers[layer].append(key)
+            else:
+                if 'other' not in layers:
+                    layers['other'] = []
+                layers['other'].append(key)
+        
+        # 打印层及其键
+        for layer, keys in layers.items():
+            print(f"- {layer}:")
+            if detail_level >= 2:
+                # 打印每个键和张量形状
+                for key in keys:
+                    shape = tuple(state_dict[key].shape)
+                    print(f"  - {key}: {shape}")
+            else:
+                # 只打印键的数量
+                print(f"  - {len(keys)} 个参数")
+    
+    print("=" * 40)
 def parse_arguments():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(description='异构联邦学习框架')
@@ -258,6 +318,29 @@ def allocate_resources_to_clients(num_clients):
     
     return client_resource_allocation
 
+def safe_load_state_dict(model, state_dict, verbose=False):
+    """安全地加载状态字典，处理架构不匹配的情况"""
+    # 过滤状态字典，只保留模型中存在的键
+    model_keys = set(model.state_dict().keys())
+    dict_keys = set(state_dict.keys())
+    
+    # 找出不匹配的键
+    missing_keys = model_keys - dict_keys
+    unexpected_keys = dict_keys - model_keys
+    
+    if verbose:
+        if missing_keys:
+            print(f"模型中存在但状态字典中缺少的键: {missing_keys}")
+        if unexpected_keys:
+            print(f"状态字典中存在但模型中缺少的键: {unexpected_keys}")
+    
+    # 创建过滤后的状态字典
+    filtered_dict = {k: v for k, v in state_dict.items() if k in model_keys}
+    
+    # 加载过滤后的状态字典
+    model.load_state_dict(filtered_dict, strict=False)
+    
+    return model
 
 def create_models(args, class_num):
     """创建客户端和服务器模型"""
@@ -382,6 +465,14 @@ def create_models(args, class_num):
                 print(f"  - 客户端特征形状: {client_features.shape}")
                 print(f"  - 调试信息: 客户端tier={tier}, 期望的特征维度={target_dim}")
     
+    # 打印第一个tier的模型架构（示例）
+    print_model_architecture(enhanced_client_models[1], "客户端模型 (Tier 1)", detail_level=1)
+    print_model_architecture(enhanced_server_models[1], "服务器模型 (Tier 1)", detail_level=1)
+    print_model_architecture(enhanced_client_models[2], "客户端模型 (Tier 2)", detail_level=1)
+    print_model_architecture(enhanced_server_models[2], "服务器模型 (Tier 2)", detail_level=1)
+    print_model_architecture(enhanced_client_models[3], "客户端模型 (Tier 3)", detail_level=1)
+    print_model_architecture(enhanced_server_models[3], "服务器模型 (Tier 3)", detail_level=1)
+    print_model_architecture(unified_classifier, "统一分类器", detail_level=2)
     return enhanced_client_models, enhanced_server_models, unified_classifier, init_glob_model, num_tiers
 def setup_clients(args, dataset, client_resources, client_models, server_models):
     """设置客户端管理器和客户端"""
@@ -522,6 +613,13 @@ def train_client_function(client_id, client_model, server_model, device,
         # 确保客户端设备与传入的设备一致
         client.device = device
         print(f"客户端 {client_id} 使用设备: {device}")
+
+        # 确保全局分类器在正确设备上
+        if global_classifier is not None:
+            global_classifier = global_classifier.to(device)
+            # 确保其参数也在正确设备上
+            for param in global_classifier.parameters():
+                param.data = param.data.to(device)
         
         # 记录开始时间
         start_time = time.time()
@@ -627,7 +725,14 @@ def evaluate_client_function(client_id, client_model, server_model, device, clie
         client = client_manager.get_client(client_id)
         if client is None:
             return {'error': f"客户端 {client_id} 不存在"}
-        
+        # 确保global_classifier完全在正确设备上
+        if global_classifier is not None:
+            global_classifier = global_classifier.to(device)
+            # 确保所有参数和缓冲区都在设备上
+            for param in global_classifier.parameters():
+                param.data = param.data.to(device)
+            for buffer in global_classifier.buffers():
+                buffer.data = buffer.data.to(device)
         # 执行评估 - 传递全局分类器
         eval_start_time = time.time()
         eval_stats = client.evaluate(client_model, server_model, global_classifier=global_classifier)
@@ -825,7 +930,8 @@ def main():
             client_manager=client_manager,
             round_idx=round_idx,
             local_epochs=args.client_epoch,
-            split_rounds=1
+            split_rounds=1,
+            global_classifier=unified_classifier  # 显式传递
         )
         
         # 收集训练后的模型
@@ -845,10 +951,24 @@ def main():
         training_framework.set_global_model(global_model)
         training_framework.set_cluster_models(cluster_models)
         
-        # 创建全局模型进行评估
+        # 创建全局模型进行评估，加载全局模型（忽略增强客户端特有的投影层）
         global_eval_model = copy.deepcopy(init_glob_model) if init_glob_model else copy.deepcopy(client_models[1])
-        global_eval_model.load_state_dict(global_model)
+        print_model_architecture(global_eval_model, "加载全局模型前的全局评估模型", detail_level=1)
+
+        # 打印全局模型状态字典键
+        print("\n==== 全局聚合模型状态字典信息 ====")
+        global_model_keys = set(global_model.keys())
+        print(f"键的数量: {len(global_model_keys)}")
+        print(f"示例键: {list(global_model_keys)[:5]}")
+        if 'projection.weight' in global_model:
+            print(f"projection.weight形状: {global_model['projection.weight'].shape}")
+        print("=" * 40)
+        
+        global_eval_model = safe_load_state_dict(global_eval_model, global_model, verbose=True)
         global_eval_model = global_eval_model.to(device)
+
+        # 加载后打印
+        print_model_architecture(global_eval_model, "加载全局模型后的全局评估模型", detail_level=1)
         
         # 诊断并修复全局模型
         logger.info("诊断和修复全局模型...")

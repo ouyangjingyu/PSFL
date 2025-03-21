@@ -86,6 +86,10 @@ class UnifiedClassifier(nn.Module):
                 nn.init.constant_(m.bias, 0)
     
     def forward(self, x):
+        # 确保输入和参数在同一设备上
+        device = next(self.parameters()).device
+        if x.device != device:
+            x = x.to(device)
         return self.classifier(x)
 
 

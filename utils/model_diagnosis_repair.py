@@ -33,16 +33,18 @@ class ModelDiagnosticTracker:
         
         # 记录预测不平衡情况
         pred_data = diagnosis_result.get('prediction_data', {})
-        if pred_data and 'prediction_counts' in pred_data:
+        if isinstance(pred_data, dict) and 'prediction_counts' in pred_data:
             counts = pred_data['prediction_counts']
-            if counts and max(counts) > 0 and min(counts) > 0:
-                imbalance = max(counts) / min(counts)
-                self.pred_imbalance_history.append(imbalance)
+            if isinstance(counts, (list, np.ndarray)) and len(counts) > 0:
+                if max(counts) > 0 and min(counts) > 0:
+                    imbalance = max(counts) / min(counts)
+                    self.pred_imbalance_history.append(imbalance)
+                else:
+                    self.pred_imbalance_history.append(0)
             else:
                 self.pred_imbalance_history.append(0)
         else:
             self.pred_imbalance_history.append(0)
-        
         # 记录梯度统计信息
         grad_stats = diagnosis_result.get('gradient_stats', {})
         if grad_stats:

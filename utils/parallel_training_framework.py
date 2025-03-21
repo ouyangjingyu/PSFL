@@ -79,9 +79,24 @@ class ParallelClusterTrainer:
             'evaluation_metrics': {}
         }
         
-        # 确保全局分类器在device上
+        # 创建全局分类器的完整副本，确保它完全在正确设备上
         if 'global_classifier' in kwargs and kwargs['global_classifier'] is not None:
-            kwargs['global_classifier'] = kwargs['global_classifier'].to(device)
+            # 使用深拷贝创建完全独立的副本
+            import copy
+            original_classifier = kwargs['global_classifier']
+            cluster_classifier = copy.deepcopy(original_classifier)
+            
+            # 将整个分类器移至设备
+            cluster_classifier = cluster_classifier.to(device)
+            
+            # 额外确保所有参数和缓冲区也在正确设备上
+            for param in cluster_classifier.parameters():
+                param.data = param.data.to(device)
+            for buffer in cluster_classifier.buffers():
+                buffer.data = buffer.data.to(device)
+                
+            # 替换原始分类器
+            kwargs['global_classifier'] = cluster_classifier
         
         # 在该聚类中串行训练每个客户端
         for client_id in client_ids:
@@ -181,11 +196,23 @@ class ParallelClusterTrainer:
         工作线程函数，用于并行训练不同聚类
         """
         try:
-            result = self.train_cluster(cluster_id, client_ids, train_fn, eval_fn, **kwargs)
+            # 创建线程专用的kwargs副本，避免跨线程干扰
+            thread_kwargs = kwargs.copy()
+            # 调试打印
+            print(f"聚类 {cluster_id} 收到的kwargs键: {list(kwargs.keys())}")
+            thread_kwargs = kwargs.copy()
+            
+            # 更多调试
+            if 'global_classifier' in thread_kwargs:
+                print(f"聚类 {cluster_id} global_classifier类型: {type(thread_kwargs['global_classifier'])}")
+
+            result = self.train_cluster(cluster_id, client_ids, train_fn, eval_fn, **thread_kwargs)
             result_queue.put((cluster_id, result))
         except Exception as e:
-            print(f"聚类 {cluster_id} 训练时出错: {str(e)}")
-            result_queue.put((cluster_id, {'error': str(e)}))
+            import traceback
+            error_trace = traceback.format_exc()
+            print(f"聚类 {cluster_id} 训练时出错: {str(e)}\n详细错误:\n{error_trace}")
+            result_queue.put((cluster_id, {'error': str(e), 'traceback': error_trace}))
     
     def train_all_clusters_parallel(self, train_fn, eval_fn=None, **kwargs):
         """
@@ -505,12 +532,14 @@ class TrainingCoordinator:
         Returns:
             训练结果和统计信息
         """
+        print(f"执行训练，shared_classifier: {self.shared_classifier is not None}")
+        
         if self.trainer is None:
             self.logger.error("训练器未初始化，请先调用setup_training")
             return None, None, 0
         
-        # 添加全局分类器到kwargs
-        if self.shared_classifier is not None and 'global_classifier' not in kwargs:
+        # 添加全局分类器到kwargs - 确保使用kwargs['global_classifier']
+        if self.shared_classifier is not None:
             kwargs['global_classifier'] = self.shared_classifier
         
         # 执行并行训练

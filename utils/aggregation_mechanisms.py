@@ -95,37 +95,106 @@ def global_unified_aggregation(cluster_models, cluster_weights):
     # 收集聚类模型和权重
     models_list = [model for _, model in cluster_models.items()]
     weights_list = [cluster_weights.get(cid, 1.0) for cid in cluster_models.keys()]
+
+    # 检查是否有模型可聚合
+    if not models_list:
+        print("警告: 没有有效的模型可聚合!")
+        return None  # 或返回一个默认模型
     
     # 归一化权重
     weight_sum = sum(weights_list)
     if weight_sum > 0:
         normalized_weights = [w / weight_sum for w in weights_list]
     else:
-        normalized_weights = [1.0 / len(weights_list)] * len(weights_list)
+        # 避免除零错误
+        normalized_weights = [1.0 / max(1, len(weights_list))] * len(weights_list)
     
     # 执行全局聚合，保留分类器
-    global_model = aggregate_models(
+    global_model = aggregate_models_feature_only(
         models_list, 
         normalized_weights,
-        special_bn_treatment=True,
-        preserve_classifier=True
+        special_bn_treatment=True
     )
     
     return global_model
 
-
+def aggregate_models_feature_only(model_list, weights, special_bn_treatment=True):
+    """
+    仅聚合特征提取层的版本
+    """
+    if not model_list:
+        return None
+    
+    # 初始化聚合模型
+    base_model = model_list[0]
+    aggregated_model = OrderedDict()
+    
+    # 选择目标设备
+    target_device = torch.device('cpu')
+    
+    # 遍历基础模型的所有键
+    for key in base_model.keys():
+        # 跳过分类器相关层
+        if 'classifier' in key or 'fc' in key:
+            continue
+            
+        # 跳过特殊参数
+        if 'num_batches_tracked' in key:
+            aggregated_model[key] = base_model[key].clone()
+            continue
+        
+        # 收集所有相同形状的参数
+        param_values = []
+        param_weights = []
+        
+        for i, model in enumerate(model_list):
+            if key in model and model[key].shape == base_model[key].shape:
+                param_values.append(model[key])
+                param_weights.append(weights[i])
+        
+        # 如果没有匹配的参数，使用基础模型的参数
+        if not param_values:
+            aggregated_model[key] = base_model[key].clone()
+            continue
+        
+        # 归一化权重
+        weight_sum = sum(param_weights)
+        if weight_sum > 0:
+            param_weights = [w / weight_sum for w in param_weights]
+        else:
+            param_weights = [1.0 / len(param_weights)] * len(param_weights)
+        
+        # 特殊处理BatchNorm层
+        if special_bn_treatment and ('running_mean' in key or 'running_var' in key):
+            # 对于BN层，使用中位数或限制范围
+            if 'running_mean' in key:
+                # 确保所有值都在同一设备上进行操作
+                stacked_values = torch.stack([v.to(dtype=torch.float32, device=target_device) for v in param_values])
+                median_value, _ = torch.median(stacked_values, dim=0)
+                aggregated_model[key] = torch.clamp(median_value, min=-2.0, max=2.0)
+            elif 'running_var' in key:
+                # 对方差使用加权平均后限制范围，确保在同一设备上
+                weighted_avg = torch.zeros_like(param_values[0], dtype=torch.float32, device=target_device)
+                for v, w in zip(param_values, param_weights):
+                    weighted_avg += v.to(dtype=torch.float32, device=target_device) * w
+                aggregated_model[key] = torch.clamp(weighted_avg, min=0.01, max=5.0)
+        else:
+            # 普通参数使用加权平均，确保所有值都在同一设备上
+            weighted_avg = torch.zeros_like(param_values[0], dtype=torch.float32, device=target_device)
+            for v, w in zip(param_values, param_weights):
+                weighted_avg += v.to(dtype=torch.float32, device=target_device) * w
+            aggregated_model[key] = weighted_avg
+    
+    # # 如果保留分类器，使用第一个模型的分类器参数
+    # if preserve_classifier:
+    #     for key in base_model.keys():
+    #         if 'classifier' in key or 'fc' in key:
+    #             aggregated_model[key] = base_model[key].clone()
+    
+    return aggregated_model
 def aggregate_models(model_list, weights, special_bn_treatment=True, preserve_classifier=False):
     """
     聚合多个模型参数，可选择性地对BatchNorm层和分类器层进行特殊处理
-    
-    Args:
-        model_list: 模型参数列表
-        weights: 归一化权重列表
-        special_bn_treatment: 是否对BatchNorm层进行特殊处理
-        preserve_classifier: 是否保留最好模型的分类器参数
-        
-    Returns:
-        聚合后的模型参数
     """
     if not model_list:
         return None
@@ -133,6 +202,9 @@ def aggregate_models(model_list, weights, special_bn_treatment=True, preserve_cl
     # 初始化聚合模型 - 使用第一个模型作为基础
     base_model = model_list[0]
     aggregated_model = OrderedDict()
+    
+    # 选择一个目标设备用于聚合(使用CPU以确保兼容性)
+    target_device = torch.device('cpu')
     
     # 遍历基础模型的所有键
     for key in base_model.keys():
@@ -166,21 +238,21 @@ def aggregate_models(model_list, weights, special_bn_treatment=True, preserve_cl
         if special_bn_treatment and ('running_mean' in key or 'running_var' in key):
             # 对于BN层，使用中位数或限制范围
             if 'running_mean' in key:
-                # 对均值使用中位数
-                stacked_values = torch.stack([v.to(dtype=torch.float32) for v in param_values])
+                # 确保所有值都在同一设备上进行操作
+                stacked_values = torch.stack([v.to(dtype=torch.float32, device=target_device) for v in param_values])
                 median_value, _ = torch.median(stacked_values, dim=0)
                 aggregated_model[key] = torch.clamp(median_value, min=-2.0, max=2.0)
             elif 'running_var' in key:
-                # 对方差使用加权平均后限制范围
-                weighted_avg = torch.zeros_like(param_values[0], dtype=torch.float32)
+                # 对方差使用加权平均后限制范围，确保在同一设备上
+                weighted_avg = torch.zeros_like(param_values[0], dtype=torch.float32, device=target_device)
                 for v, w in zip(param_values, param_weights):
-                    weighted_avg += v.to(dtype=torch.float32) * w
+                    weighted_avg += v.to(dtype=torch.float32, device=target_device) * w
                 aggregated_model[key] = torch.clamp(weighted_avg, min=0.01, max=5.0)
         else:
-            # 普通参数使用加权平均
-            weighted_avg = torch.zeros_like(param_values[0], dtype=torch.float32)
+            # 普通参数使用加权平均，确保所有值都在同一设备上
+            weighted_avg = torch.zeros_like(param_values[0], dtype=torch.float32, device=target_device)
             for v, w in zip(param_values, param_weights):
-                weighted_avg += v.to(dtype=torch.float32) * w
+                weighted_avg += v.to(dtype=torch.float32, device=target_device) * w
             aggregated_model[key] = weighted_avg
     
     # 如果保留分类器，使用第一个模型的分类器参数
@@ -210,6 +282,11 @@ def hybrid_aggregation_strategy(client_models, client_weights, cluster_map, clus
         client_models, client_weights, cluster_map
     )
     
+    # 检查是否有聚类模型
+    if not cluster_models:
+        print("警告: 聚类聚合未产生有效模型!")
+        return None, {}
+
     # 2. 如果没有提供聚类权重，创建均等权重
     if cluster_weights is None:
         # 基于聚类大小设置权重
@@ -220,10 +297,10 @@ def hybrid_aggregation_strategy(client_models, client_weights, cluster_map, clus
             for cluster_id, clients in cluster_map.items():
                 cluster_weights[cluster_id] = len(clients) / total_clients
         else:
-            # 均等权重
-            n_clusters = len(cluster_map)
+            # 避免除零错误
+            n_clusters = max(1, len(cluster_map))
             for cluster_id in cluster_map.keys():
-                cluster_weights[cluster_id] = 1.0 / max(1, n_clusters)
+                cluster_weights[cluster_id] = 1.0 / n_clusters
     
     # 3. 执行全局统一聚合
     global_model = global_unified_aggregation(
@@ -339,10 +416,19 @@ def enhanced_hierarchical_aggregation(client_models, client_weights, cluster_map
             'clients': client_ids
         }
     
+    # 检查是否有客户端模型
+    if not client_models:
+        print("警告: 没有客户端模型可聚合!")
+        return global_model_template or {}, {}, log_info
+
     # 2. 执行双层聚合
     global_model, cluster_models = hybrid_aggregation_strategy(
         client_models, client_weights, cluster_map
     )
+    # 如果聚合失败，使用模板或返回空字典
+    if global_model is None:
+        print("警告: 聚合失败，使用全局模型模板或返回空字典")
+        global_model = global_model_template.copy() if global_model_template else {}
     
     # 3. 验证和修复全局模型参数
     global_model, fixed_count = validate_model_parameters(global_model)
