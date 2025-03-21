@@ -174,6 +174,7 @@ class EnhancedServerModel(nn.Module):
         return logits
 
 
+
 # 创建增强的客户端特征提取器
 def create_enhanced_client_model(base_model, tier, target_dim=256):
     """基于tier级别创建适当的客户端模型"""

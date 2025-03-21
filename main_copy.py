@@ -60,9 +60,9 @@ from data.cifar10_eval_dataset import get_cifar10_proxy_dataset
 from utils.enhanced_model_architecture import create_enhanced_client_model, create_enhanced_server_model, UnifiedClassifier
 from utils.client_clustering import adaptive_cluster_assignment, extract_model_predictions
 from utils.model_diagnosis_repair import ModelDiagnosticTracker, comprehensive_model_repair
-from utils.aggregation_mechanisms import enhanced_hierarchical_aggregation
-from utils.parallel_training_framework import create_training_framework
-from utils.unified_client_module import EnhancedClient, ClientManager
+from utils.aggregation_mechanisms import enhanced_hierarchical_aggregation_no_projection
+from utils.parallel_training_framework import create_training_framework,create_training_framework_with_global_classifier
+from utils.unified_client_module import EnhancedClient, ClientManager, train_client_with_global_classifier
 
 
 # 设置随机种子，确保实验可复现
@@ -868,10 +868,10 @@ def main():
     
     # 创建训练框架
     logger.info("创建并行训练框架...")
-    training_framework = create_training_framework(
+    training_framework = create_training_framework_with_global_classifier(
         client_models_dict, server_models_dict, client_resources
     )
-    
+        
     # 设置共享分类器
     training_framework.set_shared_classifier(unified_classifier)
 
@@ -925,27 +925,47 @@ def main():
 
         # 执行并行训练
         cluster_results, client_stats, training_time = training_framework.execute_training(
-            train_client_function,
+            train_client_with_global_classifier,  # 使用新的训练函数
             evaluate_client_function,
             client_manager=client_manager,
             round_idx=round_idx,
+            coordinator=training_framework,  # 传入协调器
             local_epochs=args.client_epoch,
-            split_rounds=1,
-            global_classifier=unified_classifier  # 显式传递
+            split_rounds=1
         )
         
+        # 执行分层聚合前获取客户端tier信息
+        client_tiers = {}
+        for client_id in client_models_dict.keys():
+            client = client_manager.get_client(client_id)
+            if client is not None:
+                client_tiers[client_id] = client.tier
+
         # 收集训练后的模型
         client_models_params, client_weights = training_framework.collect_trained_models(cluster_results)
         
+
         # 执行分层聚合
         logger.info("执行双层聚合...")
-        global_model, cluster_models, agg_log = enhanced_hierarchical_aggregation(
-            client_models_params, 
-            client_weights, 
-            client_clusters,
-            global_model_template=init_glob_model.state_dict() if init_glob_model else None,
-            num_classes=class_num
-        )
+        try:
+            global_model, cluster_models, agg_log = enhanced_hierarchical_aggregation_no_projection(
+                client_models_params, 
+                client_weights, 
+                client_clusters,
+                client_tiers=client_tiers,  # 新增参数
+                global_model_template=init_glob_model.state_dict() if init_glob_model else None,
+                num_classes=class_num
+            )
+            
+            # 确保global_model不为None
+            if global_model is None:
+                print("错误: global_model为None，使用默认模型")
+                global_model = {} if init_glob_model is None else init_glob_model.state_dict()
+        except Exception as e:
+            print(f"聚合过程出错: {str(e)}")
+            global_model = {} if init_glob_model is None else init_glob_model.state_dict()
+            cluster_models = {}
+            agg_log = {'error': str(e)}
         
         # 更新全局模型和聚类模型
         training_framework.set_global_model(global_model)

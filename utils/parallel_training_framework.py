@@ -8,6 +8,8 @@ import logging
 import threading
 import queue
 
+import torch.nn as nn
+import torch.nn.functional as F
 
 class ParallelClusterTrainer:
     """
@@ -268,6 +270,140 @@ class ParallelClusterTrainer:
         
         return self.cluster_results, self.client_training_stats, total_time
 
+class GlobalClassifierService:
+    """全局分类器服务，处理所有聚类的特征请求"""
+    
+    def __init__(self, classifier, device='cpu'):
+        """
+        初始化全局分类器服务
+        
+        Args:
+            classifier: 全局分类器模型
+            device: 运行设备
+        """
+        self.classifier = classifier.to(device)
+        self.device = device
+        self.optimizer = torch.optim.Adam(
+            self.classifier.parameters(),
+            lr=0.001,
+            weight_decay=5e-4
+        )
+        self.criterion = nn.CrossEntropyLoss()
+        
+    def process_batch(self, features_batch, labels_batch, cluster_ids=None):
+        """
+        批量处理来自不同聚类的特征
+        
+        Args:
+            features_batch: 特征张量列表或字典
+            labels_batch: 标签张量列表或字典
+            cluster_ids: 聚类ID列表
+            
+        Returns:
+            gradients_dict: 每个输入对应的梯度字典
+            loss_dict: 每个输入对应的损失字典
+            metrics_dict: 准确率等指标字典
+        """
+        self.optimizer.zero_grad()
+        
+        # 准备批处理结果存储
+        gradients_dict = {}
+        loss_dict = {}
+        metrics_dict = {}
+        
+        # 如果输入是字典形式
+        if isinstance(features_batch, dict):
+            # 批量处理所有特征
+            all_features = []
+            all_labels = []
+            batch_indices = {}
+            start_idx = 0
+            
+            # 将不同聚类的特征和标签组合成批次
+            for cluster_id, features in features_batch.items():
+                if cluster_id not in labels_batch:
+                    continue
+                    
+                features = features.to(self.device)
+                labels = labels_batch[cluster_id].to(self.device)
+                
+                batch_size = features.size(0)
+                all_features.append(features)
+                all_labels.append(labels)
+                
+                # 记录每个聚类数据在批次中的位置
+                batch_indices[cluster_id] = (start_idx, start_idx + batch_size)
+                start_idx += batch_size
+            
+            if all_features:
+                # 连接所有特征和标签
+                all_features = torch.cat(all_features, dim=0)
+                all_labels = torch.cat(all_labels, dim=0)
+                
+                # 前向传播
+                outputs = self.classifier(all_features)
+                loss = self.criterion(outputs, all_labels)
+                
+                # 反向传播计算梯度
+                loss.backward()
+                
+                # 优化器步进
+                self.optimizer.step()
+                
+                # 计算准确率
+                _, predicted = torch.max(outputs.data, 1)
+                accuracy = (predicted == all_labels).float().mean().item() * 100
+                
+                # 为每个聚类提取梯度和损失
+                for cluster_id, (start_idx, end_idx) in batch_indices.items():
+                    cluster_features = all_features[start_idx:end_idx]
+                    cluster_labels = all_labels[start_idx:end_idx]
+                    cluster_outputs = outputs[start_idx:end_idx]
+                    
+                    # 计算聚类损失
+                    cluster_loss = self.criterion(cluster_outputs, cluster_labels).item()
+                    loss_dict[cluster_id] = cluster_loss
+                    
+                    # 提取聚类梯度（对于输入特征）
+                    if cluster_features.grad is not None:
+                        gradients_dict[cluster_id] = cluster_features.grad.clone().detach()
+                    
+                    # 计算聚类准确率
+                    cluster_predicted = predicted[start_idx:end_idx]
+                    cluster_accuracy = (cluster_predicted == cluster_labels).float().mean().item() * 100
+                    metrics_dict[cluster_id] = {'accuracy': cluster_accuracy}
+            
+        # 如果输入是列表形式
+        elif isinstance(features_batch, list):
+            for i, features in enumerate(features_batch):
+                if i >= len(labels_batch):
+                    continue
+                    
+                cluster_id = cluster_ids[i] if cluster_ids and i < len(cluster_ids) else i
+                features = features.to(self.device)
+                labels = labels_batch[i].to(self.device)
+                
+                # 前向传播
+                outputs = self.classifier(features)
+                loss = self.criterion(outputs, labels)
+                
+                # 反向传播计算梯度
+                loss.backward(retain_graph=(i < len(features_batch) - 1))
+                
+                # 提取梯度和损失
+                if features.grad is not None:
+                    gradients_dict[cluster_id] = features.grad.clone().detach()
+                loss_dict[cluster_id] = loss.item()
+                
+                # 计算准确率
+                _, predicted = torch.max(outputs.data, 1)
+                accuracy = (predicted == labels).float().mean().item() * 100
+                metrics_dict[cluster_id] = {'accuracy': accuracy}
+            
+            # 优化器步进
+            self.optimizer.step()
+        
+        return gradients_dict, loss_dict, metrics_dict
 
 class ResourceAwareScheduler:
     """
@@ -624,6 +760,106 @@ class TrainingCoordinator:
         print(f"收集到 {len(client_models_params)} 个客户端的训练后模型")
         return client_models_params, client_weights
 
+class TrainingCoordinatorWithGlobalClassifier(TrainingCoordinator):
+    """扩展训练协调器，支持全局分类器串行处理"""
+    
+    def __init__(self, device='cuda' if torch.cuda.is_available() else 'cpu'):
+        super(TrainingCoordinatorWithGlobalClassifier, self).__init__(device)
+        self.global_classifier_service = None
+        self.features_queue = {}
+        self.labels_queue = {}
+        self.results_queue = {}
+        self.batch_size = 16  # 默认批处理大小
+        
+    def set_shared_classifier(self, classifier):
+        """设置共享分类器并创建服务"""
+        super().set_shared_classifier(classifier)
+        self.global_classifier_service = GlobalClassifierService(
+            classifier, 
+            device=self.device
+        )
+    
+    def register_features(self, cluster_id, features, labels):
+        """注册聚类的特征和标签到队列"""
+        if cluster_id not in self.features_queue:
+            self.features_queue[cluster_id] = []
+            self.labels_queue[cluster_id] = []
+        
+        self.features_queue[cluster_id].append(features)
+        self.labels_queue[cluster_id].append(labels)
+        
+        # 检查是否可以进行批处理
+        self._try_batch_process()
+    
+    def _try_batch_process(self):
+        """尝试批量处理队列中的特征"""
+        # 检查是否有足够的数据进行批处理
+        total_batches = sum(len(queue) for queue in self.features_queue.values())
+        
+        if total_batches >= self.batch_size or (total_batches > 0 and all(len(queue) > 0 for queue in self.features_queue.values())):
+            # 准备批处理数据
+            batch_features = {}
+            batch_labels = {}
+            
+            for cluster_id, features_list in self.features_queue.items():
+                if not features_list:
+                    continue
+                    
+                # 获取该聚类的一批特征和标签
+                features = torch.cat(features_list, dim=0)
+                labels = torch.cat(self.labels_queue[cluster_id], dim=0)
+                
+                batch_features[cluster_id] = features
+                batch_labels[cluster_id] = labels
+                
+                # 清空队列
+                self.features_queue[cluster_id] = []
+                self.labels_queue[cluster_id] = []
+            
+            # 执行批处理
+            if batch_features:
+                gradients, losses, metrics = self.global_classifier_service.process_batch(
+                    batch_features, batch_labels
+                )
+                
+                # 保存结果
+                for cluster_id in batch_features.keys():
+                    if cluster_id not in self.results_queue:
+                        self.results_queue[cluster_id] = []
+                    
+                    result = {
+                        'gradients': gradients.get(cluster_id),
+                        'loss': losses.get(cluster_id),
+                        'metrics': metrics.get(cluster_id)
+                    }
+                    
+                    self.results_queue[cluster_id].append(result)
+    
+    def get_results(self, cluster_id):
+        """获取指定聚类的处理结果"""
+        if cluster_id in self.results_queue and self.results_queue[cluster_id]:
+            return self.results_queue[cluster_id].pop(0)
+        
+        return None
+    
+    def process_features_sync(self, cluster_id, features, labels):
+        """同步处理特征（非队列模式）"""
+        if self.global_classifier_service is None:
+            raise ValueError("全局分类器服务未初始化")
+        
+        batch_features = {cluster_id: features}
+        batch_labels = {cluster_id: labels}
+        
+        gradients, losses, metrics = self.global_classifier_service.process_batch(
+            batch_features, batch_labels
+        )
+        
+        return {
+            'gradients': gradients.get(cluster_id),
+            'loss': losses.get(cluster_id),
+            'metrics': metrics.get(cluster_id)
+        }
+
 
 def create_training_framework(client_models, server_models, client_resources=None):
     """
@@ -639,6 +875,33 @@ def create_training_framework(client_models, server_models, client_resources=Non
     """
     # 初始化训练协调器
     coordinator = TrainingCoordinator()
+    
+    # 注册客户端
+    for client_id, client_model in client_models.items():
+        server_model = server_models.get(client_id)
+        if server_model is not None:
+            resources = None
+            if client_resources and client_id in client_resources:
+                resources = client_resources[client_id]
+            coordinator.register_client(client_id, client_model, server_model, resources)
+    
+    return coordinator
+
+# 添加新的框架创建函数
+def create_training_framework_with_global_classifier(client_models, server_models, client_resources=None):
+    """
+    创建带有全局分类器服务的训练框架
+    
+    Args:
+        client_models: 客户端模型字典
+        server_models: 服务器模型字典
+        client_resources: 客户端资源信息字典（可选）
+        
+    Returns:
+        训练协调器
+    """
+    # 初始化扩展的训练协调器
+    coordinator = TrainingCoordinatorWithGlobalClassifier()
     
     # 注册客户端
     for client_id, client_model in client_models.items():

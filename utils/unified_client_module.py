@@ -938,3 +938,201 @@ class ClientManager:
             results[client_id] = eval_stats
         
         return results
+
+def train_client_with_global_classifier(client_id, client_model, server_model, device, 
+                         client_manager, round_idx, coordinator, local_epochs=None, split_rounds=1, global_classifier=None, **kwargs):
+    """
+    使用全局分类器服务的客户端训练函数
+    """
+    try:
+        client = client_manager.get_client(client_id)
+        if client is None:
+            return {'error': f"客户端 {client_id} 不存在"}
+        
+        # 确保客户端设备与传入的设备一致
+        client.device = device
+        
+        # 记录开始时间
+        start_time = time.time()
+        
+        # 第1步：本地训练
+        client_model_copy = copy.deepcopy(client_model)
+        client_state, local_stats = client.local_train(client_model_copy, local_epochs)
+        local_train_time = local_stats['time']
+        
+        # 获取客户端所属聚类
+        cluster_id = client_manager.get_client_cluster(client_id)
+        
+        # 第2步：拆分学习但使用全局分类器服务
+        # 修改EnhancedClient.train_split_learning的逻辑，以支持全局分类器服务
+        
+        # 初始化客户端优化器
+        if not hasattr(client, 'optimizer') or client.optimizer is None:
+            client.init_optimizer(client_model_copy)
+        client_optimizer = client.optimizer
+        
+        # 初始化服务器优化器
+        server_model_copy = copy.deepcopy(server_model).to(device)
+        server_optimizer = torch.optim.Adam(
+            server_model_copy.parameters(),
+            lr=client.learning_rate,
+            weight_decay=5e-4
+        )
+        
+        # 设置模型为训练模式
+        client_model_copy.train()
+        server_model_copy.train()
+        
+        # 记录数据传输大小
+        intermediate_data_size = 0
+        
+        # 训练统计信息
+        stats = {
+            'global_loss': [],
+            'global_accuracy': [],
+            'local_loss': [],
+            'local_accuracy': [],
+            'time': 0,
+            'data_transmitted_mb': 0
+        }
+        
+        # 开始计时
+        sl_start_time = time.time()
+        
+        for round_idx in range(split_rounds):
+            # 本地分类器指标
+            round_local_loss = 0.0
+            round_local_correct = 0
+            # 全局分类器指标
+            round_global_loss = 0.0
+            round_global_correct = 0
+            # 样本数
+            round_samples = 0
+            
+            for batch_idx, (images, labels) in enumerate(client.ldr_train):
+                images, labels = images.to(device), labels.to(device)
+                
+                # 1. 客户端前向传播
+                client_optimizer.zero_grad()
+                client_outputs = client_model_copy(images)
+                
+                # 客户端模型应该返回(logits, features)
+                if isinstance(client_outputs, tuple):
+                    client_logits, client_features = client_outputs
+                    
+                    # 计算本地分类器损失和准确率
+                    local_loss = client.criterion(client_logits, labels)
+                    
+                    _, local_predicted = torch.max(client_logits.data, 1)
+                    local_batch_correct = (local_predicted == labels).sum().item()
+                    
+                    # 更新本地分类器统计
+                    round_local_loss += local_loss.item() * labels.size(0)
+                    round_local_correct += local_batch_correct
+                else:
+                    # 如果没有返回元组，则假设只返回了特征
+                    client_features = client_outputs
+                    client_logits = None
+                    local_loss = 0
+                
+                # 确保client_features需要梯度
+                if not client_features.requires_grad:
+                    client_features = client_features.clone().detach().requires_grad_(True)
+                
+                # 记录中间特征大小
+                features_size_bytes = client_features.nelement() * client_features.element_size()
+                intermediate_data_size += features_size_bytes + labels.nelement() * labels.element_size()
+                
+                # 2. 服务器前向传播
+                server_optimizer.zero_grad()
+                server_features = server_model_copy(client_features)
+                
+                # 3. 使用全局分类器服务处理特征
+                global_result = coordinator.process_features_sync(
+                    cluster_id, server_features, labels
+                )
+                
+                global_loss = global_result['loss']
+                global_metrics = global_result['metrics']
+                feature_gradients = global_result['gradients']
+                
+                # 更新全局分类器统计
+                global_batch_correct = int(global_metrics['accuracy'] * labels.size(0) / 100)
+                round_global_loss += global_loss * labels.size(0)
+                round_global_correct += global_batch_correct
+                
+                # 4. 使用全局分类器返回的梯度更新服务器模型
+                if feature_gradients is not None:
+                    server_features.backward(feature_gradients)
+                server_optimizer.step()
+                
+                # 5. 更新客户端模型
+                if client_features.grad is not None:
+                    client_optimizer.step()
+                
+                # 更新样本数
+                round_samples += labels.size(0)
+            
+            # 计算每个轮次的平均值
+            if round_samples > 0:
+                # 本地分类器指标
+                round_local_loss /= round_samples
+                round_local_acc = 100.0 * round_local_correct / round_samples
+                stats['local_loss'].append(round_local_loss)
+                stats['local_accuracy'].append(round_local_acc)
+                
+                # 全局分类器指标
+                round_global_loss /= round_samples
+                round_global_acc = 100.0 * round_global_correct / round_samples
+                stats['global_loss'].append(round_global_loss)
+                stats['global_accuracy'].append(round_global_acc)
+        
+        # 计算训练耗时
+        sl_train_time = time.time() - sl_start_time
+        
+        # 计算中间数据大小（MB）
+        intermediate_data_size_mb = intermediate_data_size / (1024 ** 2)
+        
+        # 更新训练统计信息
+        avg_local_loss = np.mean(stats['local_loss']) if stats['local_loss'] else 0
+        avg_local_acc = np.mean(stats['local_accuracy']) if stats['local_accuracy'] else 0
+        avg_global_loss = np.mean(stats['global_loss']) if stats['global_loss'] else 0
+        avg_global_acc = np.mean(stats['global_accuracy']) if stats['global_accuracy'] else 0
+        
+        # 更新结果统计信息
+        stats['time'] = sl_train_time
+        stats['total_time'] = local_train_time + sl_train_time
+        stats['data_transmitted_mb'] = intermediate_data_size_mb
+        stats['data_size'] = len(client.ldr_train.dataset) if hasattr(client.ldr_train, 'dataset') else 0
+        
+        # 为了兼容旧代码，保留原有的loss和accuracy字段
+        stats['loss'] = avg_global_loss
+        stats['accuracy'] = avg_global_acc
+        
+        # 返回结果
+        return {
+            'client_model_state': client_model_copy.state_dict(),
+            'server_model_state': server_model_copy.state_dict(),
+            'local_train': local_stats,
+            'split_learning': stats,
+            'loss': avg_global_loss,
+            'accuracy': avg_global_acc,
+            'local_sl_loss': avg_local_loss,
+            'local_sl_accuracy': avg_local_acc,
+            'global_sl_loss': avg_global_loss,
+            'global_sl_accuracy': avg_global_acc,
+            'local_train_loss': local_stats.get('loss', 0),
+            'local_train_accuracy': local_stats.get('accuracy', 0),
+            'time': local_train_time + sl_train_time,
+            'local_train_time': local_train_time,
+            'sl_train_time': sl_train_time,
+            'data_size': stats['data_size'],
+            'communication_mb': intermediate_data_size_mb,
+            'lr': local_stats.get('lr_final', client.learning_rate)
+        }
+        
+    except Exception as e:
+        import traceback
+        error_msg = f"客户端 {client_id} 训练失败: {str(e)}\n{traceback.format_exc()}"
+        print(error_msg)
+        return {'error': error_msg}
