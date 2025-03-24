@@ -205,81 +205,64 @@ def create_enhanced_client_model(base_model, tier, target_dim=256):
 # 创建增强的服务器模型
 def create_enhanced_server_model(base_server_model, tier, target_dim=256, num_classes=10, classifier_mode='feature_only'):
     """
-    基于tier级别创建适当的服务器模型
-    
-    Args:
-        base_server_model: 基础服务器模型
-        tier: tier级别
-        target_dim: 目标特征维度
-        num_classes: 类别数量
-        classifier_mode: 分类器模式，'feature_only'表示只输出特征，不包含分类器
-        
-    Returns:
-        增强的服务器模型
+    基于tier级别创建适当的服务器模型，避免重复的维度转换
     """
-    # 服务器模型现在已经输出扁平化的特征，所以不需要太多处理
-    # 创建特征提取器模型
-    if classifier_mode == 'feature_only':
-        # 只包含特征提取层，不包含分类器
-        class FeatureOnlyServerModel(nn.Module):
-            def __init__(self, base_model, target_dim):
-                super(FeatureOnlyServerModel, self).__init__()
-                self.base_model = base_model
-                self.target_dim = target_dim
-                
-                # 添加一个简单的特征适配层，确保输出维度是target_dim
-                # 避免使用BatchNorm1d，改用LayerNorm或直接使用普通激活函数
-                self.feature_adapter = nn.Sequential(
-                    nn.Linear(target_dim, target_dim),  # 恒等变换
-                    nn.LayerNorm(target_dim),  # 使用LayerNorm代替BatchNorm1d
-                    nn.ReLU(inplace=True)
-                )
+    # 简化的特征提取器模型
+    class SimplifiedServerModel(nn.Module):
+        def __init__(self, base_model):
+            super(SimplifiedServerModel, self).__init__()
+            self.base_model = base_model
             
-            def forward(self, x):
-                # 通过基础服务器模型处理特征
-                features = self.base_model(x)
-                
-                # 应用特征适配层
-                adapted_features = self.feature_adapter(features)
-                
-                return adapted_features
-        
-        # 创建特征提取器模型并设为评估模式
-        enhanced_model = FeatureOnlyServerModel(
-            base_server_model,
-            target_dim
-        )
-        # 确保测试时是评估模式
-        enhanced_model.eval()
+            # 仅添加归一化层，无需改变维度
+            self.norm_layer = nn.LayerNorm(target_dim)
+            
+        def forward(self, x):
+            # 通过基础服务器模型处理特征
+            features = self.base_model(x)
+            
+            # 对于卷积特征，进行全局平均池化
+            if len(features.shape) > 2:
+                features = F.adaptive_avg_pool2d(features, (1, 1))
+                features = features.view(features.size(0), -1)
+            
+            # 仅应用归一化，维持维度不变
+            normalized_features = self.norm_layer(features)
+            
+            return normalized_features
+    
+    if classifier_mode == 'feature_only':
+        # 使用简化模型，避免冗余转换
+        enhanced_model = SimplifiedServerModel(base_server_model)
     else:
-        # 包含分类器的完整服务器模型（原始实现）
+        # 带分类器的完整服务器模型
         class EnhancedServerModelWithClassifier(nn.Module):
-            def __init__(self, base_model, target_dim, hidden_dims, num_classes):
+            def __init__(self, base_model, hidden_dims, num_classes):
                 super(EnhancedServerModelWithClassifier, self).__init__()
                 self.base_model = base_model
                 
-                # 添加分类器
+                # 添加分类器，不需要额外的维度转换
                 self.classifier = UnifiedClassifier(
                     target_dim, hidden_dims, num_classes
                 )
             
             def forward(self, x):
-                # 通过基础服务器模型处理特征
                 features = self.base_model(x)
                 
-                # 通过分类器
-                logits = self.classifier(features)
+                # 对于卷积特征，进行全局平均池化
+                if len(features.shape) > 2:
+                    features = F.adaptive_avg_pool2d(features, (1, 1))
+                    features = features.view(features.size(0), -1)
                 
+                logits = self.classifier(features)
                 return logits
         
-        # 创建带分类器的服务器模型
         enhanced_model = EnhancedServerModelWithClassifier(
             base_server_model,
-            target_dim,
             [128, 64],  # 隐藏层维度
             num_classes
         )
-        # 确保测试时是评估模式
-        enhanced_model.eval()
+    
+    # 确保模型为评估模式
+    enhanced_model.eval()
     
     return enhanced_model

@@ -283,10 +283,12 @@ class GlobalClassifierService:
         """
         self.classifier = classifier.to(device)
         self.device = device
+        
+        # 使用较小的学习率和权重衰减
         self.optimizer = torch.optim.Adam(
             self.classifier.parameters(),
-            lr=0.001,
-            weight_decay=5e-4
+            lr=0.0005,  # 降低学习率
+            weight_decay=1e-4
         )
         self.criterion = nn.CrossEntropyLoss()
         
@@ -327,6 +329,10 @@ class GlobalClassifierService:
                 features = features.to(self.device)
                 labels = labels_batch[cluster_id].to(self.device)
                 
+                # 特征标准化 - 减少尺度问题
+                if torch.mean(torch.abs(features)) > 10:  # 大特征值检测
+                    features = F.normalize(features, p=2, dim=1)
+                
                 batch_size = features.size(0)
                 all_features.append(features)
                 all_labels.append(labels)
@@ -340,12 +346,19 @@ class GlobalClassifierService:
                 all_features = torch.cat(all_features, dim=0)
                 all_labels = torch.cat(all_labels, dim=0)
                 
+                # 确保特征需要梯度
+                if not all_features.requires_grad:
+                    all_features = all_features.detach().requires_grad_(True)
+                
                 # 前向传播
                 outputs = self.classifier(all_features)
                 loss = self.criterion(outputs, all_labels)
                 
                 # 反向传播计算梯度
                 loss.backward()
+                
+                # 在优化器步进前应用梯度裁剪
+                torch.nn.utils.clip_grad_norm_(self.classifier.parameters(), max_norm=1.0)
                 
                 # 优化器步进
                 self.optimizer.step()
@@ -366,6 +379,11 @@ class GlobalClassifierService:
                     
                     # 提取聚类梯度（对于输入特征）
                     if cluster_features.grad is not None:
+                        # 裁剪梯度，防止梯度爆炸
+                        grad_norm = torch.norm(cluster_features.grad)
+                        if grad_norm > 1.0:
+                            cluster_features.grad = cluster_features.grad * (1.0 / grad_norm)
+                        
                         gradients_dict[cluster_id] = cluster_features.grad.clone().detach()
                     
                     # 计算聚类准确率
@@ -373,7 +391,7 @@ class GlobalClassifierService:
                     cluster_accuracy = (cluster_predicted == cluster_labels).float().mean().item() * 100
                     metrics_dict[cluster_id] = {'accuracy': cluster_accuracy}
             
-        # 如果输入是列表形式
+        # 如果输入是列表形式 - 类似逻辑
         elif isinstance(features_batch, list):
             for i, features in enumerate(features_batch):
                 if i >= len(labels_batch):
@@ -382,6 +400,14 @@ class GlobalClassifierService:
                 cluster_id = cluster_ids[i] if cluster_ids and i < len(cluster_ids) else i
                 features = features.to(self.device)
                 labels = labels_batch[i].to(self.device)
+                
+                # 特征标准化
+                if torch.mean(torch.abs(features)) > 10:
+                    features = F.normalize(features, p=2, dim=1)
+                
+                # 确保特征需要梯度
+                if not features.requires_grad:
+                    features = features.detach().requires_grad_(True)
                 
                 # 前向传播
                 outputs = self.classifier(features)
@@ -392,7 +418,13 @@ class GlobalClassifierService:
                 
                 # 提取梯度和损失
                 if features.grad is not None:
+                    # 裁剪梯度
+                    grad_norm = torch.norm(features.grad)
+                    if grad_norm > 1.0:
+                        features.grad = features.grad * (1.0 / grad_norm)
+                    
                     gradients_dict[cluster_id] = features.grad.clone().detach()
+                    
                 loss_dict[cluster_id] = loss.item()
                 
                 # 计算准确率
@@ -400,7 +432,8 @@ class GlobalClassifierService:
                 accuracy = (predicted == labels).float().mean().item() * 100
                 metrics_dict[cluster_id] = {'accuracy': accuracy}
             
-            # 优化器步进
+            # 梯度裁剪和优化器步进
+            torch.nn.utils.clip_grad_norm_(self.classifier.parameters(), max_norm=1.0)
             self.optimizer.step()
         
         return gradients_dict, loss_dict, metrics_dict

@@ -63,6 +63,7 @@ from utils.model_diagnosis_repair import ModelDiagnosticTracker, comprehensive_m
 from utils.aggregation_mechanisms import enhanced_hierarchical_aggregation_no_projection
 from utils.parallel_training_framework import create_training_framework,create_training_framework_with_global_classifier
 from utils.unified_client_module import EnhancedClient, ClientManager, train_client_with_global_classifier
+from utils.global_model_utils import create_models_by_splitting, create_global_model, combine_to_global_model, split_global_model
 
 
 # 设置随机种子，确保实验可复现
@@ -153,7 +154,7 @@ def parse_arguments():
     parser.add_argument('--wd', help='权重衰减参数', type=float, default=5e-4)
  
     # 模型相关参数
-    parser.add_argument('--model', type=str, default='resnet110', help='训练使用的神经网络')
+    parser.add_argument('--model', type=str, default='resnet110', help='训练使用的神经网络 (resnet110 或 resnet56)')
     
     # 数据加载和预处理相关参数
     parser.add_argument('--dataset', type=str, default='cifar10', help='训练数据集')
@@ -345,135 +346,30 @@ def safe_load_state_dict(model, state_dict, verbose=False):
 def create_models(args, class_num):
     """创建客户端和服务器模型"""
     print("创建模型架构...")
-    # 初始化字典存储不同tier的客户端和服务器模型
-    client_base_models = {}
-    server_base_models = {}
+    # 确定设备
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # 选择合适的模型架构
-    if args.model == 'resnet110':
-        SFL_model_func = resnet110_SFL_local_tier_7
-        num_tiers = 7
-        init_glob_model = resnet110_SFL_fedavg_base(classes=class_num, tier=1, fedavg_base=True)
-    else:
-        SFL_model_func = resnet56_SFL_local_tier_7
-        num_tiers = 7
-        init_glob_model = None
-
-    # 为每个tier创建基础模型
-    for tier in range(1, num_tiers + 1):
-        # 强制设置local_loss=True，确保客户端有自己的分类器
-        client_model, server_model = SFL_model_func(classes=class_num, tier=tier, local_loss=True)
-        client_base_models[tier] = client_model
-        server_base_models[tier] = server_model
-        
-        # 打印每个tier的模型输入输出维度
-        # 使用dummy输入来获取输出维度
-        with torch.no_grad():
-            dummy_input = torch.randn(1, 3, 32, 32)  # 假设输入是32x32的图像
-            
-            # 获取客户端模型输出
-            client_output = client_model(dummy_input)
-            # 客户端模型应该返回(logits, features)元组
-            if isinstance(client_output, tuple):
-                client_logits, client_features = client_output
-                client_output_dim = client_features.shape[1] if len(client_features.shape) > 1 else client_features.shape[0]
-                if len(client_features.shape) > 2:  # 如果是卷积特征，需要获取通道数
-                    client_output_spatial = f"{client_features.shape[2]}x{client_features.shape[3]}"
-                    client_output_info = f"{client_output_dim} channels, {client_output_spatial}"
-                else:
-                    client_output_info = f"{client_output_dim}"
-            else:
-                print(f"警告: Tier {tier} 客户端模型没有返回特征，可能没有正确设置local_loss=True")
-                client_output_info = "未知"
-            
-            # 打印tier信息和模型维度
-            print(f"Tier {tier}:")
-            print(f"  - 客户端模型: 输入 = 3 channels, 32x32 | 输出特征 = {client_output_info} | 分类器输出 = {class_num}")
-            
-            # 服务器模型信息
-            if isinstance(client_output, tuple):
-                server_input = client_features
-            else:
-                server_input = client_output
-                
-            if isinstance(server_model, nn.Module):  # 确保是PyTorch模型
-                # 尝试获取服务器模型输出
-                try:
-                    server_output = server_model(server_input)
-                    server_output_dim = server_output.shape[1] if len(server_output.shape) > 1 else server_output.shape[0]
-                    if len(server_output.shape) > 2:  # 如果是卷积特征，需要获取通道数
-                        server_output_spatial = f"{server_output.shape[2]}x{server_output.shape[3]}"
-                        server_output_info = f"{server_output_dim} channels, {server_output_spatial}"
-                    else:
-                        server_output_info = f"{server_output_dim}"
-                    print(f"  - 服务器模型: 输入 = {client_output_info} | 输出特征 = {server_output_info}")
-                except Exception as e:
-                    print(f"  - 服务器模型: 输入 = {client_output_info} | 输出测试失败: {str(e)}")
+    # 通过拆分全局模型创建所有tier的客户端和服务器模型
+    client_models, server_models, unified_classifier, init_glob_model, num_tiers = create_models_by_splitting(
+        class_num=class_num,
+        model_type=args.model,  # 'resnet110' 或 'resnet56'
+        device=device
+    )
     
-    # 定义目标特征维度 - 所有服务器输出应该调整到这个维度
-    target_dim = 256
-    
-    # 创建全局统一分类器
-    unified_classifier = UnifiedClassifier(target_dim, [128, 64], class_num, dropout_rate=0.5)
-    print(f"\n全局统一分类器: 输入 = {target_dim} | 隐藏层 = [128, 64] | 输出 = {class_num}")
-    
-    # 修改增强模型的创建方式
-    enhanced_client_models = {}
-    enhanced_server_models = {}
-    
-    for tier in range(1, num_tiers + 1):
-        # 客户端模型只需要保留原始结构，不需要添加特征适配层
-        # 因为客户端已经有了自己的分类器
-        enhanced_client_models[tier] = client_base_models[tier]
-        
-        # 服务器模型需要添加特征适配层，将输出调整为统一维度
-        enhanced_server_models[tier] = create_enhanced_server_model(
-            server_base_models[tier], 
-            tier, 
-            target_dim=target_dim, 
-            num_classes=class_num,
-            classifier_mode='feature_only'  # 服务器端只输出特征，不包含分类器
-        )
-        
-        # 获取原始和增强后的维度信息
-        with torch.no_grad():
-            # 设置所有模型为评估模式，避免BatchNorm的问题
-            client_base_models[tier].eval()
-            server_base_models[tier].eval()
-            enhanced_server_models[tier].eval()
-            
-            dummy_input = torch.randn(1, 3, 32, 32)
-            client_output = client_base_models[tier](dummy_input)
-            
-            if isinstance(client_output, tuple):
-                _, client_features = client_output
-            else:
-                client_features = client_output
-                
-            # 测试服务器模型输出
-            try:
-                # 测试增强后的服务器模型
-                enhanced_server_model = enhanced_server_models[tier]
-                server_enhanced_output = enhanced_server_model(client_features)
-                server_output_dim = server_enhanced_output.shape[1] if len(server_enhanced_output.shape) > 1 else server_enhanced_output.shape[0]
-                
-                print(f"\nTier {tier} 增强模型:")
-                print(f"  - 客户端模型: 保持原始结构，有独立分类器")
-                print(f"  - 服务器模型: 添加特征适配层，将输出调整至统一维度 {server_output_dim}")
-            except Exception as e:
-                print(f"\nTier {tier} 增强模型测试失败: {str(e)}")
-                print(f"  - 客户端特征形状: {client_features.shape}")
-                print(f"  - 调试信息: 客户端tier={tier}, 期望的特征维度={target_dim}")
+    # 打印模型架构信息
+    print("\n===== 模型架构信息 =====")
+    print(f"模型类型: {args.model}")
+    print(f"Tier数量: {num_tiers}")
+    print(f"分类器输入维度: 256, 分类数: {class_num}")
     
     # 打印第一个tier的模型架构（示例）
-    print_model_architecture(enhanced_client_models[1], "客户端模型 (Tier 1)", detail_level=1)
-    print_model_architecture(enhanced_server_models[1], "服务器模型 (Tier 1)", detail_level=1)
-    print_model_architecture(enhanced_client_models[2], "客户端模型 (Tier 2)", detail_level=1)
-    print_model_architecture(enhanced_server_models[2], "服务器模型 (Tier 2)", detail_level=1)
-    print_model_architecture(enhanced_client_models[3], "客户端模型 (Tier 3)", detail_level=1)
-    print_model_architecture(enhanced_server_models[3], "服务器模型 (Tier 3)", detail_level=1)
+    print_model_architecture(client_models[1], "客户端模型 (Tier 1)", detail_level=1)
+    print_model_architecture(server_models[1], "服务器模型 (Tier 1)", detail_level=1)
+    print_model_architecture(client_models[3], "客户端模型 (Tier 3)", detail_level=1)
+    print_model_architecture(server_models[3], "服务器模型 (Tier 3)", detail_level=1)
     print_model_architecture(unified_classifier, "统一分类器", detail_level=2)
-    return enhanced_client_models, enhanced_server_models, unified_classifier, init_glob_model, num_tiers
+    
+    return client_models, server_models, unified_classifier, init_glob_model, num_tiers
 def setup_clients(args, dataset, client_resources, client_models, server_models):
     """设置客户端管理器和客户端"""
     # 提取数据集信息
@@ -778,7 +674,319 @@ def evaluate_client_function(client_id, client_model, server_model, device, clie
         print(error_msg)
         return {'error': error_msg}
 
+# 添加诊断代码
+def diagnose_model_and_features(model, dataloader, device, diagnosis_rounds=5):
+    """
+    诊断模型和特征分布
+    
+    Args:
+        model: 要诊断的模型
+        dataloader: 数据加载器
+        device: 计算设备
+        diagnosis_rounds: 诊断批次数量
+        
+    Returns:
+        诊断结果字典
+    """
+    model = model.to(device)
+    model.eval()
+    
+    # 存储诊断结果
+    diagnosis = {
+        'feature_stats': {
+            'min': [],
+            'max': [],
+            'mean': [],
+            'std': [],
+            'has_nan': False,
+            'has_inf': False
+        },
+        'classifier_weights': {
+            'fc1_norm': 0,
+            'fc2_norm': 0,
+            'fc3_norm': 0,
+            'min': 0,
+            'max': 0,
+            'mean': 0
+        },
+        'class_predictions': [0] * 10,  # 假设10个类别
+        'confusion_matrix': np.zeros((10, 10))  # 假设10个类别
+    }
+    
+    # 检查分类器权重
+    if hasattr(model, 'classifier'):
+        for name, param in model.classifier.named_parameters():
+            if 'weight' in name:
+                norm = torch.norm(param).item()
+                diagnosis['classifier_weights'][name + '_norm'] = norm
+                
+                # 记录权重统计信息
+                diagnosis['classifier_weights']['min'] = float(torch.min(param))
+                diagnosis['classifier_weights']['max'] = float(torch.max(param))
+                diagnosis['classifier_weights']['mean'] = float(torch.mean(param))
+    
+    # 分析特征和预测
+    batch_count = 0
+    with torch.no_grad():
+        for data, target in dataloader:
+            if batch_count >= diagnosis_rounds:
+                break
+                
+            data, target = data.to(device), target.to(device)
+            
+            # 获取特征
+            if hasattr(model, 'extract_features'):
+                features = model.extract_features(data)
+            else:
+                # 对于普通模型，尝试获取特征
+                outputs = model(data)
+                if isinstance(outputs, tuple) and len(outputs) > 1:
+                    _, features = outputs
+                else:
+                    features = outputs
+                    
+            # 确保特征是扁平化的
+            if len(features.shape) > 2:
+                # 对卷积特征进行平均池化
+                features = F.adaptive_avg_pool2d(features, (1, 1))
+                features = features.view(features.size(0), -1)
+            
+            # 计算特征统计信息
+            diagnosis['feature_stats']['min'].append(float(torch.min(features)))
+            diagnosis['feature_stats']['max'].append(float(torch.max(features)))
+            diagnosis['feature_stats']['mean'].append(float(torch.mean(features)))
+            diagnosis['feature_stats']['std'].append(float(torch.std(features)))
+            
+            # 检查是否有NaN或Inf值
+            if torch.isnan(features).any():
+                diagnosis['feature_stats']['has_nan'] = True
+            if torch.isinf(features).any():
+                diagnosis['feature_stats']['has_inf'] = True
+                
+            # 分析预测分布
+            if hasattr(model, 'classifier'):
+                logits = model.classifier(features)
+            else:
+                logits = outputs if not isinstance(outputs, tuple) else outputs[0]
+                
+            _, predicted = torch.max(logits, 1)
+            
+            # 更新预测统计
+            for pred in predicted:
+                pred_idx = pred.item()
+                if pred_idx < len(diagnosis['class_predictions']):
+                    diagnosis['class_predictions'][pred_idx] += 1
+            
+            # 更新混淆矩阵
+            for t, p in zip(target, predicted):
+                t_idx, p_idx = t.item(), p.item()
+                if t_idx < 10 and p_idx < 10:  # 假设10个类别
+                    diagnosis['confusion_matrix'][t_idx][p_idx] += 1
+            
+            batch_count += 1
+    
+    # 计算平均特征统计信息
+    for stat in ['min', 'max', 'mean', 'std']:
+        if diagnosis['feature_stats'][stat]:
+            diagnosis['feature_stats'][stat] = sum(diagnosis['feature_stats'][stat]) / len(diagnosis['feature_stats'][stat])
+    
+    # 归一化混淆矩阵
+    row_sums = diagnosis['confusion_matrix'].sum(axis=1, keepdims=True)
+    diagnosis['confusion_matrix'] = np.divide(diagnosis['confusion_matrix'], row_sums, 
+                                              out=np.zeros_like(diagnosis['confusion_matrix']), where=row_sums!=0)
+    
+    return diagnosis
 
+def diagnose_full_model_pipeline(global_model, client_models_dict, server_models_dict, 
+                               client_manager, eval_dataset, device, num_classes=10):
+    """
+    诊断完整模型流程，包括客户端模型、服务器模型和全局模型
+    
+    Args:
+        global_model: 全局模型
+        client_models_dict: 客户端模型字典
+        server_models_dict: 服务器模型字典
+        client_manager: 客户端管理器
+        eval_dataset: 评估数据集
+        device: 计算设备
+        num_classes: 类别数量
+        
+    Returns:
+        完整诊断结果
+    """
+    eval_loader = torch.utils.data.DataLoader(eval_dataset, batch_size=16, shuffle=False)
+    
+    # 初始化诊断结果
+    pipeline_diagnosis = {
+        'global_model': {},
+        'client_models': {},
+        'server_models': {},
+        'client_plus_server': {}
+    }
+    
+    # 诊断全局模型
+    global_model = global_model.to(device)
+    pipeline_diagnosis['global_model'] = diagnose_model_and_features(global_model, eval_loader, device)
+    
+    # 选择几个具有代表性的客户端进行诊断
+    client_ids = []
+    tier_analyzed = set()
+    for client_id, client in client_manager.clients.items():
+        tier = client.tier
+        if tier not in tier_analyzed and len(tier_analyzed) < 3:  # 选择最多3个不同tier的客户端
+            client_ids.append(client_id)
+            tier_analyzed.add(tier)
+    
+    # 诊断选择的客户端模型和对应的服务器模型
+    for client_id in client_ids:
+        client = client_manager.get_client(client_id)
+        tier = client.tier
+        
+        # 获取模型并移至正确设备
+        client_model = client_models_dict[client_id].to(device)
+        server_model = server_models_dict[client_id].to(device)
+        
+        # 单独诊断客户端模型
+        client_diagnosis = diagnose_model_and_features(client_model, eval_loader, device)
+        pipeline_diagnosis['client_models'][f'client_{client_id}_tier_{tier}'] = client_diagnosis
+        
+        # 诊断客户端+服务器的特征映射
+        class CombinedModel(nn.Module):
+            def __init__(self, client_model, server_model):
+                super(CombinedModel, self).__init__()
+                self.client_model = client_model
+                self.server_model = server_model
+                
+            def forward(self, x):
+                client_output = self.client_model(x)
+                if isinstance(client_output, tuple):
+                    client_logits, client_features = client_output
+                else:
+                    client_features = client_output
+                
+                server_output = self.server_model(client_features)
+                return server_output
+        
+        combined_model = CombinedModel(client_model, server_model).to(device)
+        combined_diagnosis = diagnose_model_and_features(combined_model, eval_loader, device)
+        pipeline_diagnosis['client_plus_server'][f'client_{client_id}_tier_{tier}'] = combined_diagnosis
+    
+    return pipeline_diagnosis
+
+def evaluate_split_model_pipeline(client_manager, client_models_dict, server_models_dict, 
+                                global_classifier, eval_dataset, device):
+    """
+    评估拆分模型流程 - 客户端+服务器+全局分类器
+    
+    Args:
+        client_manager: 客户端管理器
+        client_models_dict: 客户端模型字典
+        server_models_dict: 服务器模型字典
+        global_classifier: 全局分类器
+        eval_dataset: 评估数据集
+        device: 计算设备
+        
+    Returns:
+        评估结果字典
+    """
+    eval_loader = torch.utils.data.DataLoader(eval_dataset, batch_size=32, shuffle=False)
+    global_classifier = global_classifier.to(device)
+    
+    results = {}
+    
+    # 选择几个代表性客户端进行评估
+    client_ids = []
+    tier_analyzed = set()
+    for client_id, client in client_manager.clients.items():
+        tier = client.tier
+        if tier not in tier_analyzed and len(tier_analyzed) < 5:  # 最多5个不同tier
+            client_ids.append(client_id)
+            tier_analyzed.add(tier)
+    
+    # 逐个评估客户端
+    for client_id in client_ids:
+        client = client_manager.get_client(client_id)
+        tier = client.tier
+        
+        # 获取模型并移至正确设备
+        client_model = client_models_dict[client_id].to(device)
+        server_model = server_models_dict[client_id].to(device)
+        
+        # 设置评估模式
+        client_model.eval()
+        server_model.eval()
+        global_classifier.eval()
+        
+        # 初始化指标
+        correct = 0
+        total = 0
+        loss_sum = 0.0
+        criterion = nn.CrossEntropyLoss()
+        
+        # 特征尺度统计
+        feature_stats = {
+            'client_feature_scales': [],
+            'server_feature_scales': []
+        }
+        
+        with torch.no_grad():
+            for data, target in eval_loader:
+                data, target = data.to(device), target.to(device)
+                
+                # 客户端前向传播
+                client_outputs = client_model(data)
+                if isinstance(client_outputs, tuple):
+                    client_logits, client_features = client_outputs
+                else:
+                    client_features = client_outputs
+                
+                # 记录客户端特征尺度
+                client_feature_norm = torch.norm(client_features.view(client_features.size(0), -1), 
+                                              dim=1).mean().item()
+                feature_stats['client_feature_scales'].append(client_feature_norm)
+                
+                # 服务器前向传播
+                server_features = server_model(client_features)
+                
+                # 记录服务器特征尺度
+                server_feature_norm = torch.norm(server_features.view(server_features.size(0), -1), 
+                                              dim=1).mean().item()
+                feature_stats['server_feature_scales'].append(server_feature_norm)
+                
+                # 全局分类器前向传播
+                logits = global_classifier(server_features)
+                
+                # 计算损失和准确率
+                loss = criterion(logits, target)
+                loss_sum += loss.item() * target.size(0)
+                
+                _, predicted = torch.max(logits, 1)
+                total += target.size(0)
+                correct += (predicted == target).sum().item()
+        
+        # 计算平均指标
+        accuracy = 100.0 * correct / total if total > 0 else 0
+        avg_loss = loss_sum / total if total > 0 else 0
+        
+        # 计算平均特征尺度
+        avg_client_scale = sum(feature_stats['client_feature_scales']) / len(feature_stats['client_feature_scales']) \
+                         if feature_stats['client_feature_scales'] else 0
+        avg_server_scale = sum(feature_stats['server_feature_scales']) / len(feature_stats['server_feature_scales']) \
+                         if feature_stats['server_feature_scales'] else 0
+        
+        # 记录结果
+        results[f'client_{client_id}_tier_{tier}'] = {
+            'accuracy': accuracy,
+            'loss': avg_loss,
+            'client_feature_scale': avg_client_scale,
+            'server_feature_scale': avg_server_scale
+        }
+        
+        print(f"客户端 {client_id} (Tier {tier}) 流水线评估:")
+        print(f"  准确率: {accuracy:.2f}%, 损失: {avg_loss:.4f}")
+        print(f"  客户端特征尺度: {avg_client_scale:.4f}, 服务器特征尺度: {avg_server_scale:.4f}")
+    
+    return results
 def main():
     """主函数"""
     # 解析命令行参数
@@ -948,32 +1156,42 @@ def main():
         # 执行分层聚合
         logger.info("执行双层聚合...")
         try:
-            global_model, cluster_models, agg_log = enhanced_hierarchical_aggregation_no_projection(
+            # 执行聚类内聚合
+            _, cluster_models, agg_log = enhanced_hierarchical_aggregation_no_projection(
                 client_models_params, 
                 client_weights, 
                 client_clusters,
-                client_tiers=client_tiers,  # 新增参数
+                client_tiers=client_tiers,
                 global_model_template=init_glob_model.state_dict() if init_glob_model else None,
                 num_classes=class_num
+            )
+            
+            # 执行全局模型组合 (基于拆分学习思想)
+            global_model = combine_to_global_model(
+                client_models_params,
+                server_models_dict,
+                client_tiers,
+                init_glob_model
             )
             
             # 确保global_model不为None
             if global_model is None:
                 print("错误: global_model为None，使用默认模型")
                 global_model = {} if init_glob_model is None else init_glob_model.state_dict()
+
         except Exception as e:
             print(f"聚合过程出错: {str(e)}")
             global_model = {} if init_glob_model is None else init_glob_model.state_dict()
             cluster_models = {}
             agg_log = {'error': str(e)}
-        
+                
         # 更新全局模型和聚类模型
         training_framework.set_global_model(global_model)
         training_framework.set_cluster_models(cluster_models)
         
+
         # 创建全局模型进行评估，加载全局模型（忽略增强客户端特有的投影层）
-        global_eval_model = copy.deepcopy(init_glob_model) if init_glob_model else copy.deepcopy(client_models[1])
-        print_model_architecture(global_eval_model, "加载全局模型前的全局评估模型", detail_level=1)
+        global_eval_model = copy.deepcopy(init_glob_model)
 
         # 打印全局模型状态字典键
         print("\n==== 全局聚合模型状态字典信息 ====")
@@ -983,10 +1201,10 @@ def main():
         if 'projection.weight' in global_model:
             print(f"projection.weight形状: {global_model['projection.weight'].shape}")
         print("=" * 40)
-        
+
+        # 加载聚合后的模型参数
         global_eval_model = safe_load_state_dict(global_eval_model, global_model, verbose=True)
         global_eval_model = global_eval_model.to(device)
-
         # 加载后打印
         print_model_architecture(global_eval_model, "加载全局模型后的全局评估模型", detail_level=1)
         
@@ -1284,48 +1502,4 @@ def main():
             if cluster_id in cluster_train_metrics and 'local_train_accuracy' in cluster_train_metrics[cluster_id]:
                 round_metrics[f"cluster_{cluster_id}/local_train_accuracy"] = cluster_train_metrics[cluster_id]['local_train_accuracy']
             if cluster_id in cluster_test_metrics and 'local_test_accuracy' in cluster_test_metrics[cluster_id]:
-                round_metrics[f"cluster_{cluster_id}/local_test_accuracy"] = cluster_test_metrics[cluster_id]['local_test_accuracy']
-            
-            # 全局分类器
-            if cluster_id in cluster_train_metrics and 'global_train_accuracy' in cluster_train_metrics[cluster_id]:
-                round_metrics[f"cluster_{cluster_id}/global_train_accuracy"] = cluster_train_metrics[cluster_id]['global_train_accuracy']
-            if cluster_id in cluster_test_metrics and 'global_test_accuracy' in cluster_test_metrics[cluster_id]:
-                round_metrics[f"cluster_{cluster_id}/global_test_accuracy"] = cluster_test_metrics[cluster_id]['global_test_accuracy']
-            
-            # 兼容原有代码
-            if cluster_id in cluster_train_metrics and 'avg_train_accuracy' in cluster_train_metrics[cluster_id]:
-                round_metrics[f"cluster_{cluster_id}/avg_train_accuracy"] = cluster_train_metrics[cluster_id]['avg_train_accuracy']
-            if cluster_id in cluster_test_metrics and 'avg_test_accuracy' in cluster_test_metrics[cluster_id]:
-                round_metrics[f"cluster_{cluster_id}/avg_test_accuracy"] = cluster_test_metrics[cluster_id]['avg_test_accuracy']
-
-        wandb.log(round_metrics)
-        
-        # 定期记录系统资源使用情况
-        if round_idx % 5 == 0 or round_idx == args.rounds - 1:
-            log_system_resources()
-        
-        # 更新客户端模型（针对下一轮）
-        for client_id in client_models_dict.keys():
-            # 获取客户端所属聚类
-            cluster_id = client_manager.get_client_cluster(client_id)
-            if cluster_id is not None and cluster_id in cluster_models:
-                # 使用对应聚类的模型更新客户端模型
-                client_model = client_models_dict[client_id]
-                client_model.load_state_dict(cluster_models[cluster_id])
-                client_models_dict[client_id] = client_model
-    
-    # 训练完成，记录最终统计信息
-    final_stats = {
-        "final/best_accuracy": best_accuracy,
-        "final/rounds": args.rounds,
-        "final/client_number": args.client_number,
-        "final/clusters": len(client_clusters)
-    }
-    wandb.log(final_stats)
-    
-    logger.info(f"联邦学习训练完成! 最佳准确率: {best_accuracy:.2f}%")
-    wandb.finish()
-
-
-if __name__ == "__main__":
-    main()
+                round_metrics[f"cluster_{cluster_id}/local_test_accuracy"] = cluster_test_metrics[cluster_id]['local
