@@ -150,10 +150,10 @@ def combine_to_global_model(client_models_dict, server_models_dict, client_tiers
     else:
         template_state = global_model_template.state_dict()
     
-    # 创建新的全局状态字典 - 确保在CPU上
+    # 创建新的全局状态字典
     global_state = OrderedDict()
     for key, param in template_state.items():
-        global_state[key] = torch.zeros_like(param, device='cpu')
+        global_state[key] = torch.zeros_like(param)
     
     # 统计每个参数的贡献客户端数
     param_counts = {key: 0 for key in global_state.keys()}
@@ -201,9 +201,7 @@ def combine_to_global_model(client_models_dict, server_models_dict, client_tiers
                 if key in global_state:
                     prefix = key.split('.')[0] if '.' in key else key
                     if prefix in tier_layer_map[tier]:
-                        # 确保参数在CPU上，避免设备不一致
-                        param = client_state[key].detach().cpu()
-                        global_state[key] += param
+                        global_state[key] += client_state[key]
                         param_counts[key] += 1
             
             # 从服务器模型获取参数
@@ -211,9 +209,7 @@ def combine_to_global_model(client_models_dict, server_models_dict, client_tiers
                 if key in global_state:
                     prefix = key.split('.')[0] if '.' in key else key
                     if prefix in server_layer_map[tier]:
-                        # 确保参数在CPU上，避免设备不一致
-                        param = server_state[key].detach().cpu()
-                        global_state[key] += param
+                        global_state[key] += server_state[key]
                         param_counts[key] += 1
     
     # 计算参数平均值
@@ -222,6 +218,6 @@ def combine_to_global_model(client_models_dict, server_models_dict, client_tiers
             global_state[key] = global_state[key] / param_counts[key]
         else:
             # 如果没有客户端贡献该参数，使用模板值
-            global_state[key] = template_state[key].clone().cpu()
+            global_state[key] = template_state[key].clone()
     
     return global_state

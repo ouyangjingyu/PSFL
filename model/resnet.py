@@ -104,48 +104,24 @@ class Bottleneck(nn.Module):
 
 # 构建更高效的分类器
 class ComplexClassifier(nn.Module):
-    def __init__(self, in_features, num_classes, use_normalization=True):
+    def __init__(self, in_features, num_classes):
         super(ComplexClassifier, self).__init__()
-        # 添加特征归一化层
-        self.use_normalization = use_normalization
-        if use_normalization:
-            self.norm = nn.LayerNorm(in_features)
+        # # 根据 in_features 调整中间层维度
+        # mid_features = min(128, max(64, in_features))  # 限制中间层大小
         
-        # 隐藏层维度
-        hidden1 = min(512, max(128, in_features))
-        hidden2 = min(256, max(64, hidden1//2))
-        
-        self.fc1 = nn.Linear(in_features, hidden1)
-        self.fc2 = nn.Linear(hidden1, hidden2)
-        self.fc3 = nn.Linear(hidden2, num_classes)
+        self.fc1 = nn.Linear(in_features, 128)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, num_classes)
         
         self.dropout = nn.Dropout(0.5)
-        
-        # 使用非inplace激活函数
-        self.relu = nn.ReLU(inplace=False)
-        
-        # 初始化参数
-        self._initialize_weights()
-    
-    def _initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-    
+        # print(f"Classifier dimensions: in={in_features}, hidden1=128, hidden2=64, out={num_classes}")
+
     def forward(self, x):
-        # 特征归一化，避免尺度问题
-        if self.use_normalization:
-            x = self.norm(x)
-        
-        # 前向传播
-        x = self.relu(self.fc1(x))
+        x = F.relu(self.fc1(x))
         x = self.dropout(x)
-        x = self.relu(self.fc2(x))
+        x = F.relu(self.fc2(x))
         x = self.dropout(x)
         x = self.fc3(x)
-        
         return x
 
 
