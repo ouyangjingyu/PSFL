@@ -3,6 +3,7 @@ import copy
 import numpy as np
 from collections import OrderedDict
 import torch.nn as nn
+import logging
 
 
 def cluster_aware_aggregation(client_models, client_weights, cluster_map, client_tiers=None):
@@ -578,71 +579,126 @@ def validate_model_parameters(model):
     
 #     return global_model, cluster_models, log_info
 
-def enhanced_hierarchical_aggregation_no_projection(client_models, client_weights, cluster_map, client_tiers=None,
-                                     global_model_template=None, num_classes=10):
-    """修改后的层次聚合函数，忽略projection层参数"""
-    
-    # 初始化日志信息
-    log_info = {
-        'cluster_stats': {},
-        'repair_stats': {},
-        'aggregation_stats': {}
-    }
-    
-    # 执行双层聚合前过滤掉projection相关参数
-    filtered_client_models = {}
-    for client_id, model_state in client_models.items():
-        filtered_state = {k: v for k, v in model_state.items() 
-                         if 'projection' not in k}
-        filtered_client_models[client_id] = filtered_state
-    
-    # 1. 聚类统计信息
-    for cluster_id, client_ids in cluster_map.items():
-        log_info['cluster_stats'][f'cluster_{cluster_id}'] = {
-            'size': len(client_ids),
-            'clients': client_ids
-        }
-        
-        # 记录tier分布
-        if client_tiers:
-            tier_dist = {}
-            for cid in client_ids:
-                if cid in client_tiers:
-                    tier = client_tiers[cid]
-                    tier_dist[tier] = tier_dist.get(tier, 0) + 1
-            log_info['cluster_stats'][f'cluster_{cluster_id}']['tier_distribution'] = tier_dist
+def filter_norm_params(state_dict):
+    """过滤掉状态字典中的归一化层参数"""
+    filtered_dict = {}
+    for k, v in state_dict.items():
+        # 跳过所有归一化层参数
+        if any(x in k for x in ['norm', 'LayerNorm', 'running_mean', 'running_var']):
+            continue
+        # 跳过分类器参数
+        if 'classifier' in k:
+            continue
+        filtered_dict[k] = v
+    return filtered_dict
 
-    # 2. 执行双层聚合
-    global_model, cluster_models = hybrid_aggregation_strategy(
-        filtered_client_models, client_weights, cluster_map, client_tiers
-    )
+
+def enhanced_hierarchical_aggregation_no_projection(client_models_params, client_weights, client_clusters, 
+                                                  client_tiers=None, global_model_template=None, 
+                                                  num_classes=10, device=None):
+    """改进的层次聚合函数，解决设备不一致问题"""
+    # 确定目标设备
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # 如果聚合失败，使用模板或返回空字典
-    if global_model is None:
-        print("警告: 聚合失败，使用全局模型模板或返回空字典")
-        global_model = copy.deepcopy(global_model_template) if global_model_template else {}
+    # 同步日志
+    logging.info(f"模型聚合使用设备: {device}")
     
-    # 3. 验证和修复全局模型参数
-    global_model, fixed_count = validate_model_parameters(global_model)
-    log_info['repair_stats']['global_fixed_count'] = fixed_count
+    # 聚类内聚合结果
+    cluster_models = {}
+    aggregation_log = {}
     
-    # 4. 平衡分类器权重
-    global_model = balance_classifier_weights(global_model, num_classes)
+    # 过滤所有客户端模型参数，去除归一化层参数
+    filtered_client_models_params = {}
+    for client_id, model_params in client_models_params.items():
+        filtered_client_models_params[client_id] = filter_norm_params(model_params)
     
-    # 5. 如果提供了全局模型模板，确保参数完整性
-    if global_model_template is not None:
-        # 复制模板中存在但聚合结果中不存在的参数
-        keys_from_template = 0
-        for key, param in global_model_template.items():
-            if key not in global_model:
-                global_model[key] = param.clone()
-                keys_from_template += 1
+    # 使用过滤后的参数进行聚合
+    client_models_params = filtered_client_models_params
+
+    # 第一步：聚类内聚合
+    for cluster_id, client_ids in client_clusters.items():
+        if len(client_ids) == 0:
+            continue
+            
+        # 收集该聚类内的客户端模型参数和权重
+        cluster_client_models = {}
+        cluster_client_weights = {}
         
-        log_info['aggregation_stats']['template_keys_used'] = keys_from_template
+        for client_id in client_ids:
+            if client_id in client_models_params:
+                # 确保模型参数在同一设备上
+                client_model_params = {}
+                for k, v in client_models_params[client_id].items():
+                    client_model_params[k] = v.to(device)
+                
+                cluster_client_models[client_id] = client_model_params
+                cluster_client_weights[client_id] = client_weights.get(client_id, 1.0)
+        
+        if not cluster_client_models:
+            continue
+            
+        # 执行加权平均聚合
+        agg_state_dict = {}
+        weight_sum = sum(cluster_client_weights.values())
+        
+        # 初始化空的聚合字典
+        for client_id, model_params in cluster_client_models.items():
+            for key in model_params.keys():
+                if key not in agg_state_dict:
+                    agg_state_dict[key] = torch.zeros_like(model_params[key], device=device)
+        
+        # 加权聚合
+        for client_id, model_params in cluster_client_models.items():
+            client_weight = cluster_client_weights[client_id] / weight_sum
+            
+            for key, param in model_params.items():
+                if key in agg_state_dict:
+                    # 确保在同一设备上
+                    param_device = param.to(device)
+                    agg_state_dict[key] += client_weight * param_device
+        
+        # 记录聚合日志
+        if global_model_template:
+            template_keys = set(global_model_template.keys())
+            agg_keys = set(agg_state_dict.keys())
+            aggregation_log[f"聚类 {cluster_id} 聚合结果"] = {
+                "基础模型键数": len(template_keys),
+                "聚合模型键数": len(agg_keys),
+                "额外包含的键数": len(agg_keys - template_keys)
+            }
+            print(f"聚类 {cluster_id} 聚合结果: 基础模型键数={len(template_keys)}, 聚合模型键数={len(agg_keys)}")
+            print(f"  - 额外包含的键数: {len(agg_keys - template_keys)}")
+        
+        # 保存该聚类的聚合模型
+        cluster_models[cluster_id] = agg_state_dict
     
-    # 6. 验证和修复聚类模型参数
-    for cluster_id, model in cluster_models.items():
-        cluster_models[cluster_id], fixed_count = validate_model_parameters(model)
-        log_info['repair_stats'][f'cluster_{cluster_id}_fixed_count'] = fixed_count
-    
-    return global_model, cluster_models, log_info
+    # 第二步：特征提取层的全局聚合
+    if global_model_template is not None:
+        global_model = {}
+        feature_extraction_count = 0
+        total_feature_extraction = 0
+        
+        # 复制全局模型模板作为基础
+        for k, v in global_model_template.items():
+            global_model[k] = v.clone().to(device)
+            
+            # 统计特征提取层参数数量
+            if not any(name in k for name in ['classifier', 'projection']):
+                total_feature_extraction += 1
+        
+        # 聚合所有聚类的特征提取层
+        for cluster_id, model_params in cluster_models.items():
+            for key, param in model_params.items():
+                # 只聚合特征提取层，不包括分类器和投影层
+                if not any(name in key for name in ['classifier', 'projection']):
+                    if key in global_model:
+                        global_model[key] = param.clone().to(device)
+                        feature_extraction_count += 1
+        
+        print(f"全局聚合模型: 聚合了 {feature_extraction_count}/{total_feature_extraction} 个特征提取层参数")
+        
+        return global_model, cluster_models, aggregation_log
+    else:
+        # 如果没有全局模型模板，直接返回聚类模型
+        return None, cluster_models, aggregation_log

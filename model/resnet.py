@@ -103,26 +103,127 @@ class Bottleneck(nn.Module):
 
 
 # 构建更高效的分类器
-class ComplexClassifier(nn.Module):
-    def __init__(self, in_features, num_classes):
-        super(ComplexClassifier, self).__init__()
-        # # 根据 in_features 调整中间层维度
-        # mid_features = min(128, max(64, in_features))  # 限制中间层大小
+# class ComplexClassifier(nn.Module):
+#     def __init__(self, in_features, num_classes):
+#         super(ComplexClassifier, self).__init__()
+#         # # 根据 in_features 调整中间层维度
+#         # mid_features = min(128, max(64, in_features))  # 限制中间层大小
         
-        self.fc1 = nn.Linear(in_features, 128)
-        self.fc2 = nn.Linear(128, 64)
-        self.fc3 = nn.Linear(64, num_classes)
+#         self.fc1 = nn.Linear(in_features, 128)
+#         self.fc2 = nn.Linear(128, 64)
+#         self.fc3 = nn.Linear(64, num_classes)
         
-        self.dropout = nn.Dropout(0.5)
-        # print(f"Classifier dimensions: in={in_features}, hidden1=128, hidden2=64, out={num_classes}")
+#         self.dropout = nn.Dropout(0.5)
+#         # print(f"Classifier dimensions: in={in_features}, hidden1=128, hidden2=64, out={num_classes}")
+
+#     def forward(self, x):
+#         x = F.relu(self.fc1(x))
+#         x = self.dropout(x)
+#         x = F.relu(self.fc2(x))
+#         x = self.dropout(x)
+#         x = self.fc3(x)
+#         return x
+
+# 在model/resnet.py中修改ComplexClassifier类
+
+# 在 model/resnet.py 中添加
+
+class LayerNormClassifier(nn.Module):
+    """使用LayerNorm的分类器，适用于异质性数据环境"""
+    def __init__(self, in_features, num_classes, is_local=False):
+        super(LayerNormClassifier, self).__init__()
+        # 使用LayerNorm替代BatchNorm - 不依赖批次统计量
+        self.norm_input = nn.LayerNorm(in_features)
+        
+        # 客户端本地分类器和全局分类器使用不同的隐藏层大小
+        hidden1 = 128 if not is_local else 96
+        hidden2 = 64 if not is_local else 48
+        
+        self.fc1 = nn.Linear(in_features, hidden1)
+        self.norm1 = nn.LayerNorm(hidden1)
+        
+        self.fc2 = nn.Linear(hidden1, hidden2)
+        self.norm2 = nn.LayerNorm(hidden2)
+        
+        self.fc3 = nn.Linear(hidden2, num_classes)
+        
+        # 本地分类器使用更高的Dropout以适应局部数据
+        # 全局分类器使用较低的Dropout提高泛化性
+        self.dropout = nn.Dropout(0.6 if is_local else 0.3)
+        
+        # 初始化权重
+        self._init_weights()
+        
+    def _init_weights(self):
+        # 使用更好的初始化方法
+        nn.init.kaiming_normal_(self.fc1.weight)
+        nn.init.kaiming_normal_(self.fc2.weight)
+        nn.init.xavier_normal_(self.fc3.weight)  # 输出层使用Xavier初始化
+        
+        nn.init.zeros_(self.fc1.bias)
+        nn.init.zeros_(self.fc2.bias)
+        nn.init.zeros_(self.fc3.bias)
 
     def forward(self, x):
-        x = F.relu(self.fc1(x))
+        x = self.norm_input(x)
+        
+        x = self.fc1(x)
+        x = self.norm1(x)
+        x = F.relu(x)
         x = self.dropout(x)
-        x = F.relu(self.fc2(x))
+        
+        x = self.fc2(x)
+        x = self.norm2(x)
+        x = F.relu(x)
         x = self.dropout(x)
+        
         x = self.fc3(x)
         return x
+
+# 简化的分类器，适用于低tier客户端
+class SimpleClassifier(nn.Module):
+    """简化的分类器，减少参数量，适用于低计算能力设备"""
+    def __init__(self, in_features, num_classes):
+        super(SimpleClassifier, self).__init__()
+        self.norm = nn.LayerNorm(in_features)
+        self.dropout = nn.Dropout(0.3)
+        self.fc = nn.Linear(in_features, num_classes)
+        
+        # 初始化
+        nn.init.xavier_normal_(self.fc.weight)
+        nn.init.zeros_(self.fc.bias)
+        
+    def forward(self, x):
+        x = self.norm(x)
+        x = self.dropout(x)
+        x = self.fc(x)
+        return x
+
+# 创建分类器的函数
+def create_classifier(in_features, num_classes, tier=None, is_global=False):
+    """
+    创建适合不同场景的分类器
+    
+    Args:
+        in_features: 输入特征维度
+        num_classes: 分类数
+        tier: 客户端tier级别，None表示全局分类器
+        is_global: 是否为全局分类器
+        
+    Returns:
+        适合指定场景的分类器实例
+    """
+    if is_global:
+        # 全局分类器始终使用LayerNormClassifier
+        return LayerNormClassifier(in_features, num_classes, is_local=False)
+    
+    # 客户端本地分类器根据tier选择不同复杂度
+    if tier is not None and tier >= 5:
+        # 低tier客户端使用简化分类器
+        return SimpleClassifier(in_features, num_classes)
+    else:
+        # 高tier客户端使用更复杂的分类器
+        return LayerNormClassifier(in_features, num_classes, is_local=True)
 
 
 class ResNet(nn.Module):
@@ -173,7 +274,7 @@ class ResNet(nn.Module):
         if self.tier == 1:# or self.local_v2:
              self.layer6 = self._make_layer(block, 64, layers[5], stride=1)
 
-        # 修改: 所有tier使用统一的分类器结构，标准化输入维度
+        # 标准化输入维度
         if self.local_loss == True:
             # 为所有tier级别添加平均池化层
             self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
@@ -190,12 +291,23 @@ class ResNet(nn.Module):
                 in_features = 16 * block.expansion  # 需要从64投影到256
             elif self.tier == 7:
                 in_features = 16  # 需要从16投影到256
-            
-            # 添加投影层（对于已经是标准维度的，使用Identity不改变特征）
-            self.projection = nn.Identity() if in_features == final_channels else nn.Linear(in_features, final_channels)
-            
-            # 所有tier使用相同的分类器结构
-            self.classifier = ComplexClassifier(final_channels, num_classes)
+
+            # 添加改进的投影层（使用LayerNorm替代BatchNorm）
+            if in_features == final_channels:
+                self.projection = nn.Sequential(
+                    nn.Identity(),
+                    nn.LayerNorm(final_channels)
+                )
+            else:
+                self.projection = nn.Sequential(
+                    nn.Linear(in_features, final_channels),
+                    nn.LayerNorm(final_channels),
+                    nn.ReLU(inplace=True)
+                )
+
+            # 创建适合当前tier的本地分类器
+            self.classifier = create_classifier(final_channels, num_classes, tier=self.tier, is_global=False)
+
 
         self.KD = KD
         for m in self.modules():
@@ -397,6 +509,9 @@ class ResNet_server(nn.Module):
         elif tier == 1:  # 客户端到layer6
             self.inplanes = 64 * block.expansion  # 256
 
+        # 重要：确保所有tier级别都有avgpool
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+
         self.dilation = 1
         if replace_stride_with_dilation is None:
             replace_stride_with_dilation = [False, False, False]
@@ -441,19 +556,28 @@ class ResNet_server(nn.Module):
         elif self.tier == 2:  # 客户端到 layer5
             self.layer6 = self._make_layer(block, 64, layers[5], stride=1)
         
-        # 所有 tier 最终都是通过 layer6 输出，输出通道为 64 * block.expansion
-        final_channels = 64 * block.expansion  # 256 for Bottleneck
-        
-        # 为所有 tier 统一分类器结构并添加同样的投影层
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        
-        # 重要修改：为所有 tier 添加投影层，即使不需要也添加，保证参数结构一致
-        # 这样可以避免在模型聚合时出现 KeyError
+        # 所有 tier 最终都是通过 layer6 输出，输出通道为 64 * block.expansion        
+        # 为所有tier添加改进的投影层
         in_features = self.inplanes
-        self.projection = nn.Identity() if in_features == final_channels else nn.Linear(in_features, final_channels)
+        final_channels = 64 * block.expansion  # 256
+
+        # 使用LayerNorm的投影层
+        if in_features == final_channels:
+            self.projection = nn.Sequential(
+                nn.Identity(),
+                nn.LayerNorm(final_channels)
+            )
+        else:
+            self.projection = nn.Sequential(
+                nn.Linear(in_features, final_channels),
+                nn.LayerNorm(final_channels),
+                nn.ReLU(inplace=True)
+            )
+
+        # self.classifier = create_classifier(final_channels, num_classes, is_global=True)
         
         # 所有 tier 使用相同的分类器结构，保证聚合时参数维度一致
-        self.classifier = ComplexClassifier(final_channels, num_classes)
+        # self.classifier = ComplexClassifier(final_channels, num_classes)
 
         self.KD = KD
         for m in self.modules():

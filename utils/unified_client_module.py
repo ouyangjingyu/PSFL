@@ -29,8 +29,8 @@ class EnhancedClient:
         self.device = device
         self.learning_rate = lr
         self.local_epochs = local_epochs
-        self.ldr_train = dataset_train
-        self.ldr_test = dataset_test
+        self.train_data = dataset_train
+        self.test_data = dataset_test
         self.tier = tier
         self.tier_scheduler = tier_scheduler
         self.resources = resources or {}
@@ -40,6 +40,21 @@ class EnhancedClient:
         self.lr_scheduler = None
         self.criterion = nn.CrossEntropyLoss()
         self.current_epoch = 0
+
+        # - 不同组件的学习率比例
+        self.lr_multipliers = {
+            'feature_extractor': 1.0,   # 特征提取层使用基准学习率
+            'local_classifier': 1.2,    # 本地分类器使用更高学习率促进个性化
+            'global_classifier': 0.75   # 全局分类器使用更低学习率提高泛化性
+        }
+        
+        # - 不同组件的权重衰减
+        self.weight_decay_values = {
+            'feature_extractor': 1e-4,
+            'local_classifier': 2e-4,   # 本地分类器使用适中权重衰减
+            'global_classifier': 5e-4   # 全局分类器使用更强权重衰减
+        }
+
         
         # 训练统计信息
         self.training_stats = {
@@ -102,6 +117,58 @@ class EnhancedClient:
             step_size=20,
             gamma=0.9
         )
+
+     # 添加一个新方法，创建不同组件的优化器
+    def create_component_optimizers(self, model, global_classifier=None):
+        """
+        为模型不同组件创建单独的优化器
+        
+        Args:
+            model: 客户端模型
+            global_classifier: 全局分类器(可选)
+            
+        Returns:
+            optimizers: 包含不同组件优化器的字典
+        """
+        optimizers = {}
+        
+        # 1. 分离特征提取器和分类器参数
+        feature_params = []
+        classifier_params = []
+        
+        for name, param in model.named_parameters():
+            if 'classifier' in name:
+                classifier_params.append(param)
+            else:
+                # 跳过投影层 (如果存在)
+                if 'projection' not in name:
+                    feature_params.append(param)
+        
+        # 2. 为特征提取器创建优化器
+        if feature_params:
+            optimizers['feature_extractor'] = torch.optim.Adam(
+                feature_params,
+                lr=self.learning_rate * self.lr_multipliers['feature_extractor'],
+                weight_decay=self.weight_decay_values['feature_extractor']
+            )
+        
+        # 3. 为本地分类器创建优化器
+        if classifier_params:
+            optimizers['local_classifier'] = torch.optim.Adam(
+                classifier_params,
+                lr=self.learning_rate * self.lr_multipliers['local_classifier'],
+                weight_decay=self.weight_decay_values['local_classifier']
+            )
+        
+        # 4. 为全局分类器创建优化器(如果提供)
+        if global_classifier is not None:
+            optimizers['global_classifier'] = torch.optim.Adam(
+                global_classifier.parameters(),
+                lr=self.learning_rate * self.lr_multipliers['global_classifier'],
+                weight_decay=self.weight_decay_values['global_classifier']
+            )
+        
+        return optimizers
     
     def calculate_model_size(self, model):
         """
@@ -151,7 +218,7 @@ class EnhancedClient:
             epoch_correct = 0
             epoch_samples = 0
             
-            for batch_idx, (images, labels) in enumerate(self.ldr_train):
+            for batch_idx, (images, labels) in enumerate(self.train_data):
                 images, labels = images.to(self.device), labels.to(self.device)
                 self.optimizer.zero_grad()
                 
@@ -203,328 +270,273 @@ class EnhancedClient:
         return model.state_dict(), time_pretrained
     
         # 修改EnhancedClient.local_train方法，确保设备正确
-    def local_train(self, model, local_epochs=None):
-        """
-        本地训练模型
-        
-        Args:
-            model: 客户端模型
-            local_epochs: 本地训练轮数（可选）
-            
-        Returns:
-            model_state_dict: 模型参数
-            training_stats: 训练统计信息
-        """
-        # 确保模型在正确的设备上
+    def local_train(self, model, epochs=None):
+        """本地训练客户端模型"""
+        # 设置训练模式
+        model.train()
         model = model.to(self.device)
         
-        # 更关键的是，确保模型的所有参数都在正确的设备上
-        for param in model.parameters():
-            param.data = param.data.to(self.device)
+        # 使用自定义epochs或默认值
+        epochs = epochs or self.local_epochs
         
-        # 然后设置为训练模式
-        model.train()
-        time_start = time.time()
+        # 创建用于不同组件的优化器
+        optimizers = self.create_component_optimizers(model)
+        feature_optimizer = optimizers.get('feature_extractor')
+        classifier_optimizer = optimizers.get('local_classifier')
         
-        # 使用传入的轮数或默认值
-        epochs = local_epochs if local_epochs is not None else self.local_epochs
+        # 创建数据加载器
+        train_loader = torch.utils.data.DataLoader(
+            self.train_data, batch_size=32, shuffle=True, drop_last=False
+        )
         
-        # 初始化优化器
-        if self.optimizer is None:
-            self.init_optimizer(model)
+        # 损失函数
+        criterion = nn.CrossEntropyLoss()
         
-        stats = {
-            'loss': [],
-            'accuracy': [],
-            'lr': []
-        }
+        # 记录统计信息
+        train_loss = 0
+        correct = 0
+        total = 0
         
+        # 记录训练开始时间
+        start_time = time.time()
+        
+        # 训练循环
         for epoch in range(epochs):
-            epoch_loss = 0.0
+            epoch_loss = 0
             epoch_correct = 0
-            epoch_samples = 0
+            epoch_total = 0
             
-            for batch_idx, (images, labels) in enumerate(self.ldr_train):
-                # 确保数据也在正确的设备上
-                images, labels = images.to(self.device), labels.to(self.device)
-                self.optimizer.zero_grad()
+            for batch_idx, (data, target) in enumerate(train_loader):
+                data, target = data.to(self.device), target.to(self.device)
                 
-                # 前向传播
-                outputs = model(images)
+                # 清零梯度
+                if feature_optimizer:
+                    feature_optimizer.zero_grad()
+                if classifier_optimizer:
+                    classifier_optimizer.zero_grad()
                 
-                # 处理可能的元组输出
-                if isinstance(outputs, tuple):
-                    outputs = outputs[0]
+                # 前向传播 - 获取输出和特征
+                outputs, _ = model(data)
                 
-                # 计算损失并反向传播
-                labels = labels.to(torch.long)
-                loss = self.criterion(outputs, labels)
+                # 计算损失
+                loss = criterion(outputs, target)
+                
+                # 反向传播
                 loss.backward()
-                self.optimizer.step()
                 
-                # 计算准确率
+                # 梯度裁剪，防止梯度爆炸
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                # 更新参数 - 分别用不同优化器
+                if feature_optimizer:
+                    feature_optimizer.step()
+                if classifier_optimizer:
+                    classifier_optimizer.step()
+                
+                # 更新统计信息
+                epoch_loss += loss.item()
                 _, predicted = torch.max(outputs.data, 1)
-                batch_correct = (predicted == labels).sum().item()
-                batch_size = labels.size(0)
-                
-                # 更新统计信息
-                epoch_loss += loss.item() * batch_size
-                epoch_correct += batch_correct
-                epoch_samples += batch_size
+                epoch_total += target.size(0)
+                epoch_correct += (predicted == target).sum().item()
             
-            # 计算每个epoch的平均值
-            if epoch_samples > 0:
-                epoch_loss /= epoch_samples
-                epoch_acc = 100.0 * epoch_correct / epoch_samples
-                
-                # 更新统计信息
-                stats['loss'].append(epoch_loss)
-                stats['accuracy'].append(epoch_acc)
-                stats['lr'].append(self.optimizer.param_groups[0]['lr'])
-                
-                # 更新学习率
-                self.lr_scheduler.step()
-                
-                print(f"Client {self.idx} - Local Epoch {epoch+1}/{epochs}: Loss={epoch_loss:.4f}, Acc={epoch_acc:.2f}%, LR={self.optimizer.param_groups[0]['lr']:.6f}")
+            # 计算本轮epoch的平均损失和准确率
+            epoch_loss /= len(train_loader)
+            epoch_acc = 100.0 * epoch_correct / epoch_total
             
-            # 更新当前epoch计数
-            self.current_epoch += 1
+            # 打印训练进度
+            print(f"Client {self.client_id} - Local Epoch {epoch+1}/{epochs}: "
+                f"Loss={epoch_loss:.4f}, Acc={epoch_acc:.2f}%, "
+                f"LR={self.learning_rate:.6f}")
+            
+            # 累计统计信息
+            train_loss += epoch_loss
+            correct += epoch_correct
+            total += epoch_total
         
-        # 计算训练耗时
-        training_time = time.time() - time_start
+        # 计算总训练时间
+        train_time = time.time() - start_time
         
         # 计算平均损失和准确率
-        avg_loss = np.mean(stats['loss']) if stats['loss'] else 0
-        avg_acc = np.mean(stats['accuracy']) if stats['accuracy'] else 0
+        train_loss /= epochs
+        accuracy = 100.0 * correct / total if total > 0 else 0
         
-        # 更新训练统计信息
-        self.training_stats['local_train_loss'].append(avg_loss)
-        self.training_stats['local_train_acc'].append(avg_acc)
-        self.training_stats['training_time'].append(training_time)
-        
-        # 计算模型大小
-        self.calculate_model_size(model)
-        
-        # 创建返回结果
-        result = {
-            'loss': avg_loss,
-            'accuracy': avg_acc,
-            'time': training_time,
-            'epochs': epochs,
-            'lr_final': self.optimizer.param_groups[0]['lr'],
-            'model_size_mb': self.model_size_mb,
-            'data_size': len(self.ldr_train.dataset) if hasattr(self.ldr_train, 'dataset') else 0
+        # 返回训练后的模型状态和统计信息
+        return model.state_dict(), {
+            'loss': train_loss,
+            'accuracy': accuracy,
+            'time': train_time,
+            'lr_final': self.learning_rate
         }
         
-        return model.state_dict(), result
-    
-    def train_split_learning(self, client_model, server_model, global_classifier=None, server_optimizer=None, rounds=1):
-        """
-        执行拆分学习训练，同时记录本地分类器和全局分类器的训练指标
-        """
-        # 确保所有模型都在正确的设备上
-        client_model = client_model.to(self.device)
-        server_model = server_model.to(self.device)
-        if global_classifier is not None:
-            global_classifier = global_classifier.to(self.device)
-        
-        # 关键：确保所有模型参数都在正确设备上
-        for param in client_model.parameters():
-            param.data = param.data.to(self.device)
-        for param in server_model.parameters():
-            param.data = param.data.to(self.device)
-        if global_classifier is not None:
-            for param in global_classifier.parameters():
-                param.data = param.data.to(self.device)
-        
-        # 设置模型为训练模式
+    def train_split_learning(self, client_model, server_model, global_classifier=None, rounds=1):
+        """执行拆分学习训练"""
+        # 设置训练模式
         client_model.train()
         server_model.train()
         if global_classifier is not None:
             global_classifier.train()
         
-        # 初始化客户端优化器
-        if self.optimizer is None:
-            self.init_optimizer(client_model)
-        client_optimizer = self.optimizer
-        
-        # 初始化服务器优化器（如果未提供）
-        if server_optimizer is None:
-            server_optimizer = torch.optim.Adam(
-                server_model.parameters(),
-                lr=self.learning_rate,
-                weight_decay=5e-4
-            )
-        
-        # 初始化全局分类器优化器
+        # 移动模型到设备
+        client_model = client_model.to(self.device)
+        server_model = server_model.to(self.device)
         if global_classifier is not None:
-            global_classifier_optimizer = torch.optim.Adam(
-                global_classifier.parameters(),
-                lr=self.learning_rate,
-                weight_decay=5e-4
-            )
+            global_classifier = global_classifier.to(self.device)
         
-        # 记录数据传输大小
-        intermediate_data_size = 0
+        # 创建用于不同组件的优化器
+        optimizers = self.create_component_optimizers(client_model, global_classifier)
+        client_optimizer = optimizers.get('feature_extractor')
+        classifier_optimizer = optimizers.get('local_classifier')
+        global_optimizer = optimizers.get('global_classifier')
         
-        # 训练统计信息 - 分别记录本地和全局分类器的指标
+        # 为服务器模型创建单独优化器
+        server_optimizer = torch.optim.Adam(
+            server_model.parameters(),
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay_values['feature_extractor']
+        )
+        
+        # 创建数据加载器
+        train_loader = torch.utils.data.DataLoader(
+            self.train_data, batch_size=32, shuffle=True, drop_last=False
+        )
+        
+        # 损失函数
+        criterion = nn.CrossEntropyLoss()
+        
+        # 记录统计信息
         stats = {
-            # 全局分类器指标
-            'global_loss': [],
-            'global_accuracy': [],
-            
-            # 本地分类器指标
-            'local_loss': [],
-            'local_accuracy': [],
-            
-            # 其他统计信息
-            'time': 0,
-            'data_transmitted_mb': 0
+            'loss': 0, 'accuracy': 0,
+            'local_loss': 0, 'local_accuracy': 0,
+            'global_loss': 0, 'global_accuracy': 0,
+            'time': 0, 'data_transmitted_mb': 0
         }
         
-        # 开始计时
-        time_start = time.time()
+        # 记录开始时间
+        start_time = time.time()
         
+        # 拆分学习训练循环
         for round_idx in range(rounds):
-            # 本地分类器指标
-            round_local_loss = 0.0
-            round_local_correct = 0
-            # 全局分类器指标
-            round_global_loss = 0.0
-            round_global_correct = 0
-            # 样本数
-            round_samples = 0
+            round_loss = 0
+            round_correct = 0
+            round_total = 0
             
-            for batch_idx, (images, labels) in enumerate(self.ldr_train):
-                images, labels = images.to(self.device), labels.to(self.device)
+            # 本地分类器统计
+            local_loss = 0
+            local_correct = 0
+            
+            # 全局分类器统计
+            global_loss = 0
+            global_correct = 0
+            
+            # 数据传输量
+            data_transmitted = 0
+            
+            for batch_idx, (data, target) in enumerate(train_loader):
+                data, target = data.to(self.device), target.to(self.device)
                 
                 # 1. 客户端前向传播
-                client_optimizer.zero_grad()
-                client_outputs = client_model(images)
+                client_out, client_features = client_model(data)
                 
-                # 客户端模型应该返回(logits, features)
-                if isinstance(client_outputs, tuple):
-                    client_logits, client_features = client_outputs
-                    
-                    # 计算本地分类器损失和准确率
-                    local_loss = self.criterion(client_logits, labels)
-                    
-                    _, local_predicted = torch.max(client_logits.data, 1)
-                    local_batch_correct = (local_predicted == labels).sum().item()
-                    
-                    # 更新本地分类器统计
-                    round_local_loss += local_loss.item() * labels.size(0)
-                    round_local_correct += local_batch_correct
-                else:
-                    # 如果没有返回元组，则假设只返回了特征
-                    client_features = client_outputs
-                    client_logits = None
-                    local_loss = 0
+                # 计算本地分类器的损失和准确率(如果有)
+                if client_out is not None:
+                    local_batch_loss = criterion(client_out, target)
+                    local_loss += local_batch_loss.item()
+                    _, local_predicted = torch.max(client_out.data, 1)
+                    local_correct += (local_predicted == target).sum().item()
                 
-                # 确保client_features需要梯度
-                if not client_features.requires_grad:
-                    client_features = client_features.clone().detach().requires_grad_(True)
+                # 2. 发送客户端特征到服务器
+                # 模拟数据传输
+                feature_size_mb = client_features.element_size() * client_features.nelement() / (1024 * 1024)
+                data_transmitted += feature_size_mb
                 
-                # 记录中间特征大小
-                features_size_bytes = client_features.nelement() * client_features.element_size()
-                intermediate_data_size += features_size_bytes + labels.nelement() * labels.element_size()
-                
-                # 2. 服务器前向传播
-                server_optimizer.zero_grad()
+                # 3. 服务器前向传播
                 server_features = server_model(client_features)
                 
-                # 3. 全局分类器前向传播
+                # 4. 应用全局分类器(如果有)
                 if global_classifier is not None:
-                    global_classifier_optimizer.zero_grad()
-                    global_outputs = global_classifier(server_features)
+                    global_out = global_classifier(server_features)
+                    global_batch_loss = criterion(global_out, target)
+                    global_loss += global_batch_loss.item()
+                    _, global_predicted = torch.max(global_out.data, 1)
+                    global_correct += (global_predicted == target).sum().item()
                     
-                    # 计算全局损失
-                    global_loss = self.criterion(global_outputs, labels)
-                    
-                    # 计算全局准确率
-                    _, global_predicted = torch.max(global_outputs.data, 1)
-                    global_batch_correct = (global_predicted == labels).sum().item()
-                    
-                    # 更新全局分类器统计
-                    round_global_loss += global_loss.item() * labels.size(0)
-                    round_global_correct += global_batch_correct
-                    
-                    # 4. 反向传播 - 使用全局损失
-                    global_loss.backward()
+                    # 使用全局分类器的输出作为主要损失
+                    loss = global_batch_loss
                 else:
-                    # 如果没有全局分类器，则使用服务器特征作为输出
-                    global_outputs = server_features
-                    global_loss = self.criterion(global_outputs, labels)
-                    global_loss.backward()
+                    # 如果没有全局分类器，使用本地分类器的损失
+                    loss = local_batch_loss if 'local_batch_loss' in locals() else 0
                 
-                # 5. 更新全局分类器
+                # 清零所有优化器的梯度
+                if client_optimizer:
+                    client_optimizer.zero_grad()
+                if server_optimizer:
+                    server_optimizer.zero_grad()
+                if classifier_optimizer:
+                    classifier_optimizer.zero_grad()
+                if global_optimizer:
+                    global_optimizer.zero_grad()
+                
+                # 5. 反向传播 - 计算梯度
+                loss.backward()
+                
+                # 梯度裁剪
+                torch.nn.utils.clip_grad_norm_(client_model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(server_model.parameters(), max_norm=1.0)
                 if global_classifier is not None:
-                    global_classifier_optimizer.step()
+                    torch.nn.utils.clip_grad_norm_(global_classifier.parameters(), max_norm=1.0)
                 
-                # 6. 获取服务器特征的梯度
-                server_features_grad = None
-                if server_features.grad is not None:
-                    server_features_grad = server_features.grad.clone()
-                
-                # 7. 更新服务器模型
-                server_optimizer.step()
-                
-                # 8. 获取客户端特征的梯度
-                client_features_grad = None
-                if client_features.grad is not None:
-                    client_features_grad = client_features.grad.clone()
-                
-                # 9. 客户端反向传播和更新
-                if client_features_grad is not None:
-                    if not client_features.requires_grad:
-                        client_features.backward(client_features_grad)
+                # 6. 使用不同的优化器更新各个组件
+                if client_optimizer:
                     client_optimizer.step()
+                if server_optimizer:
+                    server_optimizer.step()
+                if classifier_optimizer:
+                    classifier_optimizer.step()
+                if global_optimizer:
+                    global_optimizer.step()
                 
-                # 更新样本数
-                round_samples += labels.size(0)
+                # 更新统计信息
+                round_loss += loss.item()
+                
+                # 使用最终预测(全局或本地)更新准确率统计
+                if global_classifier is not None:
+                    pred = global_predicted
+                else:
+                    pred = local_predicted if 'local_predicted' in locals() else None
+                
+                if pred is not None:
+                    round_total += target.size(0)
+                    round_correct += (pred == target).sum().item()
             
-            # 计算每个轮次的平均值
-            if round_samples > 0:
-                # 本地分类器指标
-                round_local_loss /= round_samples
-                round_local_acc = 100.0 * round_local_correct / round_samples
-                stats['local_loss'].append(round_local_loss)
-                stats['local_accuracy'].append(round_local_acc)
-                
-                # 全局分类器指标
-                round_global_loss /= round_samples
-                round_global_acc = 100.0 * round_global_correct / round_samples
-                stats['global_loss'].append(round_global_loss)
-                stats['global_accuracy'].append(round_global_acc)
-                
-                print(f"客户端 {self.idx} - 拆分学习轮次 {round_idx+1}/{rounds}:")
-                print(f"  本地分类器: 损失={round_local_loss:.4f}, 准确率={round_local_acc:.2f}%")
-                print(f"  全局分类器: 损失={round_global_loss:.4f}, 准确率={round_global_acc:.2f}%")
+            # 计算本轮平均损失和准确率
+            num_batches = len(train_loader)
+            round_loss /= num_batches
+            round_acc = 100.0 * round_correct / round_total if round_total > 0 else 0
+            
+            # 计算本地分类器指标
+            local_loss /= num_batches
+            local_acc = 100.0 * local_correct / round_total if round_total > 0 else 0
+            
+            # 计算全局分类器指标
+            if global_classifier is not None:
+                global_loss /= num_batches
+                global_acc = 100.0 * global_correct / round_total if round_total > 0 else 0
+            
+            # 累计统计信息
+            stats['loss'] += round_loss / rounds
+            stats['accuracy'] += round_acc / rounds
+            stats['local_loss'] += local_loss / rounds
+            stats['local_accuracy'] += local_acc / rounds
+            if global_classifier is not None:
+                stats['global_loss'] += global_loss / rounds
+                stats['global_accuracy'] += global_acc / rounds
         
-        # 计算训练耗时
-        training_time = time.time() - time_start
+        # 计算总训练时间和传输数据总量
+        stats['time'] = time.time() - start_time
+        stats['data_transmitted_mb'] = data_transmitted
+        stats['data_size'] = len(self.train_data)
         
-        # 计算中间数据大小（MB）
-        intermediate_data_size_mb = intermediate_data_size / (1024 ** 2)
-        
-        # 更新训练统计信息
-        avg_local_loss = np.mean(stats['local_loss']) if stats['local_loss'] else 0
-        avg_local_acc = np.mean(stats['local_accuracy']) if stats['local_accuracy'] else 0
-        avg_global_loss = np.mean(stats['global_loss']) if stats['global_loss'] else 0
-        avg_global_acc = np.mean(stats['global_accuracy']) if stats['global_accuracy'] else 0
-        
-        self.training_stats['sl_train_loss'].append(avg_global_loss)
-        self.training_stats['sl_train_acc'].append(avg_global_acc)
-        
-        # 更新结果统计信息
-        stats['time'] = training_time
-        stats['data_transmitted_mb'] = intermediate_data_size_mb
-        stats['data_size'] = len(self.ldr_train.dataset) if hasattr(self.ldr_train, 'dataset') else 0
-        
-        # 为了兼容旧代码，保留原有的loss和accuracy字段，使用全局分类器的结果
-        stats['loss'] = avg_global_loss
-        stats['accuracy'] = avg_global_acc
-        
+        # 返回训练后的模型状态和统计信息
         return client_model.state_dict(), server_model.state_dict(), stats
         
     def evaluate(self, client_model, server_model, global_classifier=None):
@@ -567,7 +579,7 @@ class EnhancedClient:
         test_samples = 0
         
         with torch.no_grad():
-            for batch_idx, (images, labels) in enumerate(self.ldr_test):
+            for batch_idx, (images, labels) in enumerate(self.test_data):
                 # 确保数据在正确的设备上
                 images, labels = images.to(self.device), labels.to(self.device)
                 
@@ -940,196 +952,80 @@ class ClientManager:
         return results
 
 def train_client_with_global_classifier(client_id, client_model, server_model, device, 
-                         client_manager, round_idx, coordinator, local_epochs=None, split_rounds=1, global_classifier=None, **kwargs):
-    """
-    使用全局分类器服务的客户端训练函数
-    """
+                                       client_manager, round_idx, global_classifier=None, 
+                                       local_epochs=None, split_rounds=1, **kwargs):
+    """使用全局分类器的客户端训练函数 - 用于并行训练框架"""
     try:
+        # 获取客户端
         client = client_manager.get_client(client_id)
         if client is None:
             return {'error': f"客户端 {client_id} 不存在"}
         
-        # 确保客户端设备与传入的设备一致
+        # 设置设备
         client.device = device
+        print(f"客户端 {client_id} 使用设备: {device}")
+        
+        # 确保全局分类器在正确设备上
+        if global_classifier is not None:
+            global_classifier = global_classifier.to(device)
+            for param in global_classifier.parameters():
+                param.data = param.data.to(device)
         
         # 记录开始时间
         start_time = time.time()
         
-        # 第1步：本地训练
+        # 第1步：本地训练 - 确保深度复制模型
         client_model_copy = copy.deepcopy(client_model)
         client_state, local_stats = client.local_train(client_model_copy, local_epochs)
         local_train_time = local_stats['time']
         
-        # 获取客户端所属聚类
-        cluster_id = client_manager.get_client_cluster(client_id)
-        
-        # 第2步：拆分学习但使用全局分类器服务
-        # 修改EnhancedClient.train_split_learning的逻辑，以支持全局分类器服务
-        
-        # 初始化客户端优化器
-        if not hasattr(client, 'optimizer') or client.optimizer is None:
-            client.init_optimizer(client_model_copy)
-        client_optimizer = client.optimizer
-        
-        # 初始化服务器优化器
-        server_model_copy = copy.deepcopy(server_model).to(device)
-        server_optimizer = torch.optim.Adam(
-            server_model_copy.parameters(),
-            lr=client.learning_rate,
-            weight_decay=5e-4
+        # 第2步：拆分学习训练 - 使用已经本地训练过的模型继续拆分学习训练
+        client_state_sl, server_state, sl_stats = client.train_split_learning(
+            client_model_copy, 
+            copy.deepcopy(server_model), 
+            global_classifier=global_classifier,
+            rounds=split_rounds
         )
+        sl_train_time = sl_stats['time']
         
-        # 设置模型为训练模式
-        client_model_copy.train()
-        server_model_copy.train()
+        # 合并结果并计算总训练时间
+        total_time = local_train_time + sl_train_time
         
-        # 记录数据传输大小
-        intermediate_data_size = 0
-        
-        # 训练统计信息
-        stats = {
-            'global_loss': [],
-            'global_accuracy': [],
-            'local_loss': [],
-            'local_accuracy': [],
-            'time': 0,
-            'data_transmitted_mb': 0
-        }
-        
-        # 开始计时
-        sl_start_time = time.time()
-        
-        for round_idx in range(split_rounds):
-            # 本地分类器指标
-            round_local_loss = 0.0
-            round_local_correct = 0
-            # 全局分类器指标
-            round_global_loss = 0.0
-            round_global_correct = 0
-            # 样本数
-            round_samples = 0
-            
-            for batch_idx, (images, labels) in enumerate(client.ldr_train):
-                images, labels = images.to(device), labels.to(device)
-                
-                # 1. 客户端前向传播
-                client_optimizer.zero_grad()
-                client_outputs = client_model_copy(images)
-                
-                # 客户端模型应该返回(logits, features)
-                if isinstance(client_outputs, tuple):
-                    client_logits, client_features = client_outputs
-                    
-                    # 计算本地分类器损失和准确率
-                    local_loss = client.criterion(client_logits, labels)
-                    
-                    _, local_predicted = torch.max(client_logits.data, 1)
-                    local_batch_correct = (local_predicted == labels).sum().item()
-                    
-                    # 更新本地分类器统计
-                    round_local_loss += local_loss.item() * labels.size(0)
-                    round_local_correct += local_batch_correct
-                else:
-                    # 如果没有返回元组，则假设只返回了特征
-                    client_features = client_outputs
-                    client_logits = None
-                    local_loss = 0
-                
-                # 确保client_features需要梯度
-                if not client_features.requires_grad:
-                    client_features = client_features.clone().detach().requires_grad_(True)
-                
-                # 记录中间特征大小
-                features_size_bytes = client_features.nelement() * client_features.element_size()
-                intermediate_data_size += features_size_bytes + labels.nelement() * labels.element_size()
-                
-                # 2. 服务器前向传播
-                server_optimizer.zero_grad()
-                server_features = server_model_copy(client_features)
-                
-                # 3. 使用全局分类器服务处理特征
-                global_result = coordinator.process_features_sync(
-                    cluster_id, server_features, labels
-                )
-                
-                global_loss = global_result['loss']
-                global_metrics = global_result['metrics']
-                feature_gradients = global_result['gradients']
-                
-                # 更新全局分类器统计
-                global_batch_correct = int(global_metrics['accuracy'] * labels.size(0) / 100)
-                round_global_loss += global_loss * labels.size(0)
-                round_global_correct += global_batch_correct
-                
-                # 4. 使用全局分类器返回的梯度更新服务器模型
-                if feature_gradients is not None:
-                    server_features.backward(feature_gradients)
-                server_optimizer.step()
-                
-                # 5. 更新客户端模型
-                if client_features.grad is not None:
-                    client_optimizer.step()
-                
-                # 更新样本数
-                round_samples += labels.size(0)
-            
-            # 计算每个轮次的平均值
-            if round_samples > 0:
-                # 本地分类器指标
-                round_local_loss /= round_samples
-                round_local_acc = 100.0 * round_local_correct / round_samples
-                stats['local_loss'].append(round_local_loss)
-                stats['local_accuracy'].append(round_local_acc)
-                
-                # 全局分类器指标
-                round_global_loss /= round_samples
-                round_global_acc = 100.0 * round_global_correct / round_samples
-                stats['global_loss'].append(round_global_loss)
-                stats['global_accuracy'].append(round_global_acc)
-        
-        # 计算训练耗时
-        sl_train_time = time.time() - sl_start_time
-        
-        # 计算中间数据大小（MB）
-        intermediate_data_size_mb = intermediate_data_size / (1024 ** 2)
-        
-        # 更新训练统计信息
-        avg_local_loss = np.mean(stats['local_loss']) if stats['local_loss'] else 0
-        avg_local_acc = np.mean(stats['local_accuracy']) if stats['local_accuracy'] else 0
-        avg_global_loss = np.mean(stats['global_loss']) if stats['global_loss'] else 0
-        avg_global_acc = np.mean(stats['global_accuracy']) if stats['global_accuracy'] else 0
-        
-        # 更新结果统计信息
-        stats['time'] = sl_train_time
-        stats['total_time'] = local_train_time + sl_train_time
-        stats['data_transmitted_mb'] = intermediate_data_size_mb
-        stats['data_size'] = len(client.ldr_train.dataset) if hasattr(client.ldr_train, 'dataset') else 0
-        
-        # 为了兼容旧代码，保留原有的loss和accuracy字段
-        stats['loss'] = avg_global_loss
-        stats['accuracy'] = avg_global_acc
-        
-        # 返回结果
-        return {
-            'client_model_state': client_model_copy.state_dict(),
-            'server_model_state': server_model_copy.state_dict(),
+        # 构建结果字典
+        merged_stats = {
             'local_train': local_stats,
-            'split_learning': stats,
-            'loss': avg_global_loss,
-            'accuracy': avg_global_acc,
-            'local_sl_loss': avg_local_loss,
-            'local_sl_accuracy': avg_local_acc,
-            'global_sl_loss': avg_global_loss,
-            'global_sl_accuracy': avg_global_acc,
+            'split_learning': sl_stats,
+            
+            # 全局分类器结果
+            'loss': sl_stats['loss'],
+            'accuracy': sl_stats['accuracy'],
+            
+            # 本地分类器的拆分学习结果
+            'local_sl_loss': sl_stats.get('local_loss', 0),
+            'local_sl_accuracy': sl_stats.get('local_accuracy', 0),
+            
+            # 全局分类器的拆分学习结果
+            'global_sl_loss': sl_stats.get('global_loss', 0), 
+            'global_sl_accuracy': sl_stats.get('global_accuracy', 0),
+            
+            # 本地训练结果
             'local_train_loss': local_stats.get('loss', 0),
             'local_train_accuracy': local_stats.get('accuracy', 0),
-            'time': local_train_time + sl_train_time,
+            
+            'time': total_time,
             'local_train_time': local_train_time,
             'sl_train_time': sl_train_time,
-            'data_size': stats['data_size'],
-            'communication_mb': intermediate_data_size_mb,
-            'lr': local_stats.get('lr_final', client.learning_rate)
+            'data_size': sl_stats.get('data_size', 0),
+            'communication_mb': sl_stats.get('data_transmitted_mb', 0),
+            'lr': local_stats.get('lr_final', client.learning_rate),
+            
+            # 保存训练后的模型状态
+            'client_model_state': client_state_sl,
+            'server_model_state': server_state
         }
+        
+        # 返回训练结果
+        return merged_stats
         
     except Exception as e:
         import traceback

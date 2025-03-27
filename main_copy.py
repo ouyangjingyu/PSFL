@@ -38,6 +38,7 @@ import copy
 import warnings
 import math
 from collections import defaultdict
+import pynvml
 
 # 忽略警告
 warnings.filterwarnings("ignore")
@@ -64,6 +65,7 @@ from utils.aggregation_mechanisms import enhanced_hierarchical_aggregation_no_pr
 from utils.parallel_training_framework import create_training_framework,create_training_framework_with_global_classifier
 from utils.unified_client_module import EnhancedClient, ClientManager, train_client_with_global_classifier
 from utils.global_model_utils import create_models_by_splitting, create_global_model, combine_to_global_model, split_global_model
+from utils.evaluate import comprehensive_evaluation, print_evaluation_results
 
 
 # 设置随机种子，确保实验可复现
@@ -235,7 +237,7 @@ def log_system_resources():
         
         # 尝试获取GPU利用率（需要pynvml支持）
         try:
-            import pynvml
+
             pynvml.nvmlInit()
             handle = pynvml.nvmlDeviceGetHandleByIndex(0)
             gpu_utilization = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
@@ -365,8 +367,7 @@ def create_models(args, class_num):
     # 打印第一个tier的模型架构（示例）
     print_model_architecture(client_models[1], "客户端模型 (Tier 1)", detail_level=1)
     print_model_architecture(server_models[1], "服务器模型 (Tier 1)", detail_level=1)
-    print_model_architecture(client_models[3], "客户端模型 (Tier 3)", detail_level=1)
-    print_model_architecture(server_models[3], "服务器模型 (Tier 3)", detail_level=1)
+    print_model_architecture(init_glob_model, "全局模型 (Tier 3)", detail_level=2)
     print_model_architecture(unified_classifier, "统一分类器", detail_level=2)
     
     return client_models, server_models, unified_classifier, init_glob_model, num_tiers
@@ -844,6 +845,9 @@ def main():
         # 执行分层聚合
         logger.info("执行双层聚合...")
         try:
+            # 指定聚合设备
+            aggregation_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            
             # 执行聚类内聚合
             _, cluster_models, agg_log = enhanced_hierarchical_aggregation_no_projection(
                 client_models_params, 
@@ -851,7 +855,8 @@ def main():
                 client_clusters,
                 client_tiers=client_tiers,
                 global_model_template=init_glob_model.state_dict() if init_glob_model else None,
-                num_classes=class_num
+                num_classes=class_num,
+                device=aggregation_device  # 明确指定设备
             )
             
             # 执行全局模型组合 (基于拆分学习思想)
@@ -859,7 +864,8 @@ def main():
                 client_models_params,
                 server_models_dict,
                 client_tiers,
-                init_glob_model
+                init_glob_model,
+                device=aggregation_device  # 明确指定设备
             )
             
             # 确保global_model不为None
@@ -868,7 +874,9 @@ def main():
                 global_model = {} if init_glob_model is None else init_glob_model.state_dict()
 
         except Exception as e:
+            import traceback
             print(f"聚合过程出错: {str(e)}")
+            print(traceback.format_exc())
             global_model = {} if init_glob_model is None else init_glob_model.state_dict()
             cluster_models = {}
             agg_log = {'error': str(e)}
@@ -880,6 +888,7 @@ def main():
 
         # 创建全局模型进行评估，加载全局模型（忽略增强客户端特有的投影层）
         global_eval_model = copy.deepcopy(init_glob_model)
+        global_eval_model = global_eval_model.to(device)  # 先将模型移到目标设备
 
         # 打印全局模型状态字典键
         print("\n==== 全局聚合模型状态字典信息 ====")
@@ -890,12 +899,62 @@ def main():
             print(f"projection.weight形状: {global_model['projection.weight'].shape}")
         print("=" * 40)
 
+        # 确保全局模型参数在正确设备上
+        device_sync_global_model = {}
+        for k, v in global_model.items():
+            device_sync_global_model[k] = v.to(device)
+
         # 加载聚合后的模型参数
-        global_eval_model = safe_load_state_dict(global_eval_model, global_model, verbose=True)
-        global_eval_model = global_eval_model.to(device)
+        global_eval_model = safe_load_state_dict(global_eval_model, device_sync_global_model, verbose=True)
+
         # 加载后打印
         print_model_architecture(global_eval_model, "加载全局模型后的全局评估模型", detail_level=1)
-        
+        # 创建均衡数据集，评估全局模型、本地模型、客户端-服务器-全局分类器
+        if 'balanced_eval_dataset' not in locals():
+            balanced_eval_dataset = get_cifar10_proxy_dataset(
+                option='balanced_test',
+                num_samples=2000,
+                seed=42
+            )
+
+        # Run comprehensive evaluation
+        logger.info("Performing comprehensive model evaluation...")
+        eval_results = comprehensive_evaluation(
+            global_eval_model,  # 全局模型
+            client_models_dict,  # 客户端模型 
+            server_models_dict,  # 服务器模型
+            unified_classifier,  # 全局分类器
+            balanced_eval_dataset,
+            client_clusters,
+            client_resources,  # 传入客户端资源信息（包含tier级别）
+            device,
+            class_num
+        )
+
+        # Print and log results
+        print_evaluation_results(eval_results, round_idx)
+
+        # Log additional metrics to wandb
+        comp_eval_metrics = {
+            f"comprehensive/global_accuracy": eval_results['global']['accuracy'],
+            f"comprehensive/avg_local_accuracy": eval_results['averages']['local_accuracy'],
+            f"comprehensive/avg_server_global_accuracy": eval_results['averages']['server_global_accuracy']
+        }
+
+        # Add client-global if available
+        if isinstance(eval_results['averages']['client_global_accuracy'], (int, float)):
+            comp_eval_metrics[f"comprehensive/avg_client_global_accuracy"] = eval_results['averages']['client_global_accuracy']
+
+        # Log per-cluster metrics
+        for key, value in eval_results.items():
+            if key.startswith('cluster_'):
+                cluster_id = key.split('_')[1]
+                comp_eval_metrics[f"comprehensive/cluster_{cluster_id}/local_accuracy"] = value['local_accuracy']
+                comp_eval_metrics[f"comprehensive/cluster_{cluster_id}/server_global_accuracy"] = value['server_global_accuracy']
+                if isinstance(value['client_global_accuracy'], (int, float)):
+                    comp_eval_metrics[f"comprehensive/cluster_{cluster_id}/client_global_accuracy"] = value['client_global_accuracy']
+
+        wandb.log(comp_eval_metrics)
         # 诊断并修复全局模型
         logger.info("诊断和修复全局模型...")
         diagnostic_result = {

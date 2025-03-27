@@ -3,6 +3,12 @@ import copy
 import numpy as np
 from collections import OrderedDict
 import torch.nn as nn
+import logging
+from model.resnet import resnet110_SFL_local_tier_7
+from model.resnet import resnet56_SFL_local_tier_7
+from model.resnet import resnet110_base
+from model.resnet import resnet56_base
+from model.resnet import create_classifier
 
 def create_global_model(class_num, model_type='resnet110', device='cpu'):
     """
@@ -17,11 +23,9 @@ def create_global_model(class_num, model_type='resnet110', device='cpu'):
         全局模型
     """
     if model_type == 'resnet110':
-        from model.resnet import resnet110_SFL_fedavg_base
         # 移除重复的local_loss参数，因为该函数内部已经设置了local_loss=True
-        global_model = resnet110_SFL_fedavg_base(classes=class_num, tier=1)
+        global_model = resnet110_base(classes=class_num, tier=1)
     elif model_type == 'resnet56':
-        from model.resnet import resnet56_base
         global_model = resnet56_base(classes=class_num, tier=1)
     else:
         raise ValueError(f"不支持的模型类型: {model_type}")
@@ -54,10 +58,10 @@ def split_global_model(global_model, tier=1, class_num=10, model_type='resnet110
     
     # 导入相应的模型创建函数
     if model_type == 'resnet110':
-        from model.resnet import resnet110_SFL_local_tier_7
+        
         model_func = resnet110_SFL_local_tier_7
     else:
-        from model.resnet import resnet56_SFL_local_tier_7
+
         model_func = resnet56_SFL_local_tier_7
     
     # 创建指定tier级别的空客户端和服务器模型
@@ -83,141 +87,193 @@ def split_global_model(global_model, tier=1, class_num=10, model_type='resnet110
     
     return client_model, server_model
 
-def create_models_by_splitting(class_num, model_type='resnet110', device='cpu'):
+def create_models_by_splitting(class_num, model_type='resnet110', device=None):
     """
-    通过拆分全局模型创建所有tier级别的客户端和服务器模型
+    通过拆分创建全局模型，并为不同tier创建客户端和服务器模型
     
-    Args:
-        class_num: 类别数量
-        model_type: 模型类型，支持'resnet110'或'resnet56'
-        device: 计算设备
-        
     Returns:
-        client_models: 客户端模型字典，键为tier
-        server_models: 服务器模型字典，键为tier
-        unified_classifier: 统一分类器
-        global_model: 全局模型
+        client_models: 不同tier的客户端模型
+        server_models: 不同tier的服务器模型
+        unified_classifier: 全局分类器
+        init_glob_model: 初始全局模型
         num_tiers: tier数量
     """
-    # 创建全局模型
-    global_model = create_global_model(class_num, model_type, device)
+    # 设置设备
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # 提取全局分类器
-    if hasattr(global_model, 'classifier'):
-        unified_classifier = copy.deepcopy(global_model.classifier)
+    # 根据模型类型创建不同的模型
+    if model_type == 'resnet110':
+        model_func = resnet110_SFL_local_tier_7
+    elif model_type == 'resnet56':
+        model_func = resnet56_SFL_local_tier_7
     else:
-        # 如果没有直接的classifier属性，创建一个新的分类器
-        from utils.enhanced_model_architecture import UnifiedClassifier
-        unified_classifier = UnifiedClassifier(256, [128, 64], class_num, dropout_rate=0.5)
+        model_func = resnet110_SFL_local_tier_7
     
-    # 初始化客户端和服务器模型字典
+    # 创建不同tier的客户端和服务器模型
     client_models = {}
     server_models = {}
-    num_tiers = 7  # 默认7个tier级别
+    num_tiers = 7
     
-    # 为每个tier创建客户端和服务器模型
-    for tier in range(1, num_tiers + 1):
-        client_model, server_model = split_global_model(global_model, tier, class_num, model_type)
-        
-        # 确保客户端模型有本地分类器
-        if not hasattr(client_model, 'classifier') or client_model.classifier is None:
-            print(f"警告: Tier {tier} 客户端模型没有分类器，可能需要确保local_loss=True")
-        
-        # 保存到字典
-        client_models[tier] = client_model
-        server_models[tier] = server_model
-        
-        print(f"已创建 Tier {tier} 模型")
+    for tier in range(1, num_tiers+1):
+        client_model, server_model = model_func(class_num, tier=tier, local_loss=True)
+        client_models[tier] = client_model.to(device)
+        server_models[tier] = server_model.to(device)
     
-    return client_models, server_models, unified_classifier, global_model, num_tiers
+    # 创建用于全局模型初始化的模板
+    init_glob_model = resnet110_base(class_num) if model_type == 'resnet110' else resnet56_base(class_num)
+    init_glob_model = init_glob_model.to(device)
+    
+    # 创建优化的全局分类器
+    final_channels = 64 * 4  # 64 * Bottleneck.expansion = 256
+    unified_classifier = create_classifier(final_channels, class_num, is_global=True)
+    unified_classifier = unified_classifier.to(device)
+    
+    return client_models, server_models, unified_classifier, init_glob_model, num_tiers
 
-def combine_to_global_model(client_models_dict, server_models_dict, client_tiers, global_model_template):
+def combine_to_global_model(client_models_params, server_models_dict, client_tiers, 
+                           init_glob_model, device=None):
     """
-    将不同tier的客户端和服务器模型组合回全局模型
+    结合客户端和服务器模型参数创建全局模型，确保设备一致性
     
     Args:
-        client_models_dict: 客户端模型字典，键为客户端ID
-        server_models_dict: 服务器模型字典，键为客户端ID
-        client_tiers: 客户端tier字典，键为客户端ID
-        global_model_template: 全局模型模板
+        client_models_params: 客户端模型参数字典
+        server_models_dict: 服务器模型字典
+        client_tiers: 客户端tier信息字典
+        init_glob_model: 初始全局模型
+        device: 指定的计算设备，默认自动选择
         
     Returns:
-        global_model_params: 组合后的全局模型参数
+        global_model: 聚合后的全局模型状态字典
     """
-    # 获取全局模型状态字典作为模板
-    if isinstance(global_model_template, dict):
-        template_state = global_model_template
-    else:
-        template_state = global_model_template.state_dict()
+    # 确定目标设备
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # 创建新的全局状态字典
-    global_state = OrderedDict()
-    for key, param in template_state.items():
-        global_state[key] = torch.zeros_like(param)
+    logging.info(f"全局模型聚合使用设备: {device}")
     
-    # 统计每个参数的贡献客户端数
-    param_counts = {key: 0 for key in global_state.keys()}
-    
-    # 定义每个tier对应的层前缀
-    tier_layer_map = {
-        1: ['conv1', 'bn1', 'layer1', 'layer2', 'layer3', 'layer4', 'layer5', 'layer6', 'classifier', 'projection'],
-        2: ['conv1', 'bn1', 'layer1', 'layer2', 'layer3', 'layer4', 'layer5', 'classifier', 'projection'],
-        3: ['conv1', 'bn1', 'layer1', 'layer2', 'layer3', 'layer4', 'classifier', 'projection'],
-        4: ['conv1', 'bn1', 'layer1', 'layer2', 'layer3', 'classifier', 'projection'],
-        5: ['conv1', 'bn1', 'layer1', 'layer2', 'classifier', 'projection'],
-        6: ['conv1', 'bn1', 'layer1', 'classifier', 'projection'],
-        7: ['conv1', 'bn1', 'classifier', 'projection']
-    }
-    
-    server_layer_map = {
-        1: ['classifier', 'projection'],  # Tier 1客户端包含所有特征层
-        2: ['layer6', 'classifier', 'projection'],
-        3: ['layer5', 'layer6', 'classifier', 'projection'],
-        4: ['layer4', 'layer5', 'layer6', 'classifier', 'projection'],
-        5: ['layer3', 'layer4', 'layer5', 'layer6', 'classifier', 'projection'],
-        6: ['layer2', 'layer3', 'layer4', 'layer5', 'layer6', 'classifier', 'projection'],
-        7: ['layer1', 'layer2', 'layer3', 'layer4', 'layer5', 'layer6', 'classifier', 'projection']
-    }
-    
-    # 将客户端和服务器模型参数组合到全局模型
-    for client_id, tier in client_tiers.items():
-        if client_id in client_models_dict and client_id in server_models_dict:
-            client_model = client_models_dict[client_id]
-            server_model = server_models_dict[client_id]
-            
-            # 获取状态字典
-            if isinstance(client_model, dict):
-                client_state = client_model
-            else:
-                client_state = client_model.state_dict()
+    try:
+        # 初始化全局模型
+        global_model = {}
+        if init_glob_model is not None:
+            # 复制模板模型的状态字典，确保在正确设备上
+            for k, v in init_glob_model.state_dict().items():
+                global_model[k] = v.clone().to(device)
+        
+        # 统计各tier的客户端数量
+        tier_counts = {}
+        for client_id, tier in client_tiers.items():
+            tier_counts[tier] = tier_counts.get(tier, 0) + 1
+        
+        # 按tier收集和聚合模型参数
+        tier_models = {}
+        
+        # 1. 收集每个tier的客户端模型参数
+        for client_id, params in client_models_params.items():
+            tier = client_tiers.get(client_id)
+            if tier is None:
+                logging.warning(f"客户端 {client_id} 没有tier信息，跳过")
+                continue
                 
-            if isinstance(server_model, dict):
-                server_state = server_model
-            else:
-                server_state = server_model.state_dict()
+            if tier not in tier_models:
+                tier_models[tier] = {'client': [], 'server': None}
             
-            # 从客户端模型获取参数
-            for key in client_state.keys():
-                if key in global_state:
-                    prefix = key.split('.')[0] if '.' in key else key
-                    if prefix in tier_layer_map[tier]:
-                        global_state[key] += client_state[key]
-                        param_counts[key] += 1
+            # 将客户端模型参数移到目标设备并添加到列表
+            client_params_on_device = {}
+            for k, v in params.items():
+                # 跳过归一化层参数和分类器参数
+                if any(x in k for x in ['norm', 'running_mean', 'running_var', 'classifier', 'projection']):
+                    continue
+                    
+                try:
+                    client_params_on_device[k] = v.to(device)
+                except Exception as e:
+                    logging.error(f"移动参数 {k} 到设备 {device} 失败: {str(e)}")
+                    continue
             
-            # 从服务器模型获取参数
-            for key in server_state.keys():
-                if key in global_state:
-                    prefix = key.split('.')[0] if '.' in key else key
-                    if prefix in server_layer_map[tier]:
-                        global_state[key] += server_state[key]
-                        param_counts[key] += 1
+            tier_models[tier]['client'].append(client_params_on_device)
+            
+            # 如果还没有收集该tier的服务器模型，则获取它
+            if tier_models[tier]['server'] is None and client_id in server_models_dict:
+                server_model = server_models_dict[client_id]
+                server_params = server_model.state_dict()
+                server_params_on_device = {}
+                
+                for k, v in server_params.items():
+                    # 跳过归一化层参数和分类器参数
+                    if any(x in k for x in ['norm', 'running_mean', 'running_var', 'classifier', 'projection']):
+                        continue
+                        
+                    try:
+                        server_params_on_device[k] = v.to(device)
+                    except Exception as e:
+                        logging.error(f"移动服务器参数 {k} 到设备 {device} 失败: {str(e)}")
+                        continue
+                
+                tier_models[tier]['server'] = server_params_on_device
+        
+        # 2. 聚合每个tier的客户端模型，然后与对应的服务器模型组合
+        feature_extraction_count = 0
+        total_feature_extraction = sum(1 for k in global_model.keys() 
+                                     if not any(x in k for x in ['classifier', 'projection']))
+        
+        for tier, models in tier_models.items():
+            client_list = models['client']
+            server_model = models['server']
+            
+            if not client_list or not server_model:
+                logging.warning(f"Tier {tier} 缺少客户端或服务器模型，跳过")
+                continue
+            
+            # 聚合该tier的客户端模型
+            try:
+                agg_client_model = {}
+                for key in client_list[0].keys():
+                    # 初始化为零张量
+                    agg_client_model[key] = torch.zeros_like(client_list[0][key], device=device)
+                    
+                    # 计算平均值
+                    valid_models = 0
+                    for client_model in client_list:
+                        if key in client_model:
+                            agg_client_model[key] += client_model[key]
+                            valid_models += 1
+                    
+                    if valid_models > 0:
+                        agg_client_model[key] /= valid_models
+            except Exception as e:
+                logging.error(f"聚合Tier {tier} 客户端模型失败: {str(e)}")
+                continue
+            
+            # 将聚合的客户端模型和服务器模型组合到全局模型中
+            for key, param in agg_client_model.items():
+                if key in global_model:
+                    try:
+                        global_model[key] = param.clone().to(device)
+                        feature_extraction_count += 1
+                    except Exception as e:
+                        logging.error(f"复制客户端参数 {key} 到全局模型失败: {str(e)}")
+            
+            for key, param in server_model.items():
+                if key in global_model:
+                    try:
+                        global_model[key] = param.clone().to(device)
+                        feature_extraction_count += 1
+                    except Exception as e:
+                        logging.error(f"复制服务器参数 {key} 到全局模型失败: {str(e)}")
+        
+        # 输出统计信息
+        logging.info(f"全局聚合模型: 成功聚合了 {feature_extraction_count}/{total_feature_extraction} 个特征提取层参数")
+        
+        return global_model
     
-    # 计算参数平均值
-    for key in global_state.keys():
-        if param_counts[key] > 0:
-            global_state[key] = global_state[key] / param_counts[key]
+    except Exception as e:
+        logging.error(f"全局模型聚合失败: {str(e)}")
+        import traceback
+        logging.error(traceback.format_exc())
+        
+        # 返回初始模型作为备选
+        if init_glob_model is not None:
+            return {k: v.clone().to(device) for k, v in init_glob_model.state_dict().items()}
         else:
-            # 如果没有客户端贡献该参数，使用模板值
-            global_state[key] = template_state[key].clone()
-    
-    return global_state
+            return {}
