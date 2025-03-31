@@ -4,4 +4,4 @@ from .client_clustering import adaptive_cluster_assignment, extract_model_predic
 from .model_diagnosis_repair import ModelDiagnosticTracker, comprehensive_model_repair
 from .aggregation_mechanisms import enhanced_hierarchical_aggregation_no_projection
 from .parallel_training_framework import create_training_framework
-from .unified_client_module import EnhancedClient, ClientManager
+from .unified_client_module import EnhancedClient

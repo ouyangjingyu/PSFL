@@ -24,6 +24,7 @@
 # ============================================================================
 
 
+# 主函数中导入新模块
 import torch
 import torch.nn as nn
 import numpy as np
@@ -46,7 +47,7 @@ warnings.filterwarnings("ignore")
 # 添加项目根目录到系统路径
 sys.path.insert(0, os.path.abspath(os.path.join(os.getcwd(), "../")))
 
-# 导入模型架构
+# 导入模型架构 - 已修改为使用GroupNorm
 from model.resnet import resnet56_SFL_local_tier_7
 from model.resnet import resnet110_SFL_local_tier_7
 from model.resnet import resnet110_SFL_fedavg_base
@@ -57,16 +58,17 @@ from api.data_preprocessing.cifar100.data_loader import load_partition_data_cifa
 from api.data_preprocessing.cinic10.data_loader import load_partition_data_cinic10
 from data.cifar10_eval_dataset import get_cifar10_proxy_dataset
 
-# 导入自定义模块
+# 导入自定义模块 - 包括新增的设备管理器和优化训练策略
 from utils.enhanced_model_architecture import create_enhanced_client_model, create_enhanced_server_model, UnifiedClassifier
 from utils.client_clustering import adaptive_cluster_assignment, extract_model_predictions
 from utils.model_diagnosis_repair import ModelDiagnosticTracker, comprehensive_model_repair
-from utils.aggregation_mechanisms import enhanced_hierarchical_aggregation_no_projection
-from utils.parallel_training_framework import create_training_framework,create_training_framework_with_global_classifier
+from utils.enhanced_aggregation import EnhancedAggregator, enhanced_hierarchical_aggregation_no_projection
+from utils.parallel_training_framework import create_training_framework, create_training_framework_with_global_classifier
 from utils.unified_client_module import EnhancedClient, ClientManager, train_client_with_global_classifier
 from utils.global_model_utils import create_models_by_splitting, create_global_model, combine_to_global_model, split_global_model
 from utils.evaluate import comprehensive_evaluation, print_evaluation_results
-
+from utils.device_manager import DeviceManager
+from utils.training_strategy import OptimizedTrainingStrategy, create_training_strategy_for_client
 
 # 设置随机种子，确保实验可复现
 SEED = 42
@@ -79,84 +81,24 @@ if torch.cuda.is_available():
     torch.backends.cudnn.deterministic = True
     print(f"使用GPU: {torch.cuda.get_device_name(0)}")
 
-def print_model_architecture(model, name="模型", detail_level=0):
-    """
-    打印模型架构信息
-    
-    Args:
-        model: 要分析的模型
-        name: 模型名称
-        detail_level: 详细程度，0=基本信息，1=中等细节，2=完整细节
-    """
-    print(f"\n==== {name} 架构信息 ====")
-    
-    # 基本模型信息
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"总参数数量: {total_params:,}")
-    print(f"可训练参数: {trainable_params:,}")
-    print(f"模型类型: {type(model).__name__}")
-    
-    # 打印模型层次结构
-    if detail_level >= 1:
-        print("\n层级结构:")
-        for name, module in model.named_children():
-            print(f"- {name}: {type(module).__name__}")
-            
-            if detail_level >= 2:
-                # 打印子模块
-                for sub_name, sub_module in module.named_children():
-                    print(f"  - {name}.{sub_name}: {type(sub_module).__name__}")
-    
-    # 打印状态字典键，按层组织
-    if detail_level >= 1:
-        print("\n状态字典键:")
-        state_dict = model.state_dict()
-        layers = {}
-        
-        # 组织键
-        for key in state_dict.keys():
-            parts = key.split('.')
-            if len(parts) > 1:
-                layer = parts[0]
-                if layer not in layers:
-                    layers[layer] = []
-                layers[layer].append(key)
-            else:
-                if 'other' not in layers:
-                    layers['other'] = []
-                layers['other'].append(key)
-        
-        # 打印层及其键
-        for layer, keys in layers.items():
-            print(f"- {layer}:")
-            if detail_level >= 2:
-                # 打印每个键和张量形状
-                for key in keys:
-                    shape = tuple(state_dict[key].shape)
-                    print(f"  - {key}: {shape}")
-            else:
-                # 只打印键的数量
-                print(f"  - {len(keys)} 个参数")
-    
-    print("=" * 40)
 def parse_arguments():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(description='异构联邦学习框架')
     
     # 实验标识
-    parser.add_argument('--running_name', default="HPFL", type=str, help='实验名称')
+    parser.add_argument('--running_name', default="HPFL-GN", type=str, help='实验名称')
     
-    # 优化相关参数
-    parser.add_argument('--lr', default=0.001, type=float, help='学习率')
-    parser.add_argument('--lr_factor', default=0.9, type=float, help='学习率衰减因子')
+    # 优化相关参数 - 修改默认参数以适应GroupNorm
+    parser.add_argument('--lr', default=0.00075, type=float, help='学习率 (默认为0.001的0.75倍，适应GroupNorm)')
+    parser.add_argument('--lr_factor', default=0.85, type=float, help='学习率衰减因子')
     parser.add_argument('--lr_patience', default=10, type=float, help='学习率调整耐心值')
-    parser.add_argument('--lr_min', default=0, type=float, help='最小学习率')
-    parser.add_argument('--optimizer', default="Adam", type=str, help='优化器: SGD, Adam等')
-    parser.add_argument('--wd', help='权重衰减参数', type=float, default=5e-4)
- 
-    # 模型相关参数
+    parser.add_argument('--lr_min', default=1e-6, type=float, help='最小学习率')
+    parser.add_argument('--optimizer', default="Adam", type=str, help='优化器: SGD, Adam等 (默认改为Adam)')
+    parser.add_argument('--wd', help='权重衰减参数', type=float, default=1e-4)
+    
+    # 模型相关参数 - 添加GroupNorm相关参数
     parser.add_argument('--model', type=str, default='resnet110', help='训练使用的神经网络 (resnet110 或 resnet56)')
+    parser.add_argument('--groups_per_channel', type=int, default=32, help='GroupNorm的每通道分组数，默认32')
     
     # 数据加载和预处理相关参数
     parser.add_argument('--dataset', type=str, default='cifar10', help='训练数据集')
@@ -197,19 +139,42 @@ def setup_logging(args):
             logging.FileHandler(f"{args.running_name}.log")
         ]
     )
-    logger = logging.getLogger("HPFL")
+    logger = logging.getLogger("HPFL-GN")
     
     # 配置wandb
     wandb.init(
         mode="online",
-        project="HeterogeneousFL",
+        project="HeterogeneousFL-GN",  # 更新项目名称以反映使用GroupNorm
         name=args.running_name,
         config=args,
-        tags=[f"model_{args.model}", f"dataset_{args.dataset}", f"clients_{args.client_number}"]
+        tags=[f"model_{args.model}", f"dataset_{args.dataset}", f"clients_{args.client_number}", "GroupNorm"]
     )
     
     return logger
 
+def safe_load_state_dict(model, state_dict, verbose=False):
+    """安全地加载状态字典，处理架构不匹配的情况"""
+    # 过滤状态字典，只保留模型中存在的键
+    model_keys = set(model.state_dict().keys())
+    dict_keys = set(state_dict.keys())
+    
+    # 找出不匹配的键
+    missing_keys = model_keys - dict_keys
+    unexpected_keys = dict_keys - model_keys
+    
+    if verbose:
+        if missing_keys:
+            print(f"模型中存在但状态字典中缺少的键: {missing_keys}")
+        if unexpected_keys:
+            print(f"状态字典中存在但模型中缺少的键: {unexpected_keys}")
+    
+    # 创建过滤后的状态字典
+    filtered_dict = {k: v for k, v in state_dict.items() if k in model_keys}
+    
+    # 加载过滤后的状态字典
+    model.load_state_dict(filtered_dict, strict=False)
+    
+    return model
 
 def log_system_resources():
     """记录系统资源使用情况"""
@@ -237,7 +202,6 @@ def log_system_resources():
         
         # 尝试获取GPU利用率（需要pynvml支持）
         try:
-
             pynvml.nvmlInit()
             handle = pynvml.nvmlDeviceGetHandleByIndex(0)
             gpu_utilization = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
@@ -249,39 +213,6 @@ def log_system_resources():
     wandb.log(resource_metrics)
     
     return resource_metrics
-
-
-def load_dataset(args):
-    """加载并分割数据集"""
-    if args.dataset == "cifar10":
-        data_loader = load_partition_data_cifar10
-    elif args.dataset == "cifar100":
-        data_loader = load_partition_data_cifar100
-    elif args.dataset == "cinic10":
-        data_loader = load_partition_data_cinic10
-        args.data_dir = './data/cinic10/'
-    else:
-        data_loader = load_partition_data_cifar10
-
-    if args.dataset == "cinic10":
-        train_data_num, test_data_num, train_data_global, test_data_global, \
-        train_data_local_num_dict, train_data_local_dict, test_data_local_dict, \
-        class_num, traindata_cls_counts = data_loader(args.dataset, args.data_dir, args.partition_method,
-                                args.partition_alpha, args.client_number, args.batch_size)
-        
-        dataset = [train_data_num, test_data_num, train_data_global, test_data_global,
-                   train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num, traindata_cls_counts]
-        
-    else:
-        train_data_num, test_data_num, train_data_global, test_data_global, \
-        train_data_local_num_dict, train_data_local_dict, test_data_local_dict, \
-        class_num = data_loader(args.dataset, args.data_dir, args.partition_method,
-                                args.partition_alpha, args.client_number, args.batch_size)
-        
-        dataset = [train_data_num, test_data_num, train_data_global, test_data_global,
-                   train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num]
-    
-    return dataset
 
 
 def allocate_resources_to_clients(num_clients):
@@ -321,56 +252,38 @@ def allocate_resources_to_clients(num_clients):
     
     return client_resource_allocation
 
-def safe_load_state_dict(model, state_dict, verbose=False):
-    """安全地加载状态字典，处理架构不匹配的情况"""
-    # 过滤状态字典，只保留模型中存在的键
-    model_keys = set(model.state_dict().keys())
-    dict_keys = set(state_dict.keys())
-    
-    # 找出不匹配的键
-    missing_keys = model_keys - dict_keys
-    unexpected_keys = dict_keys - model_keys
-    
-    if verbose:
-        if missing_keys:
-            print(f"模型中存在但状态字典中缺少的键: {missing_keys}")
-        if unexpected_keys:
-            print(f"状态字典中存在但模型中缺少的键: {unexpected_keys}")
-    
-    # 创建过滤后的状态字典
-    filtered_dict = {k: v for k, v in state_dict.items() if k in model_keys}
-    
-    # 加载过滤后的状态字典
-    model.load_state_dict(filtered_dict, strict=False)
-    
-    return model
+def load_dataset(args):
+    """加载并分割数据集"""
+    if args.dataset == "cifar10":
+        data_loader = load_partition_data_cifar10
+    elif args.dataset == "cifar100":
+        data_loader = load_partition_data_cifar100
+    elif args.dataset == "cinic10":
+        data_loader = load_partition_data_cinic10
+        args.data_dir = './data/cinic10/'
+    else:
+        data_loader = load_partition_data_cifar10
 
-def create_models(args, class_num):
-    """创建客户端和服务器模型"""
-    print("创建模型架构...")
-    # 确定设备
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if args.dataset == "cinic10":
+        train_data_num, test_data_num, train_data_global, test_data_global, \
+        train_data_local_num_dict, train_data_local_dict, test_data_local_dict, \
+        class_num, traindata_cls_counts = data_loader(args.dataset, args.data_dir, args.partition_method,
+                                args.partition_alpha, args.client_number, args.batch_size)
+        
+        dataset = [train_data_num, test_data_num, train_data_global, test_data_global,
+                   train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num, traindata_cls_counts]
+        
+    else:
+        train_data_num, test_data_num, train_data_global, test_data_global, \
+        train_data_local_num_dict, train_data_local_dict, test_data_local_dict, \
+        class_num = data_loader(args.dataset, args.data_dir, args.partition_method,
+                                args.partition_alpha, args.client_number, args.batch_size)
+        
+        dataset = [train_data_num, test_data_num, train_data_global, test_data_global,
+                   train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num]
     
-    # 通过拆分全局模型创建所有tier的客户端和服务器模型
-    client_models, server_models, unified_classifier, init_glob_model, num_tiers = create_models_by_splitting(
-        class_num=class_num,
-        model_type=args.model,  # 'resnet110' 或 'resnet56'
-        device=device
-    )
-    
-    # 打印模型架构信息
-    print("\n===== 模型架构信息 =====")
-    print(f"模型类型: {args.model}")
-    print(f"Tier数量: {num_tiers}")
-    print(f"分类器输入维度: 256, 分类数: {class_num}")
-    
-    # 打印第一个tier的模型架构（示例）
-    print_model_architecture(client_models[1], "客户端模型 (Tier 1)", detail_level=1)
-    print_model_architecture(server_models[1], "服务器模型 (Tier 1)", detail_level=1)
-    print_model_architecture(init_glob_model, "全局模型 (Tier 3)", detail_level=2)
-    print_model_architecture(unified_classifier, "统一分类器", detail_level=2)
-    
-    return client_models, server_models, unified_classifier, init_glob_model, num_tiers
+    return dataset
+
 def setup_clients(args, dataset, client_resources, client_models, server_models):
     """设置客户端管理器和客户端"""
     # 提取数据集信息
@@ -391,6 +304,9 @@ def setup_clients(args, dataset, client_resources, client_models, server_models)
         resources = client_resources[client_idx]
         tier = resources["storage_tier"]
         
+        # 创建优化的学习率，适应GroupNorm
+        optimized_lr = args.lr * (1.0 if tier > 3 else 0.8)  # 高tier使用稍低的学习率
+        
         # 添加客户端
         client_manager.add_client(
             client_id=client_idx,
@@ -398,7 +314,7 @@ def setup_clients(args, dataset, client_resources, client_models, server_models)
             train_dataset=train_data_local_dict[client_idx],
             test_dataset=test_data_local_dict[client_idx],
             device=default_device,
-            lr=args.lr,
+            lr=optimized_lr,  # 使用优化的学习率
             local_epochs=args.client_epoch,
             resources=resources
         )
@@ -416,7 +332,6 @@ def setup_clients(args, dataset, client_resources, client_models, server_models)
         server_models_dict[client_idx] = copy.deepcopy(server_models[tier])
     
     return client_manager, client_models_dict, server_models_dict
-
 
 def pretrain_and_cluster(client_manager, client_models_dict, args, device):
     """客户端预训练和数据分布感知聚类"""
@@ -498,184 +413,6 @@ def pretrain_and_cluster(client_manager, client_models_dict, args, device):
     
     return client_clusters, pretrained_models
 
-
-def train_client_function(client_id, client_model, server_model, device, 
-                         client_manager, round_idx, global_classifier=None, local_epochs=None, split_rounds=1):
-    """客户端训练函数（用于并行训练框架）- 记录本地和全局分类器结果"""
-    try:
-        client = client_manager.get_client(client_id)
-        if client is None:
-            return {'error': f"客户端 {client_id} 不存在"}
-        
-        # 确保客户端设备与传入的设备一致
-        client.device = device
-        print(f"客户端 {client_id} 使用设备: {device}")
-
-        # 确保全局分类器在正确设备上
-        if global_classifier is not None:
-            global_classifier = global_classifier.to(device)
-            # 确保其参数也在正确设备上
-            for param in global_classifier.parameters():
-                param.data = param.data.to(device)
-        
-        # 记录开始时间
-        start_time = time.time()
-        
-        # 第1步：本地训练 - 确保深度复制模型，避免引用相同的模型
-        client_model_copy = copy.deepcopy(client_model)
-        client_state, local_stats = client.local_train(client_model_copy, local_epochs)
-        local_train_time = local_stats['time']
-        
-        # 第2步：拆分学习训练 - 传递全局分类器
-        # 使用已经本地训练过的模型继续拆分学习训练
-        client_state_sl, server_state, sl_stats = client.train_split_learning(
-            client_model_copy, 
-            copy.deepcopy(server_model), 
-            global_classifier=global_classifier,  # 添加全局分类器参数
-            rounds=split_rounds
-        )
-        sl_train_time = sl_stats['time']
-        
-        # 合并结果并计算总训练时间
-        total_time = local_train_time + sl_train_time
-        
-        # 记录通信量
-        communication_size_mb = sl_stats.get('data_transmitted_mb', 0)
-        
-        # 计算客户端数据量
-        data_size = sl_stats.get('data_size', 0)
-        
-        # 获取学习率
-        local_lr = local_stats.get('lr_final', client.learning_rate)
-        
-        # 合并统计信息
-        merged_stats = {
-            'local_train': local_stats,
-            'split_learning': sl_stats,
-            
-            # 全局分类器结果（用于兼容旧代码）
-            'loss': sl_stats['loss'],
-            'accuracy': sl_stats['accuracy'],
-            
-            # 本地分类器的拆分学习结果
-            'local_sl_loss': sl_stats.get('local_loss', 0),
-            'local_sl_accuracy': sl_stats.get('local_accuracy', 0),
-            
-            # 全局分类器的拆分学习结果
-            'global_sl_loss': sl_stats.get('global_loss', 0), 
-            'global_sl_accuracy': sl_stats.get('global_accuracy', 0),
-            
-            # 本地训练结果
-            'local_train_loss': local_stats.get('loss', 0),
-            'local_train_accuracy': local_stats.get('accuracy', 0),
-            
-            'time': total_time,
-            'local_train_time': local_train_time,
-            'sl_train_time': sl_train_time,
-            'data_size': data_size,
-            'communication_mb': communication_size_mb,
-            'lr': local_lr,
-            
-            # 保存训练后的模型状态
-            'client_model_state': client_state_sl,
-            'server_model_state': server_state
-        }
-        
-        # 记录到wandb
-        client_metrics = {
-            # 客户端本地训练结果
-            f"client_{client_id}/round_{round_idx}/local_train_loss": local_stats.get('loss', 0),
-            f"client_{client_id}/round_{round_idx}/local_train_accuracy": local_stats.get('accuracy', 0),
-            
-            # 拆分学习本地分类器结果
-            f"client_{client_id}/round_{round_idx}/local_sl_loss": sl_stats.get('local_loss', 0),
-            f"client_{client_id}/round_{round_idx}/local_sl_accuracy": sl_stats.get('local_accuracy', 0),
-            
-            # 拆分学习全局分类器结果
-            f"client_{client_id}/round_{round_idx}/global_sl_loss": sl_stats.get('global_loss', 0),
-            f"client_{client_id}/round_{round_idx}/global_sl_accuracy": sl_stats.get('global_accuracy', 0),
-            
-            # 兼容旧代码
-            f"client_{client_id}/round_{round_idx}/train_loss": sl_stats['loss'],
-            f"client_{client_id}/round_{round_idx}/train_accuracy": sl_stats['accuracy'],
-            
-            f"client_{client_id}/round_{round_idx}/local_train_time": local_train_time,
-            f"client_{client_id}/round_{round_idx}/sl_train_time": sl_train_time,
-            f"client_{client_id}/round_{round_idx}/total_time": total_time,
-            f"client_{client_id}/round_{round_idx}/communication_mb": communication_size_mb,
-            f"client_{client_id}/round_{round_idx}/learning_rate": local_lr,
-            f"client_{client_id}/tier": client.tier
-        }
-        wandb.log(client_metrics)
-        
-        # 返回最终的客户端和服务器模型状态以及训练统计信息
-        return merged_stats
-        
-    except Exception as e:
-        import traceback
-        error_msg = f"客户端 {client_id} 训练失败: {str(e)}\n{traceback.format_exc()}"
-        print(error_msg)
-        return {'error': error_msg}
-def evaluate_client_function(client_id, client_model, server_model, device, client_manager, round_idx, global_classifier=None, **kwargs):
-    """客户端评估函数（用于并行训练框架）- 记录本地和全局分类器结果"""
-    try:
-        client = client_manager.get_client(client_id)
-        if client is None:
-            return {'error': f"客户端 {client_id} 不存在"}
-        # 确保global_classifier完全在正确设备上
-        if global_classifier is not None:
-            global_classifier = global_classifier.to(device)
-            # 确保所有参数和缓冲区都在设备上
-            for param in global_classifier.parameters():
-                param.data = param.data.to(device)
-            for buffer in global_classifier.buffers():
-                buffer.data = buffer.data.to(device)
-        # 执行评估 - 传递全局分类器
-        eval_start_time = time.time()
-        eval_stats = client.evaluate(client_model, server_model, global_classifier=global_classifier)
-        eval_time = time.time() - eval_start_time
-        
-        # 添加评估时间
-        eval_stats['time'] = eval_time
-        
-        # 记录到wandb - 同时记录本地和全局分类器结果
-        eval_metrics = {
-            # 本地分类器结果
-            f"client_{client_id}/round_{round_idx}/local_test_loss": eval_stats['local_loss'],
-            f"client_{client_id}/round_{round_idx}/local_test_accuracy": eval_stats['local_accuracy'],
-            
-            # 全局分类器结果
-            f"client_{client_id}/round_{round_idx}/global_test_loss": eval_stats['global_loss'],
-            f"client_{client_id}/round_{round_idx}/global_test_accuracy": eval_stats['global_accuracy'],
-            
-            # 兼容旧代码
-            f"client_{client_id}/round_{round_idx}/test_loss": eval_stats['loss'],
-            f"client_{client_id}/round_{round_idx}/test_accuracy": eval_stats['accuracy'],
-            
-            f"client_{client_id}/round_{round_idx}/test_time": eval_time
-        }
-        
-        # 记录本地分类器每个类别的准确率
-        for i, acc in enumerate(eval_stats.get('local_per_class_accuracy', [])):
-            eval_metrics[f"client_{client_id}/round_{round_idx}/local_class_{i}_accuracy"] = acc
-        
-        # 记录全局分类器每个类别的准确率
-        for i, acc in enumerate(eval_stats.get('global_per_class_accuracy', [])):
-            eval_metrics[f"client_{client_id}/round_{round_idx}/global_class_{i}_accuracy"] = acc
-            # 兼容旧代码
-            eval_metrics[f"client_{client_id}/round_{round_idx}/class_{i}_accuracy"] = acc
-        
-        wandb.log(eval_metrics)
-        
-        return eval_stats
-        
-    except Exception as e:
-        import traceback
-        error_msg = f"客户端 {client_id} 评估失败: {str(e)}\n{traceback.format_exc()}"
-        print(error_msg)
-        return {'error': error_msg}
-
-# 
 def main():
     """主函数"""
     # 解析命令行参数
@@ -683,11 +420,18 @@ def main():
     
     # 设置日志
     logger = setup_logging(args)
-    logger.info("初始化异构联邦学习框架...")
+    logger.info("初始化GroupNorm版异构联邦学习框架...")
     
-    # 设置设备
+    # 创建设备管理器
+    device_manager = DeviceManager()
+    
+    # 选择最佳聚合设备
+    aggregation_device = device_manager.select_aggregation_device()
+    logger.info(f"聚合过程使用设备: {aggregation_device}")
+    
+    # 设置默认设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger.info(f"使用设备: {device}")
+    logger.info(f"默认设备: {device}")
     
     # 记录初始系统资源
     resource_info = log_system_resources()
@@ -729,15 +473,22 @@ def main():
     
     wandb.log(resource_stats)
     
-    # 创建模型
-    logger.info(f"创建 {args.model} 模型架构...")
-    client_models, server_models, unified_classifier, init_glob_model, num_tiers = create_models(args, class_num)
+    # 创建模型 - 使用GroupNorm版本
+    logger.info(f"创建GroupNorm版 {args.model} 模型架构...")
+    # 传入groups_per_channel参数
+    client_models, server_models, unified_classifier, init_glob_model, num_tiers = create_models(
+        args, class_num, groups_per_channel=args.groups_per_channel
+    )
     
     # 设置客户端
     logger.info("初始化客户端...")
     client_manager, client_models_dict, server_models_dict = setup_clients(
         args, dataset, client_resources, client_models, server_models
     )
+    
+    # 创建聚合器
+    logger.info("初始化增强聚合器...")
+    aggregator = EnhancedAggregator(device_manager)
     
     # 创建诊断追踪器
     logger.info("初始化模型诊断系统...")
@@ -778,16 +529,16 @@ def main():
     wandb.define_metric("global/test_loss", step_metric="round")
 
     # 添加本地分类器指标
-    wandb.define_metric("client/local_train_accuracy", step_metric="round")  # 客户端本地训练准确率
-    wandb.define_metric("client/local_train_loss", step_metric="round")      # 客户端本地训练损失
-    wandb.define_metric("client/local_test_accuracy", step_metric="round")   # 客户端本地测试准确率
-    wandb.define_metric("client/local_test_loss", step_metric="round")       # 客户端本地测试损失
+    wandb.define_metric("client/local_train_accuracy", step_metric="round")
+    wandb.define_metric("client/local_train_loss", step_metric="round")
+    wandb.define_metric("client/local_test_accuracy", step_metric="round")
+    wandb.define_metric("client/local_test_loss", step_metric="round")
 
     # 添加全局分类器指标
-    wandb.define_metric("client/global_train_accuracy", step_metric="round") # 客户端全局训练准确率
-    wandb.define_metric("client/global_train_loss", step_metric="round")     # 客户端全局训练损失
-    wandb.define_metric("client/global_test_accuracy", step_metric="round")  # 客户端全局测试准确率
-    wandb.define_metric("client/global_test_loss", step_metric="round")      # 客户端全局测试损失
+    wandb.define_metric("client/global_train_accuracy", step_metric="round")
+    wandb.define_metric("client/global_train_loss", step_metric="round")
+    wandb.define_metric("client/global_test_accuracy", step_metric="round")
+    wandb.define_metric("client/global_test_loss", step_metric="round")
 
     # 原有指标（兼容旧代码）
     wandb.define_metric("server/avg_train_accuracy", step_metric="round")
@@ -822,7 +573,7 @@ def main():
 
         # 执行并行训练
         cluster_results, client_stats, training_time = training_framework.execute_training(
-            train_client_with_global_classifier,  # 使用新的训练函数
+            train_client_with_global_classifier,  # 使用优化的训练函数
             evaluate_client_function,
             client_manager=client_manager,
             round_idx=round_idx,
@@ -841,38 +592,19 @@ def main():
         # 收集训练后的模型
         client_models_params, client_weights = training_framework.collect_trained_models(cluster_results)
         
-
-        # 执行分层聚合
-        logger.info("执行双层聚合...")
+        # 执行增强的分层聚合
+        logger.info("执行基于设备管理的双层聚合...")
         try:
-            # 指定聚合设备
-            aggregation_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            
-            # 执行聚类内聚合
-            _, cluster_models, agg_log = enhanced_hierarchical_aggregation_no_projection(
+            # 使用设备管理器进行聚合
+            global_model, cluster_models, agg_log = aggregator.enhanced_hierarchical_aggregation(
                 client_models_params, 
                 client_weights, 
                 client_clusters,
                 client_tiers=client_tiers,
                 global_model_template=init_glob_model.state_dict() if init_glob_model else None,
-                num_classes=class_num,
-                device=aggregation_device  # 明确指定设备
+                num_classes=class_num
             )
             
-            # 执行全局模型组合 (基于拆分学习思想)
-            global_model = combine_to_global_model(
-                client_models_params,
-                server_models_dict,
-                client_tiers,
-                init_glob_model,
-                device=aggregation_device  # 明确指定设备
-            )
-            
-            # 确保global_model不为None
-            if global_model is None:
-                print("错误: global_model为None，使用默认模型")
-                global_model = {} if init_glob_model is None else init_glob_model.state_dict()
-
         except Exception as e:
             import traceback
             print(f"聚合过程出错: {str(e)}")
@@ -885,67 +617,48 @@ def main():
         training_framework.set_global_model(global_model)
         training_framework.set_cluster_models(cluster_models)
         
-
-        # 创建全局模型进行评估，加载全局模型（忽略增强客户端特有的投影层）
+        # 创建全局模型进行评估
         global_eval_model = copy.deepcopy(init_glob_model)
-        global_eval_model = global_eval_model.to(device)  # 先将模型移到目标设备
+        global_eval_model = global_eval_model.to(device)
 
         # 打印全局模型状态字典键
         print("\n==== 全局聚合模型状态字典信息 ====")
         global_model_keys = set(global_model.keys())
         print(f"键的数量: {len(global_model_keys)}")
         print(f"示例键: {list(global_model_keys)[:5]}")
-        if 'projection.weight' in global_model:
-            print(f"projection.weight形状: {global_model['projection.weight'].shape}")
-        print("=" * 40)
+        
+        # 加载聚合后的模型参数 - 使用设备管理器恢复到原始设备
+        global_eval_model = safe_load_state_dict(global_eval_model, global_model, verbose=True)
 
-        # 确保全局模型参数在正确设备上
-        device_sync_global_model = {}
-        for k, v in global_model.items():
-            device_sync_global_model[k] = v.to(device)
-
-        # 加载聚合后的模型参数
-        global_eval_model = safe_load_state_dict(global_eval_model, device_sync_global_model, verbose=True)
-
-        # 加载后打印
-        print_model_architecture(global_eval_model, "加载全局模型后的全局评估模型", detail_level=1)
-        # 创建均衡数据集，评估全局模型、本地模型、客户端-服务器-全局分类器
-        if 'balanced_eval_dataset' not in locals():
-            balanced_eval_dataset = get_cifar10_proxy_dataset(
-                option='balanced_test',
-                num_samples=2000,
-                seed=42
-            )
-
-        # Run comprehensive evaluation
-        logger.info("Performing comprehensive model evaluation...")
+        # 进行全面评估
+        logger.info("执行全面模型评估...")
         eval_results = comprehensive_evaluation(
             global_eval_model,  # 全局模型
             client_models_dict,  # 客户端模型 
             server_models_dict,  # 服务器模型
             unified_classifier,  # 全局分类器
-            balanced_eval_dataset,
+            eval_dataset,
             client_clusters,
             client_resources,  # 传入客户端资源信息（包含tier级别）
             device,
             class_num
         )
 
-        # Print and log results
+        # 打印并记录结果
         print_evaluation_results(eval_results, round_idx)
 
-        # Log additional metrics to wandb
+        # 记录到wandb
         comp_eval_metrics = {
             f"comprehensive/global_accuracy": eval_results['global']['accuracy'],
             f"comprehensive/avg_local_accuracy": eval_results['averages']['local_accuracy'],
             f"comprehensive/avg_server_global_accuracy": eval_results['averages']['server_global_accuracy']
         }
 
-        # Add client-global if available
+        # 添加客户端-全局评估结果
         if isinstance(eval_results['averages']['client_global_accuracy'], (int, float)):
             comp_eval_metrics[f"comprehensive/avg_client_global_accuracy"] = eval_results['averages']['client_global_accuracy']
 
-        # Log per-cluster metrics
+        # 记录每个聚类的评估结果
         for key, value in eval_results.items():
             if key.startswith('cluster_'):
                 cluster_id = key.split('_')[1]
@@ -955,26 +668,8 @@ def main():
                     comp_eval_metrics[f"comprehensive/cluster_{cluster_id}/client_global_accuracy"] = value['client_global_accuracy']
 
         wandb.log(comp_eval_metrics)
-        # 诊断并修复全局模型
-        logger.info("诊断和修复全局模型...")
-        diagnostic_result = {
-            'bn_issues': [],
-            'dead_neurons': [],
-            'classifier_issues': [],
-            'prediction_data': extract_model_predictions(global_eval_model, eval_dataset, device)
-        }
-        diagnostic_tracker.add_diagnosis_result(diagnostic_result)
         
-        # 执行模型修复
-        global_eval_model, repair_summary = comprehensive_model_repair(
-            global_eval_model,
-            diagnostic_tracker,
-            eval_loader,
-            device,
-            num_classes=class_num
-        )
-        
-        # 评估全局模型
+        # 全局模型评估
         logger.info("评估全局模型性能...")
         global_eval_model.eval()
         correct = 0
@@ -1017,7 +712,6 @@ def main():
         per_class_acc = [100.0 * c / t if t > 0 else 0 for c, t in zip(class_correct, class_total)]
         
         # 更新最佳准确率
-
         is_best = accuracy > best_accuracy
         if is_best:
             best_accuracy = accuracy
@@ -1269,12 +963,21 @@ def main():
         if round_idx % 5 == 0 or round_idx == args.rounds - 1:
             log_system_resources()
         
-        # 更新客户端模型（聚类）和服务器模型（全局拆分）
+        # 使用设备管理器和增强聚合器更新客户端模型
         print("更新客户端和服务器模型...")
-
+        updated_client_models = aggregator.update_client_models(
+            client_models_dict, 
+            global_model=global_model, 
+            cluster_models=cluster_models, 
+            cluster_map=client_clusters
+        )
+        
+        # 更新客户端模型
+        client_models_dict = updated_client_models
+        
+        # 更新服务器模型，使用全局模型拆分
         for client_id in client_models_dict.keys():
-            # 获取客户端所属聚类和tier
-            cluster_id = client_manager.get_client_cluster(client_id)
+            # 获取客户端tier
             client = client_manager.get_client(client_id)
             
             if client is None:
@@ -1282,23 +985,13 @@ def main():
                 
             tier = client.tier
             
-            # 客户端模型更新 - 使用聚类模型（保留个性化学习成果）
-            if cluster_id is not None and cluster_id in cluster_models:
-                # 创建一个新的客户端模型
-                client_model = copy.deepcopy(client_models_dict[client_id])
-                
-                # 加载聚类模型参数
-                client_model = safe_load_state_dict(client_model, cluster_models[cluster_id])
-                client_models_dict[client_id] = client_model
-                
-                print(f"已用聚类 {cluster_id} 模型更新客户端 {client_id} (Tier {tier}) 的客户端模型")
-            
             # 服务器模型更新 - 使用拆分全局模型的方式（确保服务器模型一致性）
             _, server_model = split_global_model(
                 global_model,
                 tier=tier,
                 class_num=class_num,
-                model_type=args.model
+                model_type=args.model,
+                groups_per_channel=args.groups_per_channel  # 添加这个参数
             )
             
             # 更新服务器模型
@@ -1311,12 +1004,38 @@ def main():
         "final/best_accuracy": best_accuracy,
         "final/rounds": args.rounds,
         "final/client_number": args.client_number,
-        "final/clusters": len(client_clusters)
+        "final/clusters": len(client_clusters),
+        "final/model_type": "GroupNorm-ResNet"  # 标记使用了GroupNorm版本
     }
     wandb.log(final_stats)
     
-    logger.info(f"联邦学习训练完成! 最佳准确率: {best_accuracy:.2f}%")
+    logger.info(f"GroupNorm版联邦学习训练完成! 最佳准确率: {best_accuracy:.2f}%")
     wandb.finish()
+
+
+# 模型创建函数 - 传递GroupNorm参数
+def create_models(args, class_num, groups_per_channel=32):
+    """创建客户端和服务器模型"""
+    print("创建GroupNorm版模型架构...")
+    # 确定设备
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # 通过拆分全局模型创建所有tier的客户端和服务器模型
+    client_models, server_models, unified_classifier, init_glob_model, num_tiers = create_models_by_splitting(
+        class_num=class_num,
+        model_type=args.model,  # 'resnet110' 或 'resnet56'
+        device=device,
+        groups_per_channel=groups_per_channel  # 传递GroupNorm参数
+    )
+    
+    # 打印模型架构信息
+    print("\n===== GroupNorm模型架构信息 =====")
+    print(f"模型类型: {args.model} (GroupNorm版)")
+    print(f"Tier数量: {num_tiers}")
+    print(f"每通道分组数: {groups_per_channel}")
+    print(f"分类器输入维度: 256, 分类数: {class_num}")
+    
+    return client_models, server_models, unified_classifier, init_glob_model, num_tiers
 
 
 if __name__ == "__main__":

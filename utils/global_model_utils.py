@@ -10,7 +10,7 @@ from model.resnet import resnet110_base
 from model.resnet import resnet56_base
 from model.resnet import create_classifier
 
-def create_global_model(class_num, model_type='resnet110', device='cpu'):
+def create_global_model(class_num, model_type='resnet110', device='cpu', groups_per_channel=32):
     """
     创建全局模型模板
     
@@ -18,15 +18,17 @@ def create_global_model(class_num, model_type='resnet110', device='cpu'):
         class_num: 类别数量
         model_type: 模型类型，支持'resnet110'或'resnet56'
         device: 计算设备
+        groups_per_channel: GroupNorm的每通道分组数，默认为32
         
     Returns:
         全局模型
     """
     if model_type == 'resnet110':
-        # 移除重复的local_loss参数，因为该函数内部已经设置了local_loss=True
-        global_model = resnet110_base(classes=class_num, tier=1)
+        # 传递 groups_per_channel 参数
+        global_model = resnet110_base(classes=class_num, tier=1, groups_per_channel=groups_per_channel)
     elif model_type == 'resnet56':
-        global_model = resnet56_base(classes=class_num, tier=1)
+        # 传递 groups_per_channel 参数
+        global_model = resnet56_base(classes=class_num, tier=1, groups_per_channel=groups_per_channel)
     else:
         raise ValueError(f"不支持的模型类型: {model_type}")
     
@@ -36,7 +38,7 @@ def create_global_model(class_num, model_type='resnet110', device='cpu'):
     print(f"创建全局{model_type}模型，参数数量: {sum(p.numel() for p in global_model.parameters())}")
     return global_model
     
-def split_global_model(global_model, tier=1, class_num=10, model_type='resnet110'):
+def split_global_model(global_model, tier=1, class_num=10, model_type='resnet110', groups_per_channel=32):
     """
     将全局模型拆分成客户端和服务器模型
     
@@ -45,6 +47,7 @@ def split_global_model(global_model, tier=1, class_num=10, model_type='resnet110
         tier: 客户端tier级别(1-7)
         class_num: 类别数量
         model_type: 模型类型，支持'resnet110'或'resnet56'
+        groups_per_channel: GroupNorm的每通道分组数，默认为32
         
     Returns:
         client_model: 客户端模型
@@ -58,14 +61,17 @@ def split_global_model(global_model, tier=1, class_num=10, model_type='resnet110
     
     # 导入相应的模型创建函数
     if model_type == 'resnet110':
-        
         model_func = resnet110_SFL_local_tier_7
     else:
-
         model_func = resnet56_SFL_local_tier_7
     
-    # 创建指定tier级别的空客户端和服务器模型
-    client_model, server_model = model_func(classes=class_num, tier=tier, local_loss=True)
+    # 创建指定tier级别的空客户端和服务器模型，传递 groups_per_channel 参数
+    client_model, server_model = model_func(
+        classes=class_num, 
+        tier=tier, 
+        local_loss=True, 
+        groups_per_channel=groups_per_channel
+    )
     
     # 获取模型状态字典
     client_state = client_model.state_dict()
@@ -86,10 +92,15 @@ def split_global_model(global_model, tier=1, class_num=10, model_type='resnet110
     server_model.load_state_dict(server_state)
     
     return client_model, server_model
-
-def create_models_by_splitting(class_num, model_type='resnet110', device=None):
+def create_models_by_splitting(class_num, model_type='resnet110', device=None, groups_per_channel=32):
     """
     通过拆分创建全局模型，并为不同tier创建客户端和服务器模型
+    
+    Args:
+        class_num: 类别数量
+        model_type: 模型类型，支持'resnet110'或'resnet56'
+        device: 计算设备，如果为None则自动选择
+        groups_per_channel: GroupNorm的每通道分组数，默认为32
     
     Returns:
         client_models: 不同tier的客户端模型
@@ -116,12 +127,21 @@ def create_models_by_splitting(class_num, model_type='resnet110', device=None):
     num_tiers = 7
     
     for tier in range(1, num_tiers+1):
-        client_model, server_model = model_func(class_num, tier=tier, local_loss=True)
+        # 传递 groups_per_channel 参数
+        client_model, server_model = model_func(
+            class_num, 
+            tier=tier, 
+            local_loss=True, 
+            groups_per_channel=groups_per_channel
+        )
         client_models[tier] = client_model.to(device)
         server_models[tier] = server_model.to(device)
     
-    # 创建用于全局模型初始化的模板
-    init_glob_model = resnet110_base(class_num) if model_type == 'resnet110' else resnet56_base(class_num)
+    # 创建用于全局模型初始化的模板 - 传递 groups_per_channel 参数
+    if model_type == 'resnet110':
+        init_glob_model = resnet110_base(class_num, groups_per_channel=groups_per_channel)
+    else:
+        init_glob_model = resnet56_base(class_num, groups_per_channel=groups_per_channel)
     init_glob_model = init_glob_model.to(device)
     
     # 创建优化的全局分类器
@@ -182,7 +202,7 @@ def combine_to_global_model(client_models_params, server_models_dict, client_tie
             client_params_on_device = {}
             for k, v in params.items():
                 # 跳过归一化层参数和分类器参数
-                if any(x in k for x in ['norm', 'running_mean', 'running_var', 'classifier', 'projection']):
+                if any(x in k for x in ['norm', 'gn', 'classifier', 'projection']):
                     continue
                     
                 try:
@@ -201,7 +221,7 @@ def combine_to_global_model(client_models_params, server_models_dict, client_tie
                 
                 for k, v in server_params.items():
                     # 跳过归一化层参数和分类器参数
-                    if any(x in k for x in ['norm', 'running_mean', 'running_var', 'classifier', 'projection']):
+                    if any(x in k for x in ['norm', 'gn', 'classifier', 'projection']):
                         continue
                         
                     try:
@@ -215,7 +235,7 @@ def combine_to_global_model(client_models_params, server_models_dict, client_tie
         # 2. 聚合每个tier的客户端模型，然后与对应的服务器模型组合
         feature_extraction_count = 0
         total_feature_extraction = sum(1 for k in global_model.keys() 
-                                     if not any(x in k for x in ['classifier', 'projection']))
+                                     if not any(x in k for x in ['classifier', 'projection', 'gn']))
         
         for tier, models in tier_models.items():
             client_list = models['client']
@@ -252,7 +272,7 @@ def combine_to_global_model(client_models_params, server_models_dict, client_tie
                         global_model[key] = param.clone().to(device)
                         feature_extraction_count += 1
                     except Exception as e:
-                        logging.error(f"复制客户端参数 {key} 到全局模型失败: {str(e)}")
+                        logging.error(f"复制客户端参数 {k} 到全局模型失败: {str(e)}")
             
             for key, param in server_model.items():
                 if key in global_model:
@@ -260,7 +280,7 @@ def combine_to_global_model(client_models_params, server_models_dict, client_tie
                         global_model[key] = param.clone().to(device)
                         feature_extraction_count += 1
                     except Exception as e:
-                        logging.error(f"复制服务器参数 {key} 到全局模型失败: {str(e)}")
+                        logging.error(f"复制服务器参数 {k} 到全局模型失败: {str(e)}")
         
         # 输出统计信息
         logging.info(f"全局聚合模型: 成功聚合了 {feature_extraction_count}/{total_feature_extraction} 个特征提取层参数")
