@@ -285,9 +285,7 @@ class EnhancedClient:
         classifier_optimizer = optimizers.get('local_classifier')
         
         # 创建数据加载器
-        train_loader = torch.utils.data.DataLoader(
-            self.train_data, batch_size=32, shuffle=True, drop_last=False
-        )
+        train_loader = self.train_data
         
         # 损失函数
         criterion = nn.CrossEntropyLoss()
@@ -344,7 +342,7 @@ class EnhancedClient:
             epoch_acc = 100.0 * epoch_correct / epoch_total
             
             # 打印训练进度
-            print(f"Client {self.client_id} - Local Epoch {epoch+1}/{epochs}: "
+            print(f"Client {self.idx} - Local Epoch {epoch+1}/{epochs}: "
                 f"Loss={epoch_loss:.4f}, Acc={epoch_acc:.2f}%, "
                 f"LR={self.learning_rate:.6f}")
             
@@ -396,10 +394,7 @@ class EnhancedClient:
         )
         
         # 创建数据加载器
-        train_loader = torch.utils.data.DataLoader(
-            self.train_data, batch_size=32, shuffle=True, drop_last=False
-        )
-        
+        train_loader = self.train_data
         # 损失函数
         criterion = nn.CrossEntropyLoss()
         

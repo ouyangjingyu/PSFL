@@ -594,28 +594,20 @@ def filter_norm_params(state_dict):
 
 
 def enhanced_hierarchical_aggregation_no_projection(client_models_params, client_weights, client_clusters, 
-                                                  client_tiers=None, global_model_template=None, 
-                                                  num_classes=10, device=None):
-    """改进的层次聚合函数，解决设备不一致问题"""
+                                                 client_tiers=None, global_model_template=None, 
+                                                 num_classes=10, device=None):
+    """改进的层次聚合函数，解决设备不一致和类型转换问题"""
     # 确定目标设备
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # 同步日志
-    logging.info(f"模型聚合使用设备: {device}")
+    # 记录日志
+    print(f"模型聚合使用设备: {device}")
     
     # 聚类内聚合结果
     cluster_models = {}
     aggregation_log = {}
     
-    # 过滤所有客户端模型参数，去除归一化层参数
-    filtered_client_models_params = {}
-    for client_id, model_params in client_models_params.items():
-        filtered_client_models_params[client_id] = filter_norm_params(model_params)
-    
-    # 使用过滤后的参数进行聚合
-    client_models_params = filtered_client_models_params
-
     # 第一步：聚类内聚合
     for cluster_id, client_ids in client_clusters.items():
         if len(client_ids) == 0:
@@ -624,12 +616,21 @@ def enhanced_hierarchical_aggregation_no_projection(client_models_params, client
         # 收集该聚类内的客户端模型参数和权重
         cluster_client_models = {}
         cluster_client_weights = {}
+        client_tier_info = {}
         
         for client_id in client_ids:
             if client_id in client_models_params:
+                # 记录客户端的tier信息
+                if client_tiers and client_id in client_tiers:
+                    client_tier_info[client_id] = client_tiers[client_id]
+                else:
+                    # 如果没有tier信息，默认为最高tier
+                    client_tier_info[client_id] = 7
+                    
                 # 确保模型参数在同一设备上
                 client_model_params = {}
                 for k, v in client_models_params[client_id].items():
+                    # 移动参数到指定设备
                     client_model_params[k] = v.to(device)
                 
                 cluster_client_models[client_id] = client_model_params
@@ -638,25 +639,83 @@ def enhanced_hierarchical_aggregation_no_projection(client_models_params, client
         if not cluster_client_models:
             continue
             
-        # 执行加权平均聚合
-        agg_state_dict = {}
-        weight_sum = sum(cluster_client_weights.values())
+        # 按照tier排序客户端（tier越小，模型层次越多）
+        sorted_clients = sorted([(cid, client_tier_info.get(cid, 7)) for cid in cluster_client_models.keys()], 
+                               key=lambda x: x[1])
         
-        # 初始化空的聚合字典
-        for client_id, model_params in cluster_client_models.items():
-            for key in model_params.keys():
-                if key not in agg_state_dict:
-                    agg_state_dict[key] = torch.zeros_like(model_params[key], device=device)
+        # 选择tier最小的客户端作为基础模型结构
+        base_client_id = sorted_clients[0][0] if sorted_clients else None
         
-        # 加权聚合
-        for client_id, model_params in cluster_client_models.items():
-            client_weight = cluster_client_weights[client_id] / weight_sum
+        if base_client_id is None:
+            continue
             
-            for key, param in model_params.items():
-                if key in agg_state_dict:
-                    # 确保在同一设备上
-                    param_device = param.to(device)
-                    agg_state_dict[key] += client_weight * param_device
+        # 创建包含所有层的空聚合字典
+        agg_state_dict = {}
+        
+        # 收集该聚类内所有客户端模型拥有的键
+        all_keys = set()
+        for client_id, model_params in cluster_client_models.items():
+            all_keys.update(model_params.keys())
+        
+        # 计算归一化权重
+        weight_sum = sum(cluster_client_weights.values())
+        if weight_sum <= 0:
+            # 避免除零错误
+            normalized_weights = {cid: 1.0/len(cluster_client_models) for cid in cluster_client_models.keys()}
+        else:
+            normalized_weights = {cid: w/weight_sum for cid, w in cluster_client_weights.items()}
+        
+        # 首先初始化聚合字典，使用基础客户端模型的参数
+        base_model_params = cluster_client_models[base_client_id]
+        for key, param in base_model_params.items():
+            # 默认初始化为0张量，保持原始形状和类型
+            agg_state_dict[key] = torch.zeros_like(param, device=device)
+        
+        # 对于每个参数执行加权聚合
+        for key in all_keys:
+            # 如果该键不在基础模型参数中，尝试从其他客户端找到一个匹配的参数
+            if key not in agg_state_dict:
+                for client_id in cluster_client_models:
+                    if key in cluster_client_models[client_id]:
+                        # 初始化为该参数的形状和类型
+                        param = cluster_client_models[client_id][key]
+                        agg_state_dict[key] = torch.zeros_like(param, device=device)
+                        break
+            
+            # 如果还是无法找到匹配的参数，跳过该键
+            if key not in agg_state_dict:
+                continue
+            
+            # 获取参数的数据类型
+            param_dtype = agg_state_dict[key].dtype
+            
+            # 对于整数类型的参数（如num_batches_tracked），使用其中一个客户端的值
+            if param_dtype == torch.int64 or param_dtype == torch.long:
+                # 优先使用基础客户端模型的值
+                if key in base_model_params:
+                    agg_state_dict[key] = base_model_params[key].clone()
+                else:
+                    # 否则使用第一个拥有该参数的客户端模型的值
+                    for client_id in cluster_client_models:
+                        if key in cluster_client_models[client_id]:
+                            agg_state_dict[key] = cluster_client_models[client_id][key].clone()
+                            break
+            else:
+                # 对于浮点类型的参数，执行加权平均
+                for client_id, model_params in cluster_client_models.items():
+                    if key in model_params:
+                        param = model_params[key]
+                        # 确保参数形状匹配
+                        if param.shape == agg_state_dict[key].shape:
+                            # 确保数据在同一设备上
+                            param = param.to(device)
+                            # 使用客户端权重
+                            client_weight = normalized_weights[client_id]
+                            # 累加加权参数
+                            agg_state_dict[key] += client_weight * param
+        
+        # 保存该聚类的聚合模型
+        cluster_models[cluster_id] = agg_state_dict
         
         # 记录聚合日志
         if global_model_template:
@@ -669,36 +728,6 @@ def enhanced_hierarchical_aggregation_no_projection(client_models_params, client
             }
             print(f"聚类 {cluster_id} 聚合结果: 基础模型键数={len(template_keys)}, 聚合模型键数={len(agg_keys)}")
             print(f"  - 额外包含的键数: {len(agg_keys - template_keys)}")
-        
-        # 保存该聚类的聚合模型
-        cluster_models[cluster_id] = agg_state_dict
     
-    # 第二步：特征提取层的全局聚合
-    if global_model_template is not None:
-        global_model = {}
-        feature_extraction_count = 0
-        total_feature_extraction = 0
-        
-        # 复制全局模型模板作为基础
-        for k, v in global_model_template.items():
-            global_model[k] = v.clone().to(device)
-            
-            # 统计特征提取层参数数量
-            if not any(name in k for name in ['classifier', 'projection']):
-                total_feature_extraction += 1
-        
-        # 聚合所有聚类的特征提取层
-        for cluster_id, model_params in cluster_models.items():
-            for key, param in model_params.items():
-                # 只聚合特征提取层，不包括分类器和投影层
-                if not any(name in key for name in ['classifier', 'projection']):
-                    if key in global_model:
-                        global_model[key] = param.clone().to(device)
-                        feature_extraction_count += 1
-        
-        print(f"全局聚合模型: 聚合了 {feature_extraction_count}/{total_feature_extraction} 个特征提取层参数")
-        
-        return global_model, cluster_models, aggregation_log
-    else:
-        # 如果没有全局模型模板，直接返回聚类模型
-        return None, cluster_models, aggregation_log
+    # 第二步：只返回聚类模型，不执行全局聚合
+    return None, cluster_models, aggregation_log
