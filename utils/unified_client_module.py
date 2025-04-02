@@ -217,6 +217,7 @@ class EnhancedClient:
             model_state_dict: 模型参数
             time_pretrained: 预训练耗时
         """
+        model = model.to(self.device)
         model.train()
         time_start = time.time()
         

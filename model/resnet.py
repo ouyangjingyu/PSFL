@@ -107,37 +107,48 @@ class Bottleneck(nn.Module):
 # 自适应特征归一化层 - 新增
 class AdaptiveFeatureNormalization(nn.Module):
     """自适应特征归一化，保留原始特征分布特性"""
-    def __init__(self, eps=1e-5, affine=True):
+    def __init__(self, num_channels=None, eps=1e-5, affine=True, mode=None):
         super(AdaptiveFeatureNormalization, self).__init__()
         self.eps = eps
         self.affine = affine
         self.gate = nn.Parameter(torch.tensor(0.5))
+        self.num_channels = num_channels
+        # mode参数可以忽略，添加只是为了兼容现有调用
         
         # 不再预先定义运行时统计量，而是动态创建
         self.register_buffer('initialized', torch.tensor(0, dtype=torch.bool))
     
-    def _initialize_buffers(self, shape):
-        """根据输入特征的形状初始化统计量"""
+    def _initialize_buffers(self, shape, device=None):
+        """根据输入特征的形状初始化统计量
+        
+        Args:
+            shape: 输入张量的形状（元组）
+            device: 张量所在设备
+        """
+        # 如果未提供设备，使用默认设备
+        if device is None:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
         if len(shape) == 4:  # 卷积特征
             c = shape[1]
-            self.register_buffer('running_mean', torch.zeros(c))
-            self.register_buffer('running_var', torch.ones(c))
+            self.register_buffer('running_mean', torch.zeros(c, device=device))
+            self.register_buffer('running_var', torch.ones(c, device=device))
         else:  # 1D特征
             c = shape[-1]
-            self.register_buffer('running_mean', torch.zeros(c))
-            self.register_buffer('running_var', torch.ones(c))
+            self.register_buffer('running_mean', torch.zeros(c, device=device))
+            self.register_buffer('running_var', torch.ones(c, device=device))
             
         if self.affine:
-            self.weight = nn.Parameter(torch.ones(c))
-            self.bias = nn.Parameter(torch.zeros(c))
+            self.weight = nn.Parameter(torch.ones(c, device=device))
+            self.bias = nn.Parameter(torch.zeros(c, device=device))
             
-        self.register_buffer('num_batches_tracked', torch.tensor(0, dtype=torch.long))
+        self.register_buffer('num_batches_tracked', torch.tensor(0, dtype=torch.long, device=device))
         self.initialized.fill_(1)
-    
+        
     def forward(self, x):
         # 检查是否初始化
         if not self.initialized:
-            self._initialize_buffers(x.shape)
+            self._initialize_buffers(x.shape, x.device)
         
         # 计算统计量
         if len(x.shape) == 4:  # 卷积特征
@@ -157,30 +168,49 @@ class AdaptiveFeatureNormalization(nn.Module):
         # 更新运行时统计量
         if self.training:
             with torch.no_grad():
-                if len(x.shape) == 4:
-                    self.running_mean = 0.9 * self.running_mean + 0.1 * batch_mean
-                    self.running_var = 0.9 * self.running_var + 0.1 * batch_var
-                else:
-                    self.running_mean = 0.9 * self.running_mean + 0.1 * batch_mean
-                    self.running_var = 0.9 * self.running_var + 0.1 * batch_var
+                # 确保batch统计量在正确的设备上
+                if batch_mean.device != self.running_mean.device:
+                    batch_mean = batch_mean.to(self.running_mean.device)
+                    batch_var = batch_var.to(self.running_var.device)
+                    
+                self.running_mean = 0.9 * self.running_mean + 0.1 * batch_mean
+                self.running_var = 0.9 * self.running_var + 0.1 * batch_var
                 self.num_batches_tracked += 1
         
         # 仿射变换
         if self.affine:
-            if len(x.shape) == 4:
-                return x_normalized * self.weight.view(1, -1, 1, 1) + self.bias.view(1, -1, 1, 1)
+            # 确保权重和偏置在与x相同的设备上
+            if self.weight.device != x.device:
+                weight = self.weight.to(x.device)
+                bias = self.bias.to(x.device)
             else:
-                return x_normalized * self.weight + self.bias
+                weight = self.weight
+                bias = self.bias
+                
+            if len(x.shape) == 4:
+                return x_normalized * weight.view(1, -1, 1, 1) + bias.view(1, -1, 1, 1)
+            else:
+                return x_normalized * weight + bias
         else:
             return x_normalized
     
     def get_feature_stats(self):
         """返回特征统计信息用于监控"""
-        return {
-            'mean': self.running_mean.clone().detach(),
-            'var': self.running_var.clone().detach(),
-            'num_batches': self.num_batches_tracked.item()
-        }
+        stats = {}
+        
+        # 检查是否已初始化
+        if hasattr(self, 'running_mean') and hasattr(self, 'running_var'):
+            stats['mean'] = self.running_mean.clone().detach()
+            stats['var'] = self.running_var.clone().detach()
+            stats['num_batches'] = self.num_batches_tracked.item() if hasattr(self, 'num_batches_tracked') else 0
+        else:
+            # 如果未初始化，返回空统计信息
+            stats['initialized'] = False
+            stats['mean'] = None
+            stats['var'] = None
+            stats['num_batches'] = 0
+            
+        return stats
 
 
 # 特征缩放层 - 新增
@@ -418,6 +448,10 @@ class ClassBalancedLoss(nn.Module):
         """前向传播计算损失"""
         # 基础交叉熵损失
         ce_loss = self.criterion(logits, targets)
+
+        # 将weights移到与logits相同的设备
+        weights = self.weights.to(logits.device)
+        target_weights = weights[targets]
         
         # 获取目标的权重
         target_weights = self.weights[targets].to(logits.device)
@@ -427,6 +461,56 @@ class ClassBalancedLoss(nn.Module):
         
         # 返回平均损失
         return weighted_loss.mean()
+
+class EnhancedFeatureTransformer(nn.Module):
+    """增强的特征转换器，支持跨tier特征适配"""
+    def __init__(self, in_channels, out_channels, spatial_transform=None):
+        super(EnhancedFeatureTransformer, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        
+        # 通道转换
+        self.channel_transform = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+            nn.GroupNorm(max(1, out_channels // 32), out_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        # 空间变换
+        self.spatial_transform = spatial_transform
+        
+        # 残差连接
+        self.use_residual = (in_channels == out_channels and spatial_transform is None)
+        
+        # 注意力机制
+        self.attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(out_channels, out_channels // 4, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels // 4, out_channels, kernel_size=1),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, x):
+        identity = x
+        
+        # 通道转换
+        x = self.channel_transform(x)
+        
+        # 空间变换
+        if self.spatial_transform is not None:
+            x = self.spatial_transform(x)
+        
+        # 注意力机制
+        att = self.attention(x)
+        x = x * att
+        
+        # 残差连接
+        if self.use_residual:
+            x = x + identity
+            
+        return x
+
 
 
 # 重新设计ResNet - 添加特征范数控制和特征还原机制
@@ -489,46 +573,29 @@ class ResNet(nn.Module):
             # 为所有tier级别添加平均池化层
             self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
             
-            # 标准化特征维度，设置为与tier=1相同（64 * block.expansion）
-            final_channels = 64 * block.expansion  # 通常是256
-            
             # 根据tier确定当前输出通道数
             if self.tier == 1 or self.tier == 2:
-                in_features = 64 * block.expansion  # 已经是标准维度
+                in_features = 64 * block.expansion  # 256
             elif self.tier == 3 or self.tier == 4:
-                in_features = 32 * block.expansion  # 需要从128投影到256
+                in_features = 32 * block.expansion  # 128
             elif self.tier == 5 or self.tier == 6:
-                in_features = 16 * block.expansion  # 需要从64投影到256
+                in_features = 16 * block.expansion  # 64
             elif self.tier == 7:
-                in_features = 16  # 需要从16投影到256
+                in_features = 16  # 16
 
-            # 添加特征缩放层 - 新增
+            # 添加特征缩放层
             self.feature_scaling = FeatureScaling(target_norm=20.0, adaptive=True)
-            
-            # 添加改进的投影层（使用LayerNorm替代GroupNorm）
-            if in_features == final_channels:
-                self.projection = nn.Sequential(
-                    self.feature_scaling,
-                    AdaptiveFeatureNormalization(final_channels, mode='layer'),
-                    nn.Identity()
-                )
-            else:
-                self.projection = nn.Sequential(
-                    self.feature_scaling,
-                    AdaptiveFeatureNormalization(in_features, mode='layer'),
-                    nn.Linear(in_features, final_channels),
-                    nn.LayerNorm(final_channels),
-                    nn.ReLU(inplace=True)
-                )
-            
-            # 标记为非特征提取层
-            for module in self.projection:
-                if hasattr(module, 'is_feature_extraction'):
-                    module.is_feature_extraction = False
 
-            # 创建统一设计的本地分类器
+            # 为每个tier创建匹配其特征维度的分类器
+            # 移除投影层，直接使用特征缩放后的原始特征维度
+            self.projection = nn.Sequential(
+                self.feature_scaling,
+                AdaptiveFeatureNormalization(eps=1e-5, affine=True)
+            )
+
+            # 为当前tier创建匹配的分类器
             self.classifier = LayerNormClassifier(
-                in_features=final_channels,
+                in_features=in_features,  # 使用实际特征维度，不再强制转为256
                 num_classes=num_classes,
                 hidden_dims=[128, 64], 
                 is_local=True
@@ -754,7 +821,7 @@ class UnifiedServerModel(nn.Module):
                 num_channels=channels
             )
         self._norm_layer = norm_layer
-        
+        self.inplanes = 16  # 初始通道数
         # 每层输入特征维度表
         # tier=7: conv1+gn1+relu -> 16
         # tier=6: layer1 -> 16*block.expansion = 64
@@ -774,17 +841,16 @@ class UnifiedServerModel(nn.Module):
         }
         
         # 特征适配层 - 将不同tier客户端输出的特征调整为对应层所需的尺寸和通道数
+        # 为每个tier创建特征适配层 - 使用增强的特征转换器
         self.feature_adapters = nn.ModuleDict()
-        
-        # 为每个tier创建特征适配层 - 特征还原和特征缩放
         for tier in range(1, 8):
-            # 特征预处理 - 调整尺寸和归一化
+            # 特征预处理 - 使用自适应归一化
             self.feature_adapters[f'process_{tier}'] = nn.Sequential(
-                # 只使用自适应归一化，它可以处理不同维度的输入
-                AdaptiveFeatureNormalization(affine=True)
+                # 仅使用自适应归一化，不传递mode参数
+                AdaptiveFeatureNormalization(eps=1e-5, affine=True)
             )
+            
         # 设置服务器模型每层的初始通道数
-        self.inplanes = 16
         self.dilation = 1
         if replace_stride_with_dilation is None:
             replace_stride_with_dilation = [False, False, False]

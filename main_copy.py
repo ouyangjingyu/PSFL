@@ -53,7 +53,7 @@ from model.resnet import EnhancedGlobalClassifier
 from model.resnet import create_tier_client_model
 from model.resnet import create_all_tier_client_models
 from model.resnet import create_unified_server_model
-from model.resnet import create_unified_classifier
+from model.resnet import create_unified_classifier,EnhancedFeatureTransformer
 
 # 导入数据加载和处理模块
 from api.data_preprocessing.cifar10.data_loader import load_partition_data_cifar10
@@ -68,8 +68,8 @@ from utils.client_clustering import adaptive_cluster_assignment
 from utils.training_strategy import create_training_strategy_for_client
 
 # 导入新增的模块
-from utils.unified_training_framework import train_client_with_unified_server
-from utils.unified_training_framework import evaluate_client_with_unified_server
+from utils.unified_training_framework import train_client_with_unified_server, LossWeightController, AdaptiveFeatureNormController,FeatureDistributionLoss,AnomalyInterventionSystem
+from utils.unified_training_framework import evaluate_client_with_unified_server,StructureAwareAggregator,AdaptiveTierWeightAdjuster
 from utils.unified_training_framework import FeatureMonitor
 from utils.unified_training_framework import UnifiedModelAggregator, UnifiedParallelTrainer
 
@@ -475,9 +475,31 @@ def main():
     # 创建特征监控器
     logger.info("初始化特征监控系统...")
     feature_monitor = FeatureMonitor()
+
+    # 增强特征监控器 - 添加自适应特征范数控制器
+    feature_monitor.norm_controller = AdaptiveFeatureNormController()
     
+    # 创建自适应损失权重控制器
+    logger.info("初始化自适应损失权重控制器...")
+    loss_weight_controller = LossWeightController(
+        init_local=0.5, 
+        init_global=0.5, 
+        init_feature=0.0
+    )
+
+    # 创建异常干预系统
+    logger.info("初始化异常干预系统...")
+    intervention_system = AnomalyInterventionSystem(feature_monitor)
+
     # 创建模型聚合器
-    logger.info("初始化模型聚合器...")
+    logger.info("初始化增强型模型聚合器...")
+    # 创建结构感知聚合器
+    structure_aware_aggregator = StructureAwareAggregator(device=device)
+
+    # 创建tier权重调整器
+    tier_weight_adjuster = AdaptiveTierWeightAdjuster()
+
+    # 使用增强的聚合器
     model_aggregator = UnifiedModelAggregator(device=device)
     
     # 创建评估数据集
@@ -539,6 +561,17 @@ def main():
     wandb.define_metric("anomalies/count", step_metric="round")
     wandb.define_metric("anomalies/feature_norm_mismatch", step_metric="round")
     wandb.define_metric("anomalies/class_accuracy_imbalance", step_metric="round")
+
+    # 创建特征分布一致性损失函数
+    feature_dist_loss = FeatureDistributionLoss()
+
+    # 定义更多的度量指标
+    wandb.define_metric("feature_matching/norm_ratio", step_metric="round")
+    wandb.define_metric("feature_matching/dist_loss", step_metric="round")
+    wandb.define_metric("adaptive/local_loss_weight", step_metric="round")
+    wandb.define_metric("adaptive/global_loss_weight", step_metric="round")
+    wandb.define_metric("adaptive/feature_loss_weight", step_metric="round")
+    wandb.define_metric("interventions/count", step_metric="round")
     
     # 开始训练循环
     logger.info(f"开始联邦学习训练 ({args.rounds} 轮)...")
@@ -547,17 +580,85 @@ def main():
     for round_idx in range(args.rounds):
         round_start_time = time.time()
         logger.info(f"===== 轮次 {round_idx+1}/{args.rounds} =====")
-        
+        # 执行异常检测和干预
+        training_params = {'lr': args.lr, 'clip_grad': None}
+        intervention_count = intervention_system.check_and_intervene(
+            list(client_tier_models.values())[0],  # 示例客户端模型
+            unified_server_model, 
+            global_classifier, 
+            training_params
+        )
+
+        # 获取当前损失权重
+        current_loss_weights = loss_weight_controller.get_weights()
+        logger.info(f"当前损失权重: 本地={current_loss_weights['local']:.2f}, "
+                f"全局={current_loss_weights['global']:.2f}, "
+                f"特征={current_loss_weights['feature']:.2f}")
         # 执行并行训练
         train_results, eval_results, server_models, classifiers, training_time = parallel_trainer.execute_parallel_training(
             train_fn=train_client_with_unified_server,
             eval_fn=evaluate_client_with_unified_server,
             round_idx=round_idx,
-            feature_monitor=feature_monitor
+            feature_monitor=feature_monitor,
         )
+            # loss_weight_controller=loss_weight_controller,
+            # feature_dist_loss=feature_dist_loss,
+            # training_params=training_params
+        
         
         # 更新全局模型
         logger.info("更新全局模型...")
+
+        # 1. 收集客户端tier信息
+        client_tiers = {}
+        client_weights = {}
+        for client_id, result in train_results.items():
+            client = client_manager.get_client(client_id)
+            if client:
+                client_tiers[client_id] = client.tier
+                # 基于准确率设置初始权重
+                if isinstance(result, dict) and 'global_accuracy' in result:
+                    client_weights[client_id] = result['global_accuracy']
+                else:
+                    client_weights[client_id] = 1.0
+
+        # 2. 更新tier性能并调整权重
+        for client_id, eval_result in eval_results.items():
+            if client_id in client_tiers and 'global_accuracy' in eval_result:
+                tier_weight_adjuster.update_tier_performance(
+                    client_tiers[client_id], 
+                    eval_result['global_accuracy']
+                )
+
+        tier_weight_adjuster.adjust_weights()
+
+        # 3. 应用tier权重修正
+        for client_id in client_weights.keys():
+            if client_id in client_tiers:
+                modifier = tier_weight_adjuster.get_client_weight_modifier(
+                    client_id, 
+                    client_tiers[client_id]
+                )
+                client_weights[client_id] *= modifier
+
+        # 4. 使用结构感知聚合器聚合模型
+        # 首先收集客户端模型状态
+        client_models_dict = {}
+        for client_id, result in train_results.items():
+            if isinstance(result, dict) and 'client_model_state' in result:
+                client_models_dict[client_id] = result['client_model_state']
+
+        # 执行结构感知聚合
+        aggregated_model = structure_aware_aggregator.aggregate(
+            client_models_dict, 
+            client_tiers, 
+            client_weights
+        )
+
+        # 更新统一服务器模型
+        unified_server_model.load_state_dict(aggregated_model, strict=False)
+
+        # 5. 更新全局分类器 (沿用原有方法)
         parallel_trainer.update_global_models(
             server_models=server_models,
             classifiers=classifiers,
@@ -685,6 +786,12 @@ def main():
         avg_global_acc = sum(client_global_acc) / len(client_global_acc) if client_global_acc else 0
         avg_feature_norm_ratio = sum(client_feature_norm_ratios) / len(client_feature_norm_ratios) if client_feature_norm_ratios else 0
         
+        # 更新损失权重控制器
+        loss_weight_controller.update_history(avg_local_acc, avg_global_acc)
+
+        # 获取更新后的权重用于下一轮
+        next_weights = loss_weight_controller.get_weights()
+
         # 获取异常统计信息
         anomalies = feature_monitor.get_latest_anomalies()
         anomalies_count = len([a for a in anomalies if a['round'] == round_idx])
@@ -730,6 +837,26 @@ def main():
             "time/round_seconds": round_time,
             "time/training_seconds": training_time
         }
+        # 在metrics字典中添加新指标
+        metrics.update({
+            # 特征匹配相关指标
+            "feature_matching/norm_ratio": avg_feature_norm_ratio,
+            "feature_matching/dist_loss": sum([r.get('feature_dist_loss', 0) for r in train_results.values() 
+                                            if isinstance(r, dict)]) / len(train_results) if train_results else 0,
+            
+            # 自适应权重指标
+            "adaptive/local_loss_weight": current_loss_weights['local'],
+            "adaptive/global_loss_weight": current_loss_weights['global'],
+            "adaptive/feature_loss_weight": current_loss_weights['feature'],
+            
+            # 干预相关指标
+            "interventions/count": intervention_count,
+        })
+
+        # 记录每个tier的权重修正因子
+        for tier in range(1, 8):
+            if hasattr(tier_weight_adjuster, 'tier_weights') and tier in tier_weight_adjuster.tier_weights:
+                metrics[f"adaptive/tier_{tier}_weight"] = tier_weight_adjuster.tier_weights[tier]
         
         # 记录每个类别的准确率
         for i, acc in enumerate(per_class_acc):
