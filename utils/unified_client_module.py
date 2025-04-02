@@ -596,6 +596,126 @@ class EnhancedClient:
         # 返回训练后的模型状态和统计信息
         return client_model.state_dict(), server_model.state_dict(), stats
 
+    def evaluate(self, client_model, server_model, global_classifier=None):
+        """
+        评估客户端模型、服务器模型和全局分类器的性能
+        
+        Args:
+            client_model: 客户端模型
+            server_model: 服务器模型
+            global_classifier: 全局分类器（可选）
+            
+        Returns:
+            eval_stats: 评估统计信息
+        """
+        # 确保模型在正确的设备上
+        client_model = client_model.to(self.device)
+        server_model = server_model.to(self.device)
+        if global_classifier is not None:
+            global_classifier = global_classifier.to(self.device)
+        
+        # 设置为评估模式
+        client_model.eval()
+        server_model.eval()
+        if global_classifier is not None:
+            global_classifier.eval()
+        
+        # 初始化评估统计
+        stats = {
+            'loss': 0.0, 'accuracy': 0.0,
+            'local_loss': 0.0, 'local_accuracy': 0.0,
+            'global_loss': 0.0, 'global_accuracy': 0.0,
+            'local_per_class_accuracy': [], 'global_per_class_accuracy': []
+        }
+        
+        # 创建测试数据加载器
+        test_loader = self.test_data
+        
+        # 损失函数
+        criterion = nn.CrossEntropyLoss()
+        
+        # 本地分类器统计
+        local_total = 0
+        local_correct = 0
+        local_loss = 0
+        local_class_correct = [0] * 10  # 假设10个类别，可根据实际调整
+        local_class_total = [0] * 10
+        
+        # 全局分类器统计
+        global_total = 0
+        global_correct = 0
+        global_loss = 0
+        global_class_correct = [0] * 10
+        global_class_total = [0] * 10
+        
+        with torch.no_grad():
+            for data, target in test_loader:
+                data, target = data.to(self.device), target.to(self.device)
+                
+                # 1. 获取客户端模型的输出
+                client_out, client_features = client_model(data)
+                
+                # 2. 计算本地分类器的准确率
+                if client_out is not None:
+                    local_batch_loss = criterion(client_out, target)
+                    local_loss += local_batch_loss.item()
+                    _, local_predicted = torch.max(client_out.data, 1)
+                    local_total += target.size(0)
+                    local_correct += (local_predicted == target).sum().item()
+                    
+                    # 计算每个类别的准确率
+                    for i in range(len(target)):
+                        label = target[i].item()
+                        local_class_total[label] += 1
+                        if local_predicted[i] == label:
+                            local_class_correct[label] += 1
+                
+                # 3. 获取服务器端特征
+                server_features = server_model(client_features)
+                
+                # 4. 使用全局分类器进行预测
+                if global_classifier is not None:
+                    global_out = global_classifier(server_features)
+                    global_batch_loss = criterion(global_out, target)
+                    global_loss += global_batch_loss.item()
+                    _, global_predicted = torch.max(global_out.data, 1)
+                    global_total += target.size(0)
+                    global_correct += (global_predicted == target).sum().item()
+                    
+                    # 计算每个类别的准确率
+                    for i in range(len(target)):
+                        label = target[i].item()
+                        global_class_total[label] += 1
+                        if global_predicted[i] == label:
+                            global_class_correct[label] += 1
+        
+        # 计算平均损失和准确率
+        if local_total > 0:
+            stats['local_loss'] = local_loss / len(test_loader)
+            stats['local_accuracy'] = 100.0 * local_correct / local_total
+            # 计算每个类别的准确率
+            stats['local_per_class_accuracy'] = [
+                100.0 * correct / max(1, total) for correct, total in zip(local_class_correct, local_class_total)
+            ]
+        
+        if global_total > 0:
+            stats['global_loss'] = global_loss / len(test_loader)
+            stats['global_accuracy'] = 100.0 * global_correct / global_total
+            # 计算每个类别的准确率
+            stats['global_per_class_accuracy'] = [
+                100.0 * correct / max(1, total) for correct, total in zip(global_class_correct, global_class_total)
+            ]
+        
+        # 兼容旧代码的统计值
+        if global_classifier is not None:
+            stats['loss'] = stats['global_loss']
+            stats['accuracy'] = stats['global_accuracy']
+        else:
+            stats['loss'] = stats['local_loss']
+            stats['accuracy'] = stats['local_accuracy']
+        
+        return stats
+
 class ClientManager:
     """管理多个客户端的类"""
     

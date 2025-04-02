@@ -10,8 +10,9 @@ from data.cifar10_eval_dataset import get_cifar10_proxy_dataset
 from utils.client_clustering import extract_model_predictions
 
 
-def comprehensive_evaluation(
+def comprehensive_evaluation_with_comparison(
     global_model, 
+    init_global_model,  # 添加初始全局模型参数
     client_models_dict, 
     server_models_dict, 
     unified_classifier,
@@ -22,10 +23,11 @@ def comprehensive_evaluation(
     class_num
 ):
     """
-    全面评估不同模型配置在均衡测试数据集上的性能
+    全面评估不同模型配置在均衡测试数据集上的性能，并与初始全局模型进行比较
     
     Args:
-        global_model: 全局聚合模型
+        global_model: 当前全局聚合模型
+        init_global_model: 初始化的全局模型
         client_models_dict: 客户端模型字典
         server_models_dict: 服务器模型字典
         unified_classifier: 全局分类器
@@ -46,7 +48,7 @@ def comprehensive_evaluation(
     criterion = nn.CrossEntropyLoss()
     results = {}
     
-    # 1. 评估全局模型
+    # 1. 评估当前全局模型
     global_model.eval()
     global_correct = 0
     global_total = 0
@@ -87,7 +89,49 @@ def comprehensive_evaluation(
         'per_class_accuracy': global_per_class_acc
     }
     
-    # 2. 初始化跨客户端的平均指标
+    # 2. 评估初始全局模型 (新增部分)
+    if init_global_model is not None:
+        init_global_model.eval()
+        init_global_correct = 0
+        init_global_total = 0
+        init_global_loss = 0
+        init_global_class_correct = [0] * class_num
+        init_global_class_total = [0] * class_num
+        
+        with torch.no_grad():
+            for data, target in eval_loader:
+                data, target = data.to(device), target.to(device)
+                output = init_global_model(data)
+                
+                # 处理可能的元组输出
+                if isinstance(output, tuple):
+                    output = output[0]
+                
+                loss = criterion(output, target)
+                init_global_loss += loss.item()
+                _, predicted = torch.max(output.data, 1)
+                init_global_total += target.size(0)
+                init_global_correct += (predicted == target).sum().item()
+                
+                # 每个类别的准确率
+                for i in range(len(target)):
+                    label = target[i]
+                    init_global_class_total[label] += 1
+                    if predicted[i] == label:
+                        init_global_class_correct[label] += 1
+        
+        # 计算初始全局模型指标
+        init_global_accuracy = 100.0 * init_global_correct / init_global_total
+        init_global_loss = init_global_loss / len(eval_loader)
+        init_global_per_class_acc = [100.0 * c / t if t > 0 else 0 for c, t in zip(init_global_class_correct, init_global_class_total)]
+        
+        results['init_global'] = {
+            'accuracy': init_global_accuracy,
+            'loss': init_global_loss,
+            'per_class_accuracy': init_global_per_class_acc
+        }
+    
+    # 3. 初始化跨客户端的平均指标
     client_local_acc_sum = 0
     client_server_global_acc_sum = 0
     client_global_acc_sum = 0
@@ -107,6 +151,8 @@ def comprehensive_evaluation(
         local_correct = 0
         local_total = 0
         local_loss = 0
+        local_class_correct = [0] * class_num
+        local_class_total = [0] * class_num
         
         with torch.no_grad():
             for data, target in eval_loader:
@@ -118,13 +164,22 @@ def comprehensive_evaluation(
                 _, predicted = torch.max(output.data, 1)
                 local_total += target.size(0)
                 local_correct += (predicted == target).sum().item()
+                
+                # 每个类别的准确率
+                for i in range(len(target)):
+                    label = target[i]
+                    local_class_total[label] += 1
+                    if predicted[i] == label:
+                        local_class_correct[label] += 1
         
         local_accuracy = 100.0 * local_correct / local_total
         local_loss = local_loss / len(eval_loader)
+        local_per_class_acc = [100.0 * c / t if t > 0 else 0 for c, t in zip(local_class_correct, local_class_total)]
         
         client_results['local'] = {
             'accuracy': local_accuracy,
-            'loss': local_loss
+            'loss': local_loss,
+            'per_class_accuracy': local_per_class_acc
         }
         
         # B. 评估客户端-服务器-全局分类器组合
@@ -332,7 +387,7 @@ def comprehensive_evaluation(
 
 def print_evaluation_results(eval_results, round_idx):
     """
-    打印评估结果
+    打印评估结果，包括初始全局模型和当前全局模型的比较
     
     Args:
         eval_results: 评估结果字典
@@ -340,10 +395,10 @@ def print_evaluation_results(eval_results, round_idx):
     """
     print(f"\n===== 第 {round_idx+1} 轮评估结果 =====")
     
-    # 打印全局模型结果
+    # 打印当前全局模型结果
     global_acc = eval_results['global']['accuracy']
     global_loss = eval_results['global']['loss']
-    print(f"\n全局模型性能:")
+    print(f"\n当前全局模型性能:")
     print(f"  准确率: {global_acc:.2f}%, 损失: {global_loss:.4f}")
     
     # 打印每个类别的准确率
@@ -351,6 +406,27 @@ def print_evaluation_results(eval_results, round_idx):
     per_class_acc = eval_results['global']['per_class_accuracy']
     for i, acc in enumerate(per_class_acc):
         print(f"    类别 {i}: {acc:.2f}%")
+    
+    # 打印初始全局模型结果(如果有)
+    if 'init_global' in eval_results:
+        init_global_acc = eval_results['init_global']['accuracy']
+        init_global_loss = eval_results['init_global']['loss']
+        print(f"\n初始全局模型性能:")
+        print(f"  准确率: {init_global_acc:.2f}%, 损失: {init_global_loss:.4f}")
+        
+        # 打印每个类别的准确率
+        print("  各类别准确率:")
+        init_per_class_acc = eval_results['init_global']['per_class_accuracy']
+        for i, acc in enumerate(init_per_class_acc):
+            print(f"    类别 {i}: {acc:.2f}%")
+        
+        # 打印比较结果
+        print(f"\n全局模型性能比较 (当前 vs 初始):")
+        print(f"  总体准确率变化: {global_acc - init_global_acc:.2f}%")
+        print("  类别准确率变化:")
+        for i, (curr, init) in enumerate(zip(per_class_acc, init_per_class_acc)):
+            change = curr - init
+            print(f"    类别 {i}: {change:+.2f}%  ({init:.2f}% -> {curr:.2f}%)")
     
     # 打印客户端平均结果
     avg_results = eval_results['averages']

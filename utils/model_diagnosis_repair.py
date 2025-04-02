@@ -505,3 +505,193 @@ def comprehensive_model_repair(model, diagnosis_tracker, dataloader, device, num
         repair_summary['actions_taken'].append("执行了预防性模型校准")
     
     return model, repair_summary
+
+def verify_global_model(model, eval_dataset, device, model_name="全局模型"):
+    """详细验证模型状态和特征分布"""
+    print(f"\n===== {model_name}诊断 =====")
+    model.eval()
+    
+    # 1. 分析分类器权重
+    if hasattr(model, 'classifier'):
+        print("分析分类器权重...")
+        # 尝试获取最后一层权重
+        last_layer = None
+        if hasattr(model.classifier, 'fc3'):
+            last_layer = model.classifier.fc3
+        elif hasattr(model.classifier, 'fc'):
+            last_layer = model.classifier.fc
+        
+        if last_layer is not None:
+            weights = last_layer.weight.data
+            weight_norms = torch.norm(weights, dim=1)
+            max_norm = torch.max(weight_norms).item()
+            min_norm = torch.min(weight_norms).item()
+            imbalance = max_norm / (min_norm + 1e-6)
+            
+            print(f"分类器权重范数: {[f'{w:.4f}' for w in weight_norms.tolist()]}")
+            print(f"权重不平衡度(最大/最小): {imbalance:.4f}")
+            
+            # 警告极度不平衡
+            if imbalance > 10:
+                print(f"警告：分类器权重严重不平衡({imbalance:.2f}倍)，可能导致分类偏向")
+    
+    # 2. 建立激活统计收集钩子
+    activation_stats = {}
+    hooks = []
+    
+    def get_activation(name):
+        def hook(module, input, output):
+            if isinstance(output, torch.Tensor):
+                # 计算基本统计量
+                activation_stats[name] = {
+                    'mean': output.mean().item(),
+                    'std': output.std().item(),
+                    'has_nan': torch.isnan(output).any().item(),
+                    'has_inf': torch.isinf(output).any().item(),
+                }
+        return hook
+    
+    # 为关键层注册钩子
+    key_layer_types = (nn.Conv2d, nn.GroupNorm, nn.LayerNorm, nn.Linear)
+    for name, module in model.named_modules():
+        if isinstance(module, key_layer_types):
+            hooks.append(module.register_forward_hook(get_activation(name)))
+    
+    # 3. 运行测试数据获取激活值
+    eval_loader = torch.utils.data.DataLoader(eval_dataset, batch_size=64, shuffle=False)
+    class_predictions = torch.zeros(10)
+    
+    with torch.no_grad():
+        for i, (data, target) in enumerate(eval_loader):
+            if i >= 2:  # 只用少量批次
+                break
+                
+            data, target = data.to(device), target.to(device)
+            outputs = model(data)
+            
+            # 处理可能的元组输出
+            if isinstance(outputs, tuple):
+                outputs = outputs[0]
+            
+            # 统计预测分布
+            _, predictions = torch.max(outputs, 1)
+            for j in range(10):  # 假设10个类别
+                class_predictions[j] += (predictions == j).sum().item()
+    
+    # 移除钩子
+    for hook in hooks:
+        hook.remove()
+    
+    # 4. 分析层激活情况
+    problematic_layers = []
+    for name, stats in activation_stats.items():
+        if stats['has_nan'] or stats['has_inf'] or stats['std'] < 1e-4:
+            problematic_layers.append(name)
+            print(f"警告: {name} 层异常:")
+            if stats['has_nan']:
+                print("  - 包含NaN值")
+            if stats['has_inf']:
+                print("  - 包含Inf值")
+            if stats['std'] < 1e-4:
+                print(f"  - 方差极小 ({stats['std']:.6f}), 可能特征崩塌")
+    
+    # 5. 分析预测分布
+    total_preds = class_predictions.sum().item()
+    if total_preds > 0:
+        class_distribution = class_predictions / total_preds
+        print("\n预测类别分布:")
+        for i, prob in enumerate(class_distribution):
+            print(f"  类别 {i}: {prob*100:.2f}%")
+        
+        # 计算预测熵(越低越集中)
+        distribution = class_distribution.numpy()
+        entropy = -np.sum(distribution * np.log(distribution + 1e-10))
+        print(f"预测熵(越低越集中): {entropy:.4f}")
+        
+        # 检测单一类别预测
+        max_prob = torch.max(class_distribution).item()
+        if max_prob > 0.9:
+            print(f"警告: 预测极度集中于类别 {torch.argmax(class_distribution).item()} ({max_prob*100:.1f}%)")
+    
+    print(f"问题层数量: {len(problematic_layers)}/{len(activation_stats)}")
+    print("="*50)
+    
+    # 返回诊断结果摘要
+    return {
+        'problematic_layers': problematic_layers,
+        'prediction_distribution': class_distribution.tolist() if 'class_distribution' in locals() else None,
+        'weight_imbalance': imbalance if 'imbalance' in locals() else None
+    }
+
+def diagnose_feature_matching(client_model, server_model, global_classifier, eval_dataset, device):
+    """诊断客户端-服务器-分类器的特征匹配情况"""
+    client_model.eval()
+    server_model.eval()
+    global_classifier.eval()
+    
+    # 创建测试数据加载器
+    eval_loader = torch.utils.data.DataLoader(eval_dataset, batch_size=16, shuffle=False)
+    
+    # 收集特征统计信息
+    client_feature_stats = []
+    server_feature_stats = []
+    
+    with torch.no_grad():
+        for data, _ in eval_loader:
+            data = data.to(device)
+            
+            # 获取客户端特征
+            _, client_features = client_model(data)
+            
+            # 获取服务器特征
+            server_features = server_model(client_features)
+            
+            # 如果是卷积特征，展平
+            if len(server_features.shape) > 2:
+                server_features = F.adaptive_avg_pool2d(server_features, (1, 1))
+                server_features = server_features.view(server_features.size(0), -1)
+            
+            # 计算特征统计量
+            client_feat_flat = client_features.view(client_features.size(0), -1)
+            client_norms = torch.norm(client_feat_flat, dim=1)
+            server_norms = torch.norm(server_features, dim=1)
+            
+            client_feature_stats.append({
+                'mean_norm': client_norms.mean().item(),
+                'std_norm': client_norms.std().item(),
+                'mean': client_feat_flat.mean().item(),
+                'std': client_feat_flat.std().item()
+            })
+            
+            server_feature_stats.append({
+                'mean_norm': server_norms.mean().item(),
+                'std_norm': server_norms.std().item(),
+                'mean': server_features.mean().item(),
+                'std': server_features.std().item()
+            })
+            
+            # 只用一个批次
+            break
+    
+    print("\n===== 客户端-服务器特征匹配诊断 =====")
+    print(f"客户端特征范数: {client_feature_stats[0]['mean_norm']:.4f} ± {client_feature_stats[0]['std_norm']:.4f}")
+    print(f"服务器特征范数: {server_feature_stats[0]['mean_norm']:.4f} ± {server_feature_stats[0]['std_norm']:.4f}")
+    print(f"客户端特征统计: 均值={client_feature_stats[0]['mean']:.4f}, 标准差={client_feature_stats[0]['std']:.4f}")
+    print(f"服务器特征统计: 均值={server_feature_stats[0]['mean']:.4f}, 标准差={server_feature_stats[0]['std']:.4f}")
+    
+    # 输出特征匹配评估
+    norm_ratio = server_feature_stats[0]['mean_norm'] / client_feature_stats[0]['mean_norm']
+    print(f"特征范数比率(服务器/客户端): {norm_ratio:.4f}")
+    
+    if norm_ratio < 0.1 or norm_ratio > 10:
+        print("警告: 客户端和服务器特征范数差异显著，可能导致特征不匹配")
+    
+    std_ratio = server_feature_stats[0]['std'] / client_feature_stats[0]['std']
+    if std_ratio < 0.1 or std_ratio > 10:
+        print("警告: 客户端和服务器特征方差差异显著，可能导致特征不匹配")
+    
+    return {
+        'client_features': client_feature_stats[0],
+        'server_features': server_feature_stats[0],
+        'norm_ratio': norm_ratio
+    }
