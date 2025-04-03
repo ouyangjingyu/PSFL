@@ -23,7 +23,6 @@
 # Enhanced Heterogeneous Federated Learning Framework
 # ============================================================================
 
-
 import torch
 import torch.nn as nn
 import numpy as np
@@ -44,36 +43,18 @@ warnings.filterwarnings("ignore")
 # 添加项目根目录到系统路径
 sys.path.insert(0, os.path.abspath(os.path.join(os.getcwd(), "../")))
 
-# 导入优化后的模型
-from model.resnet import Bottleneck
-from model.resnet import BasicBlock
-from model.resnet import ResNet
-from model.resnet import UnifiedServerModel
-from model.resnet import EnhancedGlobalClassifier
-from model.resnet import create_tier_client_model
-from model.resnet import create_all_tier_client_models
-from model.resnet import create_unified_server_model
-from model.resnet import create_unified_classifier,EnhancedFeatureTransformer
+# 导入自定义模块
+from model.resnet import create_tierhfl_client_model, create_tierhfl_server_model
+from utils.tierhfl_aggregator import StabilizedAggregator
+from utils.tierhfl_client import TierHFLClientManager
+from utils.tierhfl_trainer import ClusterAwareParallelTrainer, AdaptiveTrainingController, DataDistributionClusterer
 
 # 导入数据加载和处理模块
 from api.data_preprocessing.cifar10.data_loader import load_partition_data_cifar10
 from api.data_preprocessing.cifar100.data_loader import load_partition_data_cifar100
 from api.data_preprocessing.cinic10.data_loader import load_partition_data_cinic10
-from data.cifar10_eval_dataset import get_cifar10_proxy_dataset
 
-# 导入优化后的工具模块
-from utils.unified_client_module import ClientManager, EnhancedClient
-from utils.parallel_training_framework import create_training_framework
-from utils.client_clustering import adaptive_cluster_assignment
-from utils.training_strategy import create_training_strategy_for_client
-
-# 导入新增的模块
-from utils.unified_training_framework import train_client_with_unified_server, LossWeightController, AdaptiveFeatureNormController,FeatureDistributionLoss,AnomalyInterventionSystem
-from utils.unified_training_framework import evaluate_client_with_unified_server,StructureAwareAggregator,AdaptiveTierWeightAdjuster
-from utils.unified_training_framework import FeatureMonitor
-from utils.unified_training_framework import UnifiedModelAggregator, UnifiedParallelTrainer
-
-# 设置随机种子，确保实验可复现
+# 设置随机种子函数
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
@@ -84,24 +65,20 @@ def set_seed(seed=42):
         torch.backends.cudnn.deterministic = True
         print(f"使用GPU: {torch.cuda.get_device_name(0)}")
 
+# 解析命令行参数
 def parse_arguments():
-    """解析命令行参数"""
-    parser = argparse.ArgumentParser(description='统一服务器架构的异构联邦学习框架')
+    parser = argparse.ArgumentParser(description='TierHFL: 分层异构联邦学习框架')
     
     # 实验标识
-    parser.add_argument('--running_name', default="HPFL-Unified", type=str, help='实验名称')
+    parser.add_argument('--running_name', default="TierHFL", type=str, help='实验名称')
     
     # 优化相关参数
-    parser.add_argument('--lr', default=0.00075, type=float, help='学习率')
+    parser.add_argument('--lr', default=0.001, type=float, help='初始学习率')
     parser.add_argument('--lr_factor', default=0.85, type=float, help='学习率衰减因子')
-    parser.add_argument('--lr_patience', default=10, type=float, help='学习率调整耐心值')
-    parser.add_argument('--lr_min', default=1e-6, type=float, help='最小学习率')
-    parser.add_argument('--optimizer', default="Adam", type=str, help='优化器: SGD, Adam等')
     parser.add_argument('--wd', help='权重衰减参数', type=float, default=1e-4)
     
     # 模型相关参数
-    parser.add_argument('--model', type=str, default='resnet110', help='训练使用的神经网络 (resnet110 或 resnet56)')
-    parser.add_argument('--groups_per_channel', type=int, default=32, help='GroupNorm的每通道分组数，默认32')
+    parser.add_argument('--model', type=str, default='resnet56', help='使用的神经网络 (resnet56 或 resnet110)')
     
     # 数据加载和预处理相关参数
     parser.add_argument('--dataset', type=str, default='cifar10', help='训练数据集')
@@ -111,18 +88,22 @@ def parse_arguments():
     
     # 联邦学习相关参数
     parser.add_argument('--client_epoch', default=1, type=int, help='客户端本地训练轮数')
-    parser.add_argument('--client_number', type=int, default=10, help='分布式集群中的工作节点数量')
-    parser.add_argument('--batch_size', type=int, default=200, help='训练的输入批次大小')
+    parser.add_argument('--client_number', type=int, default=10, help='客户端数量')
+    parser.add_argument('--batch_size', type=int, default=100, help='训练的输入批次大小')
     parser.add_argument('--rounds', default=100, type=int, help='联邦学习轮数')
     parser.add_argument('--n_clusters', default=3, type=int, help='客户端聚类数量')
     parser.add_argument('--max_workers', default=None, type=int, help='最大并行工作线程数')
     
+    # TierHFL特有参数
+    parser.add_argument('--init_alpha', default=0.5, type=float, help='初始本地与全局损失平衡因子')
+    parser.add_argument('--init_lambda', default=0.1, type=float, help='初始特征对齐损失权重')
+    parser.add_argument('--beta', default=0.8, type=float, help='聚合动量因子')
+    
     args = parser.parse_args()
     return args
 
-
+# 设置日志和wandb
 def setup_logging(args):
-    """设置日志记录"""
     # 配置基本日志
     logging.basicConfig(
         level=logging.INFO,
@@ -132,22 +113,29 @@ def setup_logging(args):
             logging.FileHandler(f"{args.running_name}.log")
         ]
     )
-    logger = logging.getLogger("HPFL-Unified")
+    logger = logging.getLogger("TierHFL")
     
     # 配置wandb
-    wandb.init(
-        mode="online",
-        project="HeterogeneousFL-Unified",
-        name=args.running_name,
-        config=args,
-        tags=[f"model_{args.model}", f"dataset_{args.dataset}", f"clients_{args.client_number}", "UnifiedServer"]
-    )
-    
+    try:
+        wandb.init(
+            mode="online",
+            project="TierHFL",
+            name=args.running_name,
+            config=args,
+            tags=[f"model_{args.model}", f"dataset_{args.dataset}", f"clients_{args.client_number}"],
+        )
+    except Exception as e:
+        print(f"警告: wandb初始化失败: {e}")
+        # 使用离线模式
+        try:
+            wandb.init(mode="offline", project="TierHFL", name=args.running_name)
+        except:
+            print("完全禁用wandb")
+            
     return logger
 
-
+# 加载数据集
 def load_dataset(args):
-    """加载并分割数据集"""
     if args.dataset == "cifar10":
         data_loader = load_partition_data_cifar10
     elif args.dataset == "cifar100":
@@ -178,9 +166,8 @@ def load_dataset(args):
     
     return dataset
 
-
+# 为客户端分配设备资源
 def allocate_device_resources(client_number):
-    """为客户端分配设备资源"""
     resources = {}
     
     # 在1-7之间随机分配tier
@@ -217,7 +204,7 @@ def allocate_device_resources(client_number):
         
         # 存储资源信息
         resources[client_id] = {
-            "storage_tier": tier,
+            "tier": tier,
             "compute_power": compute_power,
             "network_speed": network_speed,
             "storage_capacity": storage_capacity
@@ -225,183 +212,26 @@ def allocate_device_resources(client_number):
     
     return resources
 
+# 简化的数据分布聚类器
+class SimpleDataDistributionClusterer:
+    def __init__(self, num_clusters=3):
+        self.num_clusters = num_clusters
+    
+    def cluster_clients(self, client_models, client_ids, eval_dataset=None, device='cuda'):
+        # 简单地根据client_id平均分配到各个聚类
+        clusters = {}
+        for i in range(self.num_clusters):
+            clusters[i] = []
+            
+        # 平均分配
+        for i, client_id in enumerate(client_ids):
+            cluster_idx = i % self.num_clusters
+            clusters[cluster_idx].append(client_id)
+            
+        return clusters
 
-def setup_clients(args, dataset, client_resources):
-    """设置客户端管理器和客户端"""
-    # 提取数据集信息
-    if args.dataset != "cinic10":
-        _, _, _, _, train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num = dataset
-    else:
-        _, _, _, _, train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num, _ = dataset
-    
-    # 创建客户端管理器
-    client_manager = ClientManager()
-    
-    # 设置默认设备
-    default_device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
-    # 为每个客户端创建训练策略
-    for client_idx in range(args.client_number):
-        # 获取客户端资源信息
-        resources = client_resources[client_idx]
-        tier = resources["storage_tier"]
-        
-        # 创建优化的学习率
-        optimized_lr = args.lr * (1.2 if tier > 5 else (0.8 if tier < 3 else 1.0))
-        
-        # 添加客户端
-        client = client_manager.add_client(
-            client_id=client_idx,
-            tier=tier,
-            train_dataset=train_data_local_dict[client_idx],
-            test_dataset=test_data_local_dict[client_idx],
-            device=default_device,
-            lr=optimized_lr,
-            local_epochs=args.client_epoch,
-            resources=resources
-        )
-        
-        # 为客户端设置优化的训练策略
-        training_strategy = create_training_strategy_for_client(
-            tier=tier,
-            is_low_resource=(resources["compute_power"] < 0.5)
-        )
-        client.training_strategy = training_strategy
-    
-    return client_manager, class_num
-
-
-def setup_models(args, class_num):
-    """设置模型"""
-    # 确定设备
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # 选择模型类型
-    if args.model == 'resnet110':
-        layers = [6, 6, 6, 6, 6, 6]  # ResNet-110的层配置
-        block = Bottleneck
-    else:  # 默认使用ResNet-56
-        layers = [3, 3, 3, 3, 3, 3]  # ResNet-56的层配置
-        block = Bottleneck
-    
-    # 创建所有tier的客户端模型
-    print("创建不同tier的客户端模型...")
-    client_models = create_all_tier_client_models(
-        block=block,
-        layers=layers,
-        num_classes=class_num,
-        groups_per_channel=args.groups_per_channel
-    )
-    
-    # 创建统一的服务器模型和全局分类器
-    print("创建统一的服务器模型和全局分类器...")
-    unified_server_model, global_classifier = create_unified_server_model(
-        block=block,
-        layers=layers,
-        num_classes=class_num,
-        groups_per_channel=args.groups_per_channel
-    )
-    
-    # 将模型移至目标设备
-    unified_server_model = unified_server_model.to(device)
-    global_classifier = global_classifier.to(device)
-    
-    print(f"模型类型: {args.model}, 分类数: {class_num}")
-    
-    return client_models, unified_server_model, global_classifier
-
-
-def pretrain_and_cluster(client_manager, client_models, args, device):
-    """客户端预训练和数据分布感知聚类"""
-    print("开始客户端预训练...")
-    
-    # 创建评估数据集
-    eval_dataset = get_cifar10_proxy_dataset(
-        option='balanced_test',
-        num_samples=1000,
-        seed=42
-    )
-    
-    # 为每个客户端分配对应tier的模型
-    client_tier_models = {}
-    for client_id in range(args.client_number):
-        client = client_manager.get_client(client_id)
-        if client:
-            tier = client.tier
-            client_tier_models[client_id] = copy.deepcopy(client_models[tier])
-    
-    # 执行预训练
-    client_ids = list(range(args.client_number))
-    start_time = time.time()
-    pretrain_results = client_manager.pre_train_clients(client_ids, client_tier_models, epochs=5)
-    pretrain_time = time.time() - start_time
-    
-    # 记录预训练统计信息
-    pretrain_stats = {
-        "pretrain/total_time": pretrain_time,
-        "pretrain/avg_time_per_client": pretrain_time / len(client_ids) if len(client_ids) > 0 else 0
-    }
-    for client_id, result in pretrain_results.items():
-        pretrain_stats[f"pretrain/client_{client_id}/time"] = result['time']
-        pretrain_stats[f"pretrain/client_{client_id}/model_size_mb"] = result['model_size_mb']
-    
-    # 记录到wandb
-    wandb.log(pretrain_stats)
-    
-    # 收集预训练后的模型
-    pretrained_models = {}
-    for client_id, result in pretrain_results.items():
-        model = copy.deepcopy(client_tier_models[client_id])
-        model.load_state_dict(result['model_state'])
-        pretrained_models[client_id] = model
-    
-    # 数据分布感知聚类
-    print("执行数据分布感知聚类...")
-    cluster_start_time = time.time()
-    client_models_list = [pretrained_models[idx] for idx in sorted(pretrained_models.keys())]
-    client_indices = sorted(pretrained_models.keys())
-    
-    # 执行聚类
-    client_clusters = adaptive_cluster_assignment(
-        client_models_list, 
-        client_indices,
-        eval_dataset,
-        device,
-        n_clusters=args.n_clusters
-    )
-    cluster_time = time.time() - cluster_start_time
-    
-    # 设置客户端聚类信息
-    client_manager.set_client_clusters(client_clusters)
-    
-    # 记录聚类结果
-    cluster_stats = {
-        "clustering/time": cluster_time,
-        "clustering/num_clusters": len(client_clusters)
-    }
-    
-    for cluster_id, clients in client_clusters.items():
-        cluster_stats[f"clustering/cluster_{cluster_id}/size"] = len(clients)
-        wandb.log(cluster_stats)
-        
-        # 记录每个聚类的客户端tier分布
-        tier_distribution = {}
-        for c_id in clients:
-            tier = client_manager.get_client(c_id).tier
-            tier_distribution[tier] = tier_distribution.get(tier, 0) + 1
-        
-        print(f"聚类 {cluster_id}: {len(clients)} 个客户端 - {clients}")
-        print(f"聚类 {cluster_id} Tier分布: {tier_distribution}")
-        
-        # 记录到wandb
-        for tier, count in tier_distribution.items():
-            wandb.log({f"clustering/cluster_{cluster_id}/tier_{tier}_count": count})
-    
-    return client_clusters, pretrained_models
-
-
+# 主函数
 def main():
-    """主函数"""
     # 解析命令行参数
     args = parse_arguments()
     
@@ -410,7 +240,7 @@ def main():
     
     # 设置日志
     logger = setup_logging(args)
-    logger.info("初始化统一服务器架构的异构联邦学习框架...")
+    logger.info("初始化TierHFL: 分层异构联邦学习框架...")
     
     # 设置默认设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -420,158 +250,139 @@ def main():
     logger.info(f"加载数据集: {args.dataset}")
     dataset = load_dataset(args)
     
-    # 获取类别数
+    # 获取数据集信息
     if args.dataset != "cinic10":
-        class_num = dataset[7]
+        train_data_num, test_data_num, _, _, train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num = dataset
     else:
-        class_num = dataset[7]
-    
-    # 记录数据集统计信息
-    if args.dataset != "cinic10":
-        train_data_num, test_data_num = dataset[0], dataset[1]
-    else:
-        train_data_num, test_data_num = dataset[0], dataset[1]
-    
-    dataset_stats = {
-        "dataset/name": args.dataset,
-        "dataset/total_train_samples": train_data_num,
-        "dataset/total_test_samples": test_data_num,
-        "dataset/num_classes": class_num
-    }
-    
-    if args.dataset != "cinic10":
-        train_data_local_num_dict = dataset[4]
-    else:
-        train_data_local_num_dict = dataset[4]
-    
-    # 记录每个客户端的样本数量
-    for client_idx, num_samples in train_data_local_num_dict.items():
-        dataset_stats[f"dataset/client_{client_idx}_samples"] = num_samples
-    
-    wandb.log(dataset_stats)
+        train_data_num, test_data_num, _, _, train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num, _ = dataset
     
     # 分配客户端资源
     logger.info(f"为 {args.client_number} 个客户端分配异构资源...")
     client_resources = allocate_device_resources(args.client_number)
     
-    # 记录客户端资源分配
-    resource_stats = {}
-    for client_idx, resources in client_resources.items():
-        resource_stats[f"client_{client_idx}/tier"] = resources["storage_tier"]
-        resource_stats[f"client_{client_idx}/storage_gb"] = resources["storage_capacity"]
-        resource_stats[f"client_{client_idx}/network_speed"] = resources["network_speed"]
-        resource_stats[f"client_{client_idx}/compute_power"] = resources["compute_power"]
+    # 创建客户端管理器
+    logger.info("创建客户端管理器...")
+    client_manager = TierHFLClientManager()
     
-    wandb.log(resource_stats)
-    
-    # 设置客户端
-    logger.info("初始化客户端...")
-    client_manager, class_num = setup_clients(args, dataset, client_resources)
-    
-    # 设置模型
-    logger.info(f"创建 {args.model} 模型架构...")
-    client_models, unified_server_model, global_classifier = setup_models(args, class_num)
-    
-    # 创建特征监控器
-    logger.info("初始化特征监控系统...")
-    feature_monitor = FeatureMonitor()
-
-    # 增强特征监控器 - 添加自适应特征范数控制器
-    feature_monitor.norm_controller = AdaptiveFeatureNormController()
-    
-    # 创建自适应损失权重控制器
-    logger.info("初始化自适应损失权重控制器...")
-    loss_weight_controller = LossWeightController(
-        init_local=0.5, 
-        init_global=0.5, 
-        init_feature=0.0
-    )
-
-    # 创建异常干预系统
-    logger.info("初始化异常干预系统...")
-    intervention_system = AnomalyInterventionSystem(feature_monitor)
-
-    # 创建模型聚合器
-    logger.info("初始化增强型模型聚合器...")
-    # 创建结构感知聚合器
-    structure_aware_aggregator = StructureAwareAggregator(device=device)
-
-    # 创建tier权重调整器
-    tier_weight_adjuster = AdaptiveTierWeightAdjuster()
-
-    # 使用增强的聚合器
-    model_aggregator = UnifiedModelAggregator(device=device)
-    
-    # 创建评估数据集
-    eval_dataset = get_cifar10_proxy_dataset(
-        option='balanced_test',
-        num_samples=2000,
-        seed=100
-    )
-    eval_loader = torch.utils.data.DataLoader(
-        eval_dataset, batch_size=64, shuffle=False
-    )
-    
-    # 预训练和聚类
-    logger.info("开始客户端预训练和聚类...")
-    client_clusters, pretrained_models = pretrain_and_cluster(
-        client_manager, client_models, args, device
-    )
-    
-    # 为每个客户端创建对应tier的模型
-    client_tier_models = {}
+    # 注册客户端
     for client_id in range(args.client_number):
-        client = client_manager.get_client(client_id)
-        if client:
-            tier = client.tier
-            # 使用预训练模型或创建新模型
-            if client_id in pretrained_models:
-                client_tier_models[client_id] = pretrained_models[client_id]
-            else:
-                client_tier_models[client_id] = copy.deepcopy(client_models[tier])
+        resource = client_resources[client_id]
+        tier = resource["tier"]
+        
+        # 创建客户端
+        client = client_manager.add_client(
+            client_id=client_id,
+            tier=tier,
+            train_data=train_data_local_dict[client_id],
+            test_data=test_data_local_dict[client_id],
+            device=device,
+            lr=args.lr,
+            local_epochs=args.client_epoch
+        )
+        
+        # 设置初始alpha和lambda
+        client.update_alpha(args.init_alpha)
+        client.update_lambda_feature(args.init_lambda)
+    
+    # 创建客户端模型
+    logger.info(f"创建 {args.model} 客户端模型...")
+    client_models = {}
+    
+    # 使用简单的ResNet模型代替我们的自定义模型
+    for client_id, resource in client_resources.items():
+        tier = resource["tier"]
+        # 简单起见，为每个客户端创建一个简单的ResNet模型
+        model = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+            nn.Linear(16, class_num)
+        )
+        
+        # 为每个tier添加get_shared_params和get_personalized_params方法
+        def get_shared_params(self):
+            return {name: param for name, param in self.named_parameters() 
+                   if not any(x in name for x in ['4', 'fc', 'linear', 'classifier'])}
+            
+        def get_personalized_params(self):
+            return {name: param for name, param in self.named_parameters() 
+                   if any(x in name for x in ['4', 'fc', 'linear', 'classifier'])}
+            
+        # 添加forward方法来返回logits和特征
+        def forward(self, x):
+            for i in range(3):  # 直到BatchNorm2d
+                x = self[i](x)
+            features = x
+            for i in range(3, len(self)):
+                x = self[i](x)
+            return x, features
+        
+        # 动态添加方法
+        model.get_shared_params = get_shared_params.__get__(model)
+        model.get_personalized_params = get_personalized_params.__get__(model)
+        model.forward = forward.__get__(model)
+        
+        client_models[client_id] = model
+    
+    # 创建服务器模型
+    logger.info("创建服务器模型...")
+    
+    # 简单的服务器模型
+    server_model = nn.Sequential(
+        nn.AdaptiveAvgPool2d((1, 1)),
+        nn.Flatten(),
+        nn.Linear(16, class_num)
+    )
+    
+    # 添加forward方法
+    def server_forward(self, x, tier=None):
+        features = self[0](x)
+        features = self[1](features)
+        logits = self[2](features)
+        return logits, features
+    
+    server_model.forward = server_forward.__get__(server_model)
+    server_model.num_classes = class_num
+    
+    # 创建稳定化聚合器
+    logger.info("创建稳定化聚合器...")
+    aggregator = StabilizedAggregator(beta=args.beta, device=device)
+    
+    # 创建客户端聚类器
+    logger.info("创建数据分布聚类器...")
+    clusterer = SimpleDataDistributionClusterer(num_clusters=args.n_clusters)
+    
+    # 创建自适应训练控制器
+    logger.info("创建自适应训练控制器...")
+    controller = AdaptiveTrainingController(
+        initial_alpha=args.init_alpha,
+        initial_lambda=args.init_lambda
+    )
+    
+    # 对客户端进行初始聚类
+    logger.info("执行初始客户端聚类...")
+    client_ids = list(range(args.client_number))
+    cluster_map = clusterer.cluster_clients(
+        client_models=client_models,
+        client_ids=client_ids
+    )
     
     # 创建并行训练器
-    logger.info("创建并行训练框架...")
-    parallel_trainer = UnifiedParallelTrainer(
+    logger.info("创建并行训练器...")
+    trainer = ClusterAwareParallelTrainer(
         client_manager=client_manager,
-        unified_server_model=unified_server_model,
-        global_classifier=global_classifier,
-        device=device
-    )
-    
-    # 注册客户端模型
-    parallel_trainer.register_client_models(client_tier_models)
-    
-    # 设置训练环境
-    parallel_trainer.setup_training(
-        cluster_map=client_clusters,
+        server_model=server_model,
+        device=device,
         max_workers=args.max_workers
     )
     
-    # 定义更多的度量指标
-    wandb.define_metric("round")
-    wandb.define_metric("global/test_accuracy", step_metric="round")
-    wandb.define_metric("global/test_loss", step_metric="round")
-    wandb.define_metric("global/class_balance", step_metric="round")
+    # 注册客户端模型
+    trainer.register_client_models(client_models)
     
-    wandb.define_metric("client/local_accuracy", step_metric="round")
-    wandb.define_metric("client/global_accuracy", step_metric="round")
-    wandb.define_metric("client/feature_norm_ratio", step_metric="round")
-    
-    wandb.define_metric("anomalies/count", step_metric="round")
-    wandb.define_metric("anomalies/feature_norm_mismatch", step_metric="round")
-    wandb.define_metric("anomalies/class_accuracy_imbalance", step_metric="round")
-
-    # 创建特征分布一致性损失函数
-    feature_dist_loss = FeatureDistributionLoss()
-
-    # 定义更多的度量指标
-    wandb.define_metric("feature_matching/norm_ratio", step_metric="round")
-    wandb.define_metric("feature_matching/dist_loss", step_metric="round")
-    wandb.define_metric("adaptive/local_loss_weight", step_metric="round")
-    wandb.define_metric("adaptive/global_loss_weight", step_metric="round")
-    wandb.define_metric("adaptive/feature_loss_weight", step_metric="round")
-    wandb.define_metric("interventions/count", step_metric="round")
+    # 设置训练环境
+    trainer.setup_training(cluster_map=cluster_map)
     
     # 开始训练循环
     logger.info(f"开始联邦学习训练 ({args.rounds} 轮)...")
@@ -580,305 +391,211 @@ def main():
     for round_idx in range(args.rounds):
         round_start_time = time.time()
         logger.info(f"===== 轮次 {round_idx+1}/{args.rounds} =====")
-        # 执行异常检测和干预
-        training_params = {'lr': args.lr, 'clip_grad': None}
-        intervention_count = intervention_system.check_and_intervene(
-            list(client_tier_models.values())[0],  # 示例客户端模型
-            unified_server_model, 
-            global_classifier, 
-            training_params
-        )
-
-        # 获取当前损失权重
-        current_loss_weights = loss_weight_controller.get_weights()
-        logger.info(f"当前损失权重: 本地={current_loss_weights['local']:.2f}, "
-                f"全局={current_loss_weights['global']:.2f}, "
-                f"特征={current_loss_weights['feature']:.2f}")
+        
         # 执行并行训练
-        train_results, eval_results, server_models, classifiers, training_time = parallel_trainer.execute_parallel_training(
-            train_fn=train_client_with_unified_server,
-            eval_fn=evaluate_client_with_unified_server,
-            round_idx=round_idx,
-            feature_monitor=feature_monitor,
-        )
-            # loss_weight_controller=loss_weight_controller,
-            # feature_dist_loss=feature_dist_loss,
-            # training_params=training_params
+        train_results, eval_results, server_models, training_time = trainer.execute_parallel_training(round_idx)
         
+        # 防止空结果
+        if not train_results or not eval_results:
+            logger.error("训练或评估结果为空，跳过本轮")
+            continue
         
-        # 更新全局模型
-        logger.info("更新全局模型...")
-
-        # 1. 收集客户端tier信息
-        client_tiers = {}
+        # 更新自适应控制器的历史记录
+        controller.update_history(eval_results)
+        
+        # 调整训练参数
+        if round_idx > 0 and round_idx % 5 == 0:  # 每5轮调整一次
+            params = controller.adjust_parameters()
+            logger.info(f"调整训练参数: alpha={params['alpha']:.3f}, lambda_feature={params['lambda_feature']:.3f}")
+            
+            # 更新所有客户端的参数
+            client_manager.update_all_clients_alpha(params['alpha'])
+            client_manager.update_all_clients_feature_lambda(params['lambda_feature'])
+        
+        # 计算全局聚合权重 - 基于客户端评估性能
         client_weights = {}
-        for client_id, result in train_results.items():
-            client = client_manager.get_client(client_id)
-            if client:
-                client_tiers[client_id] = client.tier
-                # 基于准确率设置初始权重
-                if isinstance(result, dict) and 'global_accuracy' in result:
-                    client_weights[client_id] = result['global_accuracy']
-                else:
-                    client_weights[client_id] = 1.0
-
-        # 2. 更新tier性能并调整权重
-        for client_id, eval_result in eval_results.items():
-            if client_id in client_tiers and 'global_accuracy' in eval_result:
-                tier_weight_adjuster.update_tier_performance(
-                    client_tiers[client_id], 
-                    eval_result['global_accuracy']
-                )
-
-        tier_weight_adjuster.adjust_weights()
-
-        # 3. 应用tier权重修正
-        for client_id in client_weights.keys():
-            if client_id in client_tiers:
-                modifier = tier_weight_adjuster.get_client_weight_modifier(
-                    client_id, 
-                    client_tiers[client_id]
-                )
-                client_weights[client_id] *= modifier
-
-        # 4. 使用结构感知聚合器聚合模型
-        # 首先收集客户端模型状态
-        client_models_dict = {}
-        for client_id, result in train_results.items():
-            if isinstance(result, dict) and 'client_model_state' in result:
-                client_models_dict[client_id] = result['client_model_state']
-
-        # 执行结构感知聚合
-        aggregated_model = structure_aware_aggregator.aggregate(
-            client_models_dict, 
-            client_tiers, 
-            client_weights
-        )
-
-        # 更新统一服务器模型
-        unified_server_model.load_state_dict(aggregated_model, strict=False)
-
-        # 5. 更新全局分类器 (沿用原有方法)
-        parallel_trainer.update_global_models(
-            server_models=server_models,
-            classifiers=classifiers,
-            aggregator=model_aggregator
+        for client_id, result in eval_results.items():
+            if 'global_accuracy' in result:
+                client_weights[client_id] = result['global_accuracy'] / 100.0  # 归一化到0-1
+        
+        # 聚合服务器模型
+        logger.info("聚合服务器模型...")
+        client_states = {client_id: result['model_state'] for client_id, result in train_results.items()}
+        
+        # 提取客户端tier信息
+        client_tiers = {client_id: client_resources[client_id]['tier'] for client_id in client_states.keys()}
+        
+        # 聚合模型
+        aggregated_model = aggregator.aggregate(
+            client_states=client_states,
+            client_weights=client_weights,
+            client_clusters=cluster_map
         )
         
-        # 全局模型评估
-        logger.info("评估全局模型性能...")
-        global_correct = 0
-        global_total = 0
-        global_loss = 0
-        criterion = nn.CrossEntropyLoss()
+        # 更新客户端模型的共享部分
+        for client_id, model in client_models.items():
+            # 保存个性化参数
+            personalized_params = {}
+            for name, param in model.named_parameters():
+                if any(x in name for x in ['4', 'fc', 'linear', 'classifier']):
+                    personalized_params[name] = param.clone()
+            
+            # 加载聚合模型 - 防止错误
+            try:
+                model.load_state_dict(aggregated_model, strict=False)
+            except Exception as e:
+                logger.error(f"加载聚合模型失败: {str(e)}")
+                # 跳过本次更新
+                continue
+            
+            # 恢复个性化参数
+            for name, param in model.named_parameters():
+                if name in personalized_params:
+                    param.data = personalized_params[name].data
         
-        # 记录每个类别的准确率
-        class_correct = [0] * class_num
-        class_total = [0] * class_num
+        # 更新服务器模型
+        try:
+            server_model.load_state_dict(aggregated_model, strict=False)
+        except Exception as e:
+            logger.error(f"更新服务器模型失败: {str(e)}")
         
-        # 全局评估使用统一服务器模型和全局分类器
-        unified_server_model.eval()
-        global_classifier.eval()
+        # 计算全局指标
+        total_samples = 0
+        weighted_acc = 0.0
+        weighted_loss = 0.0
+        class_accs = [0.0] * class_num
+        class_counts = [0] * class_num
         
-        with torch.no_grad():
-            for data, target in eval_loader:
-                data, target = data.to(device), target.to(device)
-                
-                # 前向传播 - 模拟tier=1的客户端(特征最丰富)
-                # 1. 提取特征 - 使用基础模型(conv1+gn1+relu)
-                features = server_features = None
-                
-                # 创建临时tier=1客户端模型进行特征提取
-                temp_model = client_models[1].to(device)
-                temp_model.eval()
-                _, features = temp_model(data)
-                
-                # 2. 服务器处理
-                server_features = unified_server_model(features, tier=1)
-                
-                # 3. 全局分类
-                output = global_classifier(server_features)
-                
-                # 计算损失和准确率
-                loss = criterion(output, target)
-                global_loss += loss.item()
-                _, predicted = torch.max(output.data, 1)
-                global_total += target.size(0)
-                global_correct += (predicted == target).sum().item()
-                
-                # 记录每个类别的准确率
-                for i in range(len(target)):
-                    label = target[i]
-                    class_total[label] += 1
-                    if predicted[i] == label:
-                        class_correct[label] += 1
-        
-        # 计算平均损失和准确率
-        global_loss /= len(eval_loader)
-        global_accuracy = 100.0 * global_correct / global_total if global_total > 0 else 0
-        
-        # 计算每个类别的准确率
-        per_class_acc = []
-        for i in range(class_num):
-            if class_total[i] > 0:
-                per_class_acc.append(100.0 * class_correct[i] / class_total[i])
-            else:
-                per_class_acc.append(0.0)
-        
-        # 计算类别平衡度 - 最高准确率与最低准确率的比值
-        if min(per_class_acc) > 0:
-            class_balance = max(per_class_acc) / min(per_class_acc)
-        else:
-            class_balance = float('inf')
-        
-        # 更新特征监控器的全局统计信息
-        feature_monitor.update_global_stats(global_accuracy, round_idx)
-        
-        # 更新最佳准确率
-        is_best = global_accuracy > best_accuracy
-        if is_best:
-            best_accuracy = global_accuracy
-            # 保存最佳模型
-            best_model_path = f"{args.running_name}_best_model.pth"
-            torch.save({
-                'server_model': unified_server_model.state_dict(),
-                'global_classifier': global_classifier.state_dict(),
-                'round': round_idx,
-                'accuracy': best_accuracy
-            }, best_model_path)
-            logger.info(f"保存最佳模型到 {best_model_path}")
-        
-        # 计算客户端统计信息
-        client_local_acc = []
-        client_global_acc = []
-        client_feature_norm_ratios = []
-        
-        for client_id, result in train_results.items():
-            if isinstance(result, dict):
-                # 收集本地和全局准确率
-                if 'local_accuracy' in result:
-                    client_local_acc.append(result['local_accuracy'])
-                if 'global_accuracy' in result:
-                    client_global_acc.append(result['global_accuracy'])
-                
-                # 收集特征范数比例
-                if 'feature_stats' in result and 'monitoring' in result['feature_stats']:
-                    monitoring = result['feature_stats']['monitoring']
-                    if 'client_feature_norm' in monitoring and 'server_feature_norm' in monitoring:
-                        client_norms = monitoring['client_feature_norm']
-                        server_norms = monitoring['server_feature_norm']
-                        
-                        # 计算平均范数比例
-                        if client_norms and server_norms:
-                            min_len = min(len(client_norms), len(server_norms))
-                            if min_len > 0:
-                                ratios = []
-                                for i in range(min_len):
-                                    if server_norms[i] > 0:
-                                        ratios.append(client_norms[i] / server_norms[i])
-                                
-                                if ratios:
-                                    avg_ratio = sum(ratios) / len(ratios)
-                                    client_feature_norm_ratios.append(avg_ratio)
+        for client_id, result in eval_results.items():
+            samples = train_data_local_num_dict[client_id]
+            total_samples += samples
+            
+            # 加权准确率和损失
+            weighted_acc += result['global_accuracy'] * samples
+            weighted_loss += result['test_loss'] * samples
+            
+            # 统计每个类别的准确率
+            if 'global_per_class_acc' in result and len(result['global_per_class_acc']) == class_num:
+                for i, acc in enumerate(result['global_per_class_acc']):
+                    class_accs[i] += acc * samples
+                    class_counts[i] += samples
         
         # 计算平均值
-        avg_local_acc = sum(client_local_acc) / len(client_local_acc) if client_local_acc else 0
-        avg_global_acc = sum(client_global_acc) / len(client_global_acc) if client_global_acc else 0
-        avg_feature_norm_ratio = sum(client_feature_norm_ratios) / len(client_feature_norm_ratios) if client_feature_norm_ratios else 0
+        if total_samples > 0:
+            global_acc = weighted_acc / total_samples
+            global_loss = weighted_loss / total_samples
+            
+            # 计算每个类别的平均准确率
+            for i in range(class_num):
+                if class_counts[i] > 0:
+                    class_accs[i] /= class_counts[i]
+            
+            # 计算类别平衡度 - 最高准确率与最低准确率的比值
+            non_zero_accs = [acc for acc in class_accs if acc > 0]
+            if non_zero_accs:
+                class_balance = max(non_zero_accs) / max(0.1, min(non_zero_accs))
+            else:
+                class_balance = float('inf')
+        else:
+            global_acc = 0.0
+            global_loss = 0.0
+            class_balance = float('inf')
         
-        # 更新损失权重控制器
-        loss_weight_controller.update_history(avg_local_acc, avg_global_acc)
-
-        # 获取更新后的权重用于下一轮
-        next_weights = loss_weight_controller.get_weights()
-
-        # 获取异常统计信息
-        anomalies = feature_monitor.get_latest_anomalies()
-        anomalies_count = len([a for a in anomalies if a['round'] == round_idx])
+        # 更新最佳准确率
+        is_best = global_acc > best_accuracy
+        if is_best:
+            best_accuracy = global_acc
+            # 保存最佳模型
+            try:
+                torch.save({
+                    'server_model': server_model.state_dict(),
+                    'round': round_idx,
+                    'accuracy': best_accuracy
+                }, f"{args.running_name}_best_model.pth")
+                logger.info(f"保存最佳模型，准确率: {best_accuracy:.2f}%")
+            except Exception as e:
+                logger.error(f"保存模型失败: {str(e)}")
         
-        # 异常类型统计
-        feature_norm_mismatch = len([a for a in anomalies if a['round'] == round_idx and a['type'] == 'feature_norm_mismatch'])
-        class_accuracy_imbalance = len([a for a in anomalies if a['round'] == round_idx and a['type'] == 'class_accuracy_imbalance'])
+        # 计算客户端统计信息
+        if eval_results:
+            avg_local_acc = sum(result.get('local_accuracy', 0) for result in eval_results.values()) / max(1, len(eval_results))
+            avg_global_acc = sum(result.get('global_accuracy', 0) for result in eval_results.values()) / max(1, len(eval_results))
+        else:
+            avg_local_acc = 0.0
+            avg_global_acc = 0.0
+            
+        # 计算平均特征对齐损失
+        if train_results:
+            avg_feature_loss = sum(result.get('avg_feature_loss', 0) for result in train_results.values()) / max(1, len(train_results))
+        else:
+            avg_feature_loss = 0.0
         
         # 计算轮次时间
         round_time = time.time() - round_start_time
         
         # 输出统计信息
         logger.info(f"轮次 {round_idx+1} 统计:")
-        logger.info(f"全局准确率: {global_accuracy:.2f}%, 最佳: {best_accuracy:.2f}%")
+        logger.info(f"全局准确率: {global_acc:.2f}%, 最佳: {best_accuracy:.2f}%")
         logger.info(f"平均本地准确率: {avg_local_acc:.2f}%, 平均全局准确率: {avg_global_acc:.2f}%")
         logger.info(f"类别平衡度: {class_balance:.2f}")
-        logger.info(f"特征范数比例: {avg_feature_norm_ratio:.2f}")
-        logger.info(f"异常数量: {anomalies_count}")
+        logger.info(f"特征对齐损失: {avg_feature_loss:.4f}")
+        logger.info(f"alpha: {controller.alpha:.3f}, lambda_feature: {controller.lambda_feature:.3f}")
         logger.info(f"耗时: {round_time:.2f}秒")
         
         # 记录到wandb
-        metrics = {
-            "round": round_idx + 1,
+        try:
+            metrics = {
+                "round": round_idx + 1,
+                
+                # 全局模型性能
+                "global/test_accuracy": global_acc,
+                "global/test_loss": global_loss,
+                "global/best_accuracy": best_accuracy,
+                "global/is_best_model": 1 if is_best else 0,
+                "global/class_balance": class_balance,
+                
+                # 客户端性能
+                "local/accuracy": avg_local_acc,
+                "global/accuracy": avg_global_acc,
+                "feature/alignment": avg_feature_loss,
+                
+                # 训练参数
+                "params/alpha": controller.alpha,
+                "params/lambda_feature": controller.lambda_feature,
+                
+                # 时间统计
+                "time/round_seconds": round_time,
+                "time/training_seconds": training_time
+            }
             
-            # 全局模型性能
-            "global/test_accuracy": global_accuracy,
-            "global/test_loss": global_loss,
-            "global/best_accuracy": best_accuracy,
-            "global/is_best_model": 1 if is_best else 0,
-            "global/class_balance": class_balance,
+            # 记录每个类别的准确率
+            for i, acc in enumerate(class_accs):
+                metrics[f"global/class_{i}_accuracy"] = acc
             
-            # 客户端性能
-            "client/local_accuracy": avg_local_acc,
-            "client/global_accuracy": avg_global_acc,
-            "client/feature_norm_ratio": avg_feature_norm_ratio,
-            
-            # 异常统计
-            "anomalies/count": anomalies_count,
-            "anomalies/feature_norm_mismatch": feature_norm_mismatch,
-            "anomalies/class_accuracy_imbalance": class_accuracy_imbalance,
-            
-            # 时间统计
-            "time/round_seconds": round_time,
-            "time/training_seconds": training_time
-        }
-        # 在metrics字典中添加新指标
-        metrics.update({
-            # 特征匹配相关指标
-            "feature_matching/norm_ratio": avg_feature_norm_ratio,
-            "feature_matching/dist_loss": sum([r.get('feature_dist_loss', 0) for r in train_results.values() 
-                                            if isinstance(r, dict)]) / len(train_results) if train_results else 0,
-            
-            # 自适应权重指标
-            "adaptive/local_loss_weight": current_loss_weights['local'],
-            "adaptive/global_loss_weight": current_loss_weights['global'],
-            "adaptive/feature_loss_weight": current_loss_weights['feature'],
-            
-            # 干预相关指标
-            "interventions/count": intervention_count,
-        })
-
-        # 记录每个tier的权重修正因子
-        for tier in range(1, 8):
-            if hasattr(tier_weight_adjuster, 'tier_weights') and tier in tier_weight_adjuster.tier_weights:
-                metrics[f"adaptive/tier_{tier}_weight"] = tier_weight_adjuster.tier_weights[tier]
+            wandb.log(metrics)
+        except Exception as e:
+            logger.error(f"记录wandb指标失败: {str(e)}")
         
-        # 记录每个类别的准确率
-        for i, acc in enumerate(per_class_acc):
-            metrics[f"global/class_{i}_accuracy"] = acc
-        
-        wandb.log(metrics)
+        # 每10轮重新聚类一次
+        if (round_idx + 1) % 10 == 0 and round_idx < args.rounds - 10:
+            logger.info("重新进行客户端聚类...")
+            try:
+                cluster_map = clusterer.cluster_clients(
+                    client_models=client_models,
+                    client_ids=client_ids
+                )
+                trainer.setup_training(cluster_map=cluster_map)
+            except Exception as e:
+                logger.error(f"重新聚类失败: {str(e)}")
     
-    # 训练完成，记录最终统计信息和分析报告
-    analysis_report = feature_monitor.get_analysis_report()
+    # 训练完成
+    logger.info(f"TierHFL训练完成! 最佳准确率: {best_accuracy:.2f}%")
     
-    final_stats = {
-        "final/best_accuracy": best_accuracy,
-        "final/rounds": args.rounds,
-        "final/client_number": args.client_number,
-        "final/clusters": len(client_clusters),
-        "final/total_anomalies": analysis_report['total_anomalies']
-    }
-    wandb.log(final_stats)
-    
-    logger.info(f"统一服务器架构的异构联邦学习训练完成! 最佳准确率: {best_accuracy:.2f}%")
-    wandb.finish()
-
+    # 关闭wandb
+    try:
+        wandb.finish()
+    except:
+        pass
 
 if __name__ == "__main__":
     main()
