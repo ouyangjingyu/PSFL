@@ -11,6 +11,73 @@ import queue
 import logging
 from collections import deque
 
+
+# 替代torch.cuda.set_device(0)的更好方法
+# def setup_device_environment():
+#     """配置设备环境但保留多GPU功能"""
+#     if torch.cuda.is_available():
+#         # 设置确定性但不限制GPU使用
+#         torch.backends.cudnn.deterministic = True
+#         torch.backends.cudnn.benchmark = False
+#         print(f"可用GPU数量: {torch.cuda.device_count()}")
+#     else:
+#         print("无可用GPU，使用CPU")
+    
+#     # 这个函数不设置默认设备，允许多GPU并行
+
+
+# def setup_cluster_environment(cluster_id, device):
+#     """为特定聚类设置GPU环境"""
+#     # 这不会限制其他GPU的使用，只影响本线程中的张量创建
+#     if 'cuda' in device:
+#         gpu_id = int(device.split(':')[1]) if ':' in device else 0
+#         # 只在线程级别设置当前设备
+#         torch.cuda.set_device(gpu_id)
+#         print(f"聚类 {cluster_id} 使用GPU {gpu_id}")
+    
+#     return device
+
+
+
+def ensure_model_on_device(model, device):
+    """确保模型完全在指定设备上
+    
+    Args:
+        model: 要移动的模型
+        device: 目标设备
+        
+    Returns:
+        model: 确保在指定设备上的模型
+    """
+    if model is None:
+        return None
+        
+    # 记录原始设备和目标设备
+    original_device = next(model.parameters()).device if list(model.parameters()) else None
+    if original_device == device:
+        # 模型已经在正确设备上，检查所有参数
+        all_correct = all(p.device == device for p in model.parameters())
+        all_buffers_correct = all(b.device == device for b in model.buffers())
+        if all_correct and all_buffers_correct:
+            return model
+    
+    # 移动整个模型
+    model = model.to(device)
+    
+    # 确保所有参数在正确设备上
+    for param in model.parameters():
+        if param.device != device:
+            param.data = param.data.to(device)
+    
+    # 确保所有缓冲区在正确设备上
+    for buffer in model.buffers():
+        if buffer.device != device:
+            buffer.data = buffer.data.to(device)
+    
+    return model
+
+
+
 class FeatureDistributionLoss(nn.Module):
     """特征分布一致性损失函数"""
     def __init__(self, reduction='mean'):
@@ -157,6 +224,9 @@ class StructureAwareAggregator:
         if not client_models_dict:
             return {}
 
+        # 确保一致的聚合设备
+        aggregation_device = self.device
+
         # 初始化结果状态字典
         aggregated_model = {}
 
@@ -169,6 +239,11 @@ class StructureAwareAggregator:
             if target is None:
                 return weighted_source
             
+            # 如果形状不匹配，直接返回目标
+            if target.shape != weighted_source.shape:
+                print(f"形状不匹配: {target.shape} vs {weighted_source.shape}")
+                return target
+                
             # 确保类型匹配
             if target.dtype != weighted_source.dtype:
                 # 优先使用浮点型
@@ -182,7 +257,7 @@ class StructureAwareAggregator:
             else:
                 # 类型已匹配
                 return target + weighted_source
-            
+                
         # 获取默认权重
         if client_weights is None:
             client_weights = {cid: 1.0/len(client_models_dict) for cid in client_models_dict}
@@ -217,7 +292,8 @@ class StructureAwareAggregator:
                 weights = []
                 for client_id, state in clients:
                     if key in state:
-                        params.append(state[key].to(self.device))
+                        # 确保参数在聚合设备上
+                        params.append(state[key].to(aggregation_device))
                         weights.append(client_weights.get(client_id, 0))
                         
                 # 如果有效参数，执行聚合
@@ -260,20 +336,27 @@ class StructureAwareAggregator:
                 # 高tier权重更高
                 tier_importance = {t: 1.0 + (7-t)*0.1 for t in tiers}
                 total_imp = sum(tier_importance.values())
-                tier_weights = {t: imp/total_imp for t, imp in tier_importance.items()}
+                weights = {t: imp/total_imp for t, imp in tier_importance.items()}
                 
+                # 检查参数形状
+                shapes = {t: tier_aggregated[t][param_name].shape for t in tiers}
+                if len(set(str(s) for s in shapes.values())) > 1:
+                    # 形状不匹配，使用最高tier的参数
+                    highest_tier = min(tiers)
+                    print(f"参数 {param_name} 形状不匹配: {shapes}, 使用tier {highest_tier}")
+                    final_state[param_name] = tier_aggregated[highest_tier][param_name]
+                    continue
+                    
                 # 初始化聚合参数
-                agg_param = torch.zeros_like(
-                    tier_aggregated[tiers[0]][param_name]
-                )
+                agg_param = torch.zeros_like(tier_aggregated[tiers[0]][param_name])
                 
-                # 加权聚合
+                # 加权聚合 - 这里使用weights变量而不是tier_weights
                 for tier in tiers:
                     if param_name in tier_aggregated[tier]:
-                        agg_param += tier_aggregated[tier][param_name] * tier_weights[tier]
+                        agg_param = safe_add(agg_param, tier_aggregated[tier][param_name], weights[tier])
                         
                 final_state[param_name] = agg_param
-                
+                    
         return final_state
 
 class AdaptiveTierWeightAdjuster:
@@ -333,7 +416,29 @@ class AdaptiveTierWeightAdjuster:
         # 默认修正因子为1
         return self.tier_weights.get(tier, 1.0)
 
-
+def deep_to_device(model, device):
+    """
+    深度将模型及其所有参数和缓冲区移至指定设备
+    
+    Args:
+        model: 模型
+        device: 目标设备
+        
+    Returns:
+        移动到指定设备的模型
+    """
+    # 首先将模型移至设备
+    model = model.to(device)
+    
+    # 确保所有参数在正确设备上
+    for param in model.parameters():
+        param.data = param.data.to(device)
+    
+    # 确保所有缓冲区在正确设备上
+    for buffer in model.buffers():
+        buffer.data = buffer.data.to(device)
+    
+    return model
 
 # 优化的拆分学习训练函数 - 改进异构客户端处理
 def train_client_with_unified_server(client_id, client_model, unified_server_model, 
@@ -366,6 +471,19 @@ def train_client_with_unified_server(client_id, client_model, unified_server_mod
         client.device = device
         print(f"客户端 {client_id} 使用设备: {device} - Tier {client.tier}")
         
+        # 强制所有模型和组件使用相同设备
+        client_model = ensure_model_on_device(client_model, device)
+        unified_server_model = ensure_model_on_device(unified_server_model, device)
+        global_classifier = ensure_model_on_device(global_classifier, device)
+
+        
+        # 强制所有模型参数和缓冲区使用相同设备
+        for model in [client_model, unified_server_model, global_classifier]:
+            for param in model.parameters():
+                param.data = param.data.to(device)
+            for buffer in model.buffers():
+                buffer.data = buffer.data.to(device)
+
         # 获取损失权重 - 如果提供了控制器则使用动态权重
         if loss_weight_controller is not None:
             loss_weights = loss_weight_controller.get_weights()
@@ -380,6 +498,13 @@ def train_client_with_unified_server(client_id, client_model, unified_server_mod
         client_model = client_model.to(device)
         unified_server_model = unified_server_model.to(device)
         global_classifier = global_classifier.to(device)
+
+        # 额外确保所有嵌套模块的参数都在正确设备上
+        for module in client_model.modules():
+            for param in module.parameters():
+                param.data = param.data.to(device)
+            for buffer_name, buffer in module.named_buffers():
+                buffer.data = buffer.data.to(device)
         
         # 获取优化的训练策略
         training_strategy = client.training_strategy
@@ -448,6 +573,8 @@ def train_client_with_unified_server(client_id, client_model, unified_server_mod
                 local_correct += (local_preds == target).sum().item()
                 
                 # 4. 服务器处理 - 根据客户端tier处理特征
+                if client_features.device != device:
+                    client_features = client_features.to(device)
                 server_features = unified_server_model(client_features, tier=client.tier)
                 
                 # 记录服务器特征统计信息
@@ -457,6 +584,8 @@ def train_client_with_unified_server(client_id, client_model, unified_server_mod
                         feature_stats['server_feature_norm'].append(server_norm)
                 
                 # 5. 全局分类
+                if server_features.device != device:
+                    server_features = server_features.to(device)
                 global_logits = global_classifier(server_features)
                 
                 # 特征分布一致性损失
@@ -578,6 +707,7 @@ def train_client_with_unified_server(client_id, client_model, unified_server_mod
         return {'error': error_msg}
 
 
+
 def evaluate_client_with_unified_server(client_id, client_model, unified_server_model, 
                                        global_classifier, device, client_manager, 
                                        feature_monitor=None, **kwargs):
@@ -599,10 +729,17 @@ def evaluate_client_with_unified_server(client_id, client_model, unified_server_
         if client is None:
             return {'error': f"客户端 {client_id}不存在"}
         
-        # 确保模型在正确的设备上
-        client_model = client_model.to(device)
-        unified_server_model = unified_server_model.to(device)
-        global_classifier = global_classifier.to(device)
+        # 强制所有模型和组件使用相同设备
+        client_model = ensure_model_on_device(client_model, device)
+        unified_server_model = ensure_model_on_device(unified_server_model, device)
+        global_classifier = ensure_model_on_device(global_classifier, device)
+        
+        # 强制所有模型参数和缓冲区使用相同设备
+        for model in [client_model, unified_server_model, global_classifier]:
+            for param in model.parameters():
+                param.data = param.data.to(device)
+            for buffer in model.buffers():
+                buffer.data = buffer.data.to(device)
         
         # 设置模型为评估模式
         client_model.eval()
@@ -661,6 +798,8 @@ def evaluate_client_with_unified_server(client_id, client_model, unified_server_
                         local_class_correct[label] += 1
                 
                 # 4. 服务器处理 - 根据客户端tier处理特征
+                if client_features.device != device:
+                    client_features = client_features.to(device)
                 server_features = unified_server_model(client_features, tier=client.tier)
                 
                 # 记录服务器特征统计信息
@@ -669,6 +808,8 @@ def evaluate_client_with_unified_server(client_id, client_model, unified_server_
                     feature_stats['server_feature_norm'].append(server_norm)
                 
                 # 5. 全局分类
+                if server_features.device != device:
+                    server_features = server_features.to(device)
                 global_logits = global_classifier(server_features)
                 
                 # 6. 全局损失计算
@@ -1197,11 +1338,18 @@ class UnifiedParallelTrainer:
         try:
             # 获取当前聚类的设备
             device = self.device_map.get(cluster_id, self.default_device)
+            # 设置当前线程使用的GPU，不影响其他线程
+            if 'cuda' in device and ':' in device:
+                gpu_id = int(device.split(':')[1])
+                torch.cuda.set_device(gpu_id)
+            
             self.logger.info(f"聚类 {cluster_id} 开始训练，设备: {device}")
             
-            # 为当前设备创建模型副本
-            server_model_copy = copy.deepcopy(self.unified_server_model).to(device)
-            classifier_copy = copy.deepcopy(self.global_classifier).to(device)
+            # 创建模型副本，然后移动到指定设备
+            server_model_copy = ensure_model_on_device(
+                copy.deepcopy(self.unified_server_model), device)
+            classifier_copy = ensure_model_on_device(
+                copy.deepcopy(self.global_classifier), device)
             
             # 保存训练结果
             cluster_results = {}
@@ -1214,7 +1362,13 @@ class UnifiedParallelTrainer:
                     self.logger.warning(f"客户端 {client_id} 没有对应的模型，跳过")
                     continue
                 
-                client_model = copy.deepcopy(self.client_models[client_id]).to(device)
+                # 正确复制并移动模型
+                client_model = ensure_model_on_device(
+                    copy.deepcopy(self.client_models[client_id]), device)
+                
+                # 确保所有参数都在正确设备上
+                for param in client_model.parameters():
+                    param.data = param.data.to(device)
                 
                 # 执行训练
                 train_result = train_fn(
@@ -1283,6 +1437,29 @@ class UnifiedParallelTrainer:
                 'error': error_msg
             })
     
+    def setup_multi_gpu_environment(self):
+        """为聚类分配GPU设备"""
+        if not torch.cuda.is_available():
+            self.logger.info("没有可用GPU，使用CPU")
+            for cluster_id in self.cluster_map:
+                self.device_map[cluster_id] = "cpu"
+            return
+        
+        gpu_count = torch.cuda.device_count()
+        self.logger.info(f"发现 {gpu_count} 个可用GPU")
+        
+        # 优先将大聚类分配给性能更好的GPU
+        clusters_by_size = sorted(
+            [(cluster_id, len(clients)) for cluster_id, clients in self.cluster_map.items()],
+            key=lambda x: x[1],
+            reverse=True
+        )
+        
+        # 分配GPU
+        for i, (cluster_id, size) in enumerate(clusters_by_size):
+            gpu_id = i % gpu_count
+            self.device_map[cluster_id] = f"cuda:{gpu_id}"
+            self.logger.info(f"聚类 {cluster_id} (大小: {size})分配到 GPU {gpu_id}")
     def execute_parallel_training(self, train_fn, eval_fn=None, round_idx=0, feature_monitor=None):
         """
         执行并行训练
@@ -1301,12 +1478,15 @@ class UnifiedParallelTrainer:
             training_time: 训练时间
         """
         start_time = time.time()
-        
+
+        # 设置多GPU环境
+        self.setup_multi_gpu_environment()
+
         # 没有聚类映射时返回空结果
         if not self.cluster_map:
             self.logger.warning("没有设置聚类映射，无法执行训练")
             return {}, {}, {}, {}, 0
-        
+
         # 创建结果队列
         results_queue = queue.Queue()
         

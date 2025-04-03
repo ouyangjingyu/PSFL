@@ -152,13 +152,33 @@ class AdaptiveFeatureNormalization(nn.Module):
         
         # 计算统计量
         if len(x.shape) == 4:  # 卷积特征
-            # 在空间维度上计算统计量
+            # 获取通道维度
+            c = x.shape[1]
+            
+            # 计算批次统计量
             batch_mean = x.mean(dim=(0, 2, 3))
             batch_var = x.var(dim=(0, 2, 3), unbiased=False)
             
-            # 归一化
-            x_normalized = (x - batch_mean.view(1, -1, 1, 1)) / torch.sqrt(batch_var.view(1, -1, 1, 1) + self.eps)
+            # 检查通道维度是否匹配
+            if batch_mean.shape[0] != c:
+                print(f"通道维度不匹配: 预期 {c}, 实际 {batch_mean.shape[0]}")
+                # 处理不匹配情况
+                if batch_mean.shape[0] > c:
+                    batch_mean = batch_mean[:c]
+                    batch_var = batch_var[:c]
+                else:
+                    # 零填充
+                    pad_mean = torch.zeros(c, device=batch_mean.device)
+                    pad_var = torch.ones(c, device=batch_var.device)
+                    pad_mean[:batch_mean.shape[0]] = batch_mean
+                    pad_var[:batch_var.shape[0]] = batch_var
+                    batch_mean = pad_mean
+                    batch_var = pad_var
+            
+            # 归一化 - 确保形状正确
+            x_normalized = (x - batch_mean.view(1, c, 1, 1)) / torch.sqrt(batch_var.view(1, c, 1, 1) + self.eps)
         else:  # 1D特征
+            # 计算1D特征统计量
             batch_mean = x.mean(dim=0)
             batch_var = x.var(dim=0, unbiased=False)
             
@@ -346,8 +366,10 @@ class FeatureRestoration(nn.Module):
 
 class LayerNormClassifier(nn.Module):
     """使用LayerNorm的分类器，适用于异质性数据环境"""
-    def __init__(self, in_features, num_classes, hidden_dims=None, is_local=False, dropout_rate=None):
+    def __init__(self, in_features, num_classes, hidden_dims=None, is_local=False, dropout_rate=None, device=None):
         super(LayerNormClassifier, self).__init__()
+        
+        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
         
         if hidden_dims is None:
             # 客户端本地分类器和全局分类器使用统一的隐藏层设计
@@ -395,6 +417,25 @@ class LayerNormClassifier(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
+        # 确保输入在正确设备上
+        if hasattr(self, 'device'):
+            target_device = self.device
+        else:
+            # 找到模型参数的设备
+            for param in self.parameters():
+                target_device = param.device
+                break
+        
+        # 确保输入在正确设备上
+        if x.device != target_device:
+            x = x.to(target_device)
+            
+        # 确保权重在正确设备上
+        if self.norm_input.weight is not None and self.norm_input.weight.device != target_device:
+            self.norm_input.weight = nn.Parameter(self.norm_input.weight.to(target_device))
+        if self.norm_input.bias is not None and self.norm_input.bias.device != target_device:
+            self.norm_input.bias = nn.Parameter(self.norm_input.bias.to(target_device))
+            
         x = self.norm_input(x)
         x = self.classifier(x)
         return x
@@ -403,11 +444,12 @@ class LayerNormClassifier(nn.Module):
 # 添加类别平衡损失函数 - 新增
 class ClassBalancedLoss(nn.Module):
     """类别平衡损失函数，解决类别不平衡问题"""
-    def __init__(self, num_classes, beta=0.9999, samples_per_class=None):
+    def __init__(self, num_classes, beta=0.9999, samples_per_class=None, device=None):
         super(ClassBalancedLoss, self).__init__()
         self.num_classes = num_classes
         self.beta = beta
         self.samples_per_class = samples_per_class
+        self.device = device  # 添加设备参数
         
         # 如果提供了每个类别的样本数，计算类别权重
         if samples_per_class is not None:
@@ -415,12 +457,19 @@ class ClassBalancedLoss(nn.Module):
         else:
             # 默认所有类别权重相同
             self.weights = torch.ones(num_classes)
+            
+        # 将权重移至指定设备
+        if self.device is not None:
+            self.weights = self.weights.to(self.device)
         
         # 使用交叉熵损失作为基础损失函数
         self.criterion = nn.CrossEntropyLoss(reduction='none')
     
     def _compute_class_weights(self, samples_per_class):
         """计算类别权重"""
+        if self.device is not None:
+            samples_per_class = samples_per_class.to(self.device)
+            
         effective_num = 1.0 - torch.pow(self.beta, samples_per_class)
         weights = (1.0 - self.beta) / effective_num
         weights = weights / weights.sum() * self.num_classes
@@ -430,10 +479,15 @@ class ClassBalancedLoss(nn.Module):
         """更新每个类别的样本数并重新计算权重"""
         self.samples_per_class = samples_per_class
         self.weights = self._compute_class_weights(samples_per_class)
+        if self.device is not None:
+            self.weights = self.weights.to(self.device)
     
     def update_weights_from_predictions(self, predictions):
         """根据预测分布更新权重"""
         # 计算每个类别的预测频率
+        if self.device is not None:
+            predictions = predictions.to(self.device)
+            
         total_preds = torch.sum(predictions)
         class_freq = predictions / total_preds
         
@@ -449,12 +503,14 @@ class ClassBalancedLoss(nn.Module):
         # 基础交叉熵损失
         ce_loss = self.criterion(logits, targets)
 
-        # 将weights移到与logits相同的设备
-        weights = self.weights.to(logits.device)
-        target_weights = weights[targets]
+        # 确保权重在与目标相同的设备上
+        if self.weights.device != targets.device:
+            weights = self.weights.to(targets.device)
+        else:
+            weights = self.weights
         
         # 获取目标的权重
-        target_weights = self.weights[targets].to(logits.device)
+        target_weights = weights[targets]
         
         # 加权损失
         weighted_loss = ce_loss * target_weights
@@ -812,8 +868,10 @@ class UnifiedServerModel(nn.Module):
     """统一的服务器模型，处理所有tier客户端的特征"""
     def __init__(self, block, layers, num_classes=10, zero_init_residual=False, groups=1,
                  width_per_group=64, replace_stride_with_dilation=None, norm_layer=None, 
-                 groups_per_channel=32, **kwargs):
+                 groups_per_channel=32, device=None, **kwargs):
         super(UnifiedServerModel, self).__init__()
+        
+        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
         if norm_layer is None:
             # 使用GroupNorm替代BatchNorm
             norm_layer = lambda channels: nn.GroupNorm(
@@ -843,11 +901,21 @@ class UnifiedServerModel(nn.Module):
         # 特征适配层 - 将不同tier客户端输出的特征调整为对应层所需的尺寸和通道数
         # 为每个tier创建特征适配层 - 使用增强的特征转换器
         self.feature_adapters = nn.ModuleDict()
+        # 每个tier的预期通道数
+        tier_channels = {
+            1: 64 * block.expansion,  # 通常是256
+            2: 64 * block.expansion,  # 256
+            3: 32 * block.expansion,  # 128
+            4: 32 * block.expansion,  # 128
+            5: 16 * block.expansion,  # 64
+            6: 16 * block.expansion,  # 64
+            7: 16                     # 16
+        }
+
         for tier in range(1, 8):
-            # 特征预处理 - 使用自适应归一化
+            # 特征预处理 - 使用自适应归一化，显式指定通道数
             self.feature_adapters[f'process_{tier}'] = nn.Sequential(
-                # 仅使用自适应归一化，不传递mode参数
-                AdaptiveFeatureNormalization(eps=1e-5, affine=True)
+                AdaptiveFeatureNormalization(num_channels=tier_channels[tier], eps=1e-5, affine=True)
             )
             
         # 设置服务器模型每层的初始通道数
@@ -893,6 +961,9 @@ class UnifiedServerModel(nn.Module):
                     nn.init.constant_(m.gn3.weight, 0)
                 elif isinstance(m, BasicBlock):
                     nn.init.constant_(m.gn2.weight, 0)
+
+        # 将模型移动到指定设备
+        self.to(self.device)
     
     def _make_layer(self, block, planes, blocks, stride=1, dilate=False, groups_per_channel=32):
         norm_layer = self._norm_layer
@@ -1010,8 +1081,10 @@ class UnifiedServerModel(nn.Module):
 # 优化的全局分类器 - 类别平衡和监控
 class EnhancedGlobalClassifier(nn.Module):
     """增强的全局分类器，使用类别平衡机制和特征监控"""
-    def __init__(self, in_features, num_classes, hidden_dims=None, dropout_rate=0.3):
+    def __init__(self, in_features, num_classes, hidden_dims=None, dropout_rate=0.3, device=None):
         super(EnhancedGlobalClassifier, self).__init__()
+        
+        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
         
         if hidden_dims is None:
             hidden_dims = [128, 64]
@@ -1022,19 +1095,20 @@ class EnhancedGlobalClassifier(nn.Module):
             num_classes=num_classes,
             hidden_dims=hidden_dims,
             is_local=False,
-            dropout_rate=dropout_rate
-        )
+            dropout_rate=dropout_rate,
+            device=self.device
+        ).to(self.device)
         
         # 类别预测统计
-        self.register_buffer('class_predictions', torch.zeros(num_classes))
-        self.register_buffer('num_samples_processed', torch.tensor(0))
+        self.register_buffer('class_predictions', torch.zeros(num_classes, device=self.device))
+        self.register_buffer('num_samples_processed', torch.tensor(0, dtype=torch.long, device=self.device))
         
         # 特征统计
-        self.register_buffer('feature_mean', torch.zeros(in_features))
-        self.register_buffer('feature_var', torch.ones(in_features))
+        self.register_buffer('feature_mean', torch.zeros(in_features, device=self.device))
+        self.register_buffer('feature_var', torch.ones(in_features, device=self.device))
         
         # 类别平衡损失
-        self.class_balanced_loss = ClassBalancedLoss(num_classes)
+        self.class_balanced_loss = ClassBalancedLoss(num_classes, device=self.device)
         
         # 标志变量，指示是否使用类别平衡损失
         self.use_balanced_loss = True
@@ -1095,7 +1169,7 @@ class EnhancedGlobalClassifier(nn.Module):
 
 
 # 创建统一分类器函数 - 修改
-def create_unified_classifier(in_features, num_classes, is_global=True):
+def create_unified_classifier(in_features, num_classes, is_global=True, device=None):
     """
     创建统一设计的分类器
     
@@ -1103,16 +1177,20 @@ def create_unified_classifier(in_features, num_classes, is_global=True):
         in_features: 输入特征维度
         num_classes: 分类数
         is_global: 是否为全局分类器
+        device: 计算设备
         
     Returns:
         统一设计的分类器
     """
+    device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+    
     if is_global:
         return EnhancedGlobalClassifier(
             in_features=in_features,
             num_classes=num_classes,
             hidden_dims=[128, 64],
-            dropout_rate=0.3
+            dropout_rate=0.3,
+            device=device
         )
     else:
         return LayerNormClassifier(
@@ -1120,12 +1198,12 @@ def create_unified_classifier(in_features, num_classes, is_global=True):
             num_classes=num_classes,
             hidden_dims=[128, 64],
             is_local=True,
-            dropout_rate=0.5
+            dropout_rate=0.5,
+            device=device
         )
 
-
 # 创建统一服务器模型函数
-def create_unified_server_model(block, layers, num_classes=10, groups_per_channel=32):
+def create_unified_server_model(block, layers, num_classes=10, groups_per_channel=32, device=None):
     """
     创建统一的服务器模型
     
@@ -1134,24 +1212,29 @@ def create_unified_server_model(block, layers, num_classes=10, groups_per_channe
         layers: 每层的块数
         num_classes: 类别数
         groups_per_channel: GroupNorm的组数
+        device: 计算设备
         
     Returns:
         server_model: 统一的服务器模型
         global_classifier: 全局分类器
     """
+    device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+    
     # 创建统一服务器模型
     server_model = UnifiedServerModel(
         block=block, 
         layers=layers, 
         num_classes=num_classes, 
-        groups_per_channel=groups_per_channel
+        groups_per_channel=groups_per_channel,
+        device=device
     )
     
     # 创建全局分类器
     global_classifier = create_unified_classifier(
         in_features=64 * block.expansion,  # 通常是256
         num_classes=num_classes,
-        is_global=True
+        is_global=True,
+        device=device
     )
     
     return server_model, global_classifier
