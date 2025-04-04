@@ -30,7 +30,6 @@ class FeatureAlignmentLoss(nn.Module):
         """计算特征对齐损失，适应不同的特征维度"""
         # 确保特征是2D张量 (batch_size x feature_dim)
         if len(client_features.shape) > 2:
-            # 如果是卷积特征，先展平
             batch_size = client_features.size(0)
             client_features = client_features.view(batch_size, -1)
             
@@ -38,19 +37,13 @@ class FeatureAlignmentLoss(nn.Module):
             batch_size = server_features.size(0)
             server_features = server_features.view(batch_size, -1)
         
-        # 统一最后一维的大小 - 使用自适应池化
+        # 统一最后一维的大小 - 使用简单截断方法而非池化
         if client_features.size(1) != server_features.size(1):
-            # 使用1D自适应池化统一特征维度 (使用较小的维度)
             target_size = min(client_features.size(1), server_features.size(1))
             
-            # 对较大维度的特征进行下采样
-            if client_features.size(1) > target_size:
-                pool = nn.AdaptiveAvgPool1d(target_size)
-                client_features = pool(client_features.transpose(1, 2)).transpose(1, 2)
-            
-            if server_features.size(1) > target_size:
-                pool = nn.AdaptiveAvgPool1d(target_size)
-                server_features = pool(server_features.transpose(1, 2)).transpose(1, 2)
+            # 截断到相同维度
+            client_features = client_features[:, :target_size]
+            server_features = server_features[:, :target_size]
         
         # 规范化特征
         client_norm = F.normalize(client_features, dim=1)
@@ -118,6 +111,13 @@ class TierHFLClient:
         # 开始计时
         start_time = time.time()
         
+        # 记录详细训练指标
+        batch_times = []
+        epoch_losses = []
+        epoch_local_losses = []
+        epoch_global_losses = []
+        epoch_feature_losses = []
+        
         # 收集训练统计信息
         epoch_stats = {
             'total_loss': 0.0,
@@ -125,12 +125,15 @@ class TierHFLClient:
             'global_loss': 0.0,
             'feature_loss': 0.0,
             'correct': 0,
-            'total': 0
+            'total': 0,
+            'batch_count': 0
         }
         
         # 训练循环
         for epoch in range(self.local_epochs):
             for batch_idx, (data, target) in enumerate(self.train_data):
+                batch_start = time.time()
+                
                 # 将数据移到设备上
                 data, target = data.to(self.device), target.to(self.device)
                 
@@ -183,14 +186,24 @@ class TierHFLClient:
                 epoch_stats['local_loss'] += local_loss.item()
                 epoch_stats['global_loss'] += global_loss.item()
                 epoch_stats['feature_loss'] += feature_loss.item()
+                epoch_stats['batch_count'] += 1
                 
                 # 计算全局分类准确率
                 _, predicted = global_logits.max(1)
                 epoch_stats['total'] += target.size(0)
                 epoch_stats['correct'] += predicted.eq(target).sum().item()
+                
+                # 记录批次处理时间
+                batch_times.append(time.time() - batch_start)
+            
+            # 记录每个epoch的损失
+            epoch_losses.append(epoch_stats['total_loss'] / epoch_stats['batch_count'])
+            epoch_local_losses.append(epoch_stats['local_loss'] / epoch_stats['batch_count'])
+            epoch_global_losses.append(epoch_stats['global_loss'] / epoch_stats['batch_count'])
+            epoch_feature_losses.append(epoch_stats['feature_loss'] / epoch_stats['batch_count'])
         
         # 计算平均损失和准确率
-        num_batches = len(self.train_data)
+        num_batches = epoch_stats['batch_count']
         avg_loss = epoch_stats['total_loss'] / max(1, num_batches)
         avg_local_loss = epoch_stats['local_loss'] / max(1, num_batches)
         avg_global_loss = epoch_stats['global_loss'] / max(1, num_batches)
@@ -199,6 +212,7 @@ class TierHFLClient:
         
         # 记录训练时间
         training_time = time.time() - start_time
+        avg_batch_time = sum(batch_times) / max(1, len(batch_times))
         
         # 保存统计信息
         self.stats['train_loss'].append(avg_loss)
@@ -207,17 +221,20 @@ class TierHFLClient:
         self.stats['global_loss'].append(avg_global_loss)
         self.stats['feature_loss'].append(avg_feature_loss)
         
-        # 返回结果
+        # 返回更详细的结果
         return {
             'model_state': client_model.state_dict(),
             'avg_loss': avg_loss,
             'avg_local_loss': avg_local_loss,
             'avg_global_loss': avg_global_loss,
             'avg_feature_loss': avg_feature_loss,
+            'epoch_losses': epoch_losses,
             'accuracy': accuracy,
-            'training_time': training_time
+            'training_time': training_time,
+            'avg_batch_time': avg_batch_time,
+            'total_batches': num_batches
         }
-    
+        
     def evaluate(self, client_model, server_model):
         """客户端评估过程"""
         # 确保模型在正确的设备上

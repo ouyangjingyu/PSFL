@@ -78,28 +78,36 @@ class ClusterAwareParallelTrainer:
             device = self.device_map.get(cluster_id, self.default_device)
             self.logger.info(f"聚类 {cluster_id} 开始训练，设备: {device}")
             
+            # 计时 - 增加模型加载时间记录
+            model_load_start = time.time()
+            
             # 将服务器模型移到正确设备
-            # 使用深拷贝避免多线程冲突
             server_model = copy.deepcopy(self.server_model).to(device)
+            model_load_time = time.time() - model_load_start
             
             # 保存训练结果
             cluster_results = {}
             cluster_eval_results = {}
+            cluster_time_stats = {}  # 新增时间统计
             
             # 训练每个客户端
             for client_id in client_ids:
+                client_start_time = time.time()  # 客户端总时间开始
+                
                 # 获取客户端和模型
                 client = self.client_manager.get_client(client_id)
                 if client is None or client_id not in self.client_models:
                     self.logger.warning(f"客户端 {client_id} 不存在或没有模型，跳过")
                     continue
                 
-                # 获取客户端模型
+                # 计时 - 模型复制
+                copy_start_time = time.time()
                 try:
                     client_model = copy.deepcopy(self.client_models[client_id]).to(device)
                 except Exception as e:
                     self.logger.error(f"客户端 {client_id} 模型复制到设备 {device} 失败: {str(e)}")
                     continue
+                copy_time = time.time() - copy_start_time
                 
                 # 执行训练
                 try:
@@ -107,7 +115,10 @@ class ClusterAwareParallelTrainer:
                     cluster_results[client_id] = train_result
                     
                     # 更新客户端模型
+                    model_transfer_start = time.time()
                     self.client_models[client_id] = client_model.cpu()
+                    model_transfer_time = time.time() - model_transfer_start
+                    
                 except Exception as e:
                     self.logger.error(f"客户端 {client_id} 训练失败: {str(e)}")
                     import traceback
@@ -115,19 +126,33 @@ class ClusterAwareParallelTrainer:
                     continue
                 
                 # 执行评估
+                eval_start_time = time.time()
                 try:
                     eval_result = client.evaluate(client_model, server_model)
                     cluster_eval_results[client_id] = eval_result
                 except Exception as e:
                     self.logger.error(f"客户端 {client_id} 评估失败: {str(e)}")
                     continue
-            
+                eval_time = time.time() - eval_start_time
+                
+                # 记录时间开销
+                client_total_time = time.time() - client_start_time
+                cluster_time_stats[client_id] = {
+                    "copy_time": copy_time,
+                    "training_time": train_result.get('training_time', 0),
+                    "model_transfer_time": model_transfer_time,
+                    "evaluation_time": eval_time,
+                    "total_time": client_total_time
+                }
+                
             # 将聚类结果添加到队列
             results_queue.put({
                 'cluster_id': cluster_id,
                 'server_model': server_model.cpu().state_dict(),
                 'train_results': cluster_results,
-                'eval_results': cluster_eval_results
+                'eval_results': cluster_eval_results,
+                'time_stats': cluster_time_stats,  # 新增时间统计
+                'model_load_time': model_load_time  # 记录模型加载时间
             })
             
             self.logger.info(f"聚类 {cluster_id} 训练完成")
@@ -150,7 +175,7 @@ class ClusterAwareParallelTrainer:
         # 没有聚类映射时返回空结果
         if not self.cluster_map:
             self.logger.warning("没有设置聚类映射，无法执行训练")
-            return {}, {}, {}, 0
+            return {}, {}, {}, {}, 0  # 修改返回值，增加时间统计
         
         # 创建结果队列
         results_queue = queue.Queue()
@@ -187,6 +212,7 @@ class ClusterAwareParallelTrainer:
         train_results = {}
         eval_results = {}
         server_models = {}
+        time_stats = {}  # 新增时间统计收集
         
         while not results_queue.empty():
             result = results_queue.get()
@@ -207,12 +233,22 @@ class ClusterAwareParallelTrainer:
             # 合并评估结果
             for client_id, eval_result in result['eval_results'].items():
                 eval_results[client_id] = eval_result
+                
+            # 合并时间统计
+            if 'time_stats' in result:
+                for client_id, client_time in result['time_stats'].items():
+                    time_stats[client_id] = client_time
+                
+                # 添加模型加载时间
+                if 'model_load_time' in result:
+                    for client_id in result['time_stats'].keys():
+                        time_stats[client_id]['model_load_time'] = result['model_load_time']
         
         training_time = time.time() - start_time
         self.logger.info(f"并行训练完成，耗时: {training_time:.2f}秒")
         
-        return train_results, eval_results, server_models, training_time
-
+        return train_results, eval_results, server_models, time_stats, training_time  # 增加时间统计返回
+        
 # 自适应训练控制器 - 动态调整训练参数
 class AdaptiveTrainingController:
     def __init__(self, initial_alpha=0.5, initial_lambda=0.1):

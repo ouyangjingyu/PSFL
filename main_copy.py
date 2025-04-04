@@ -115,15 +115,26 @@ def setup_logging(args):
     )
     logger = logging.getLogger("TierHFL")
     
-    # 配置wandb
+    # 增强wandb配置
     try:
         wandb.init(
             mode="online",
             project="TierHFL",
             name=args.running_name,
             config=args,
-            tags=[f"model_{args.model}", f"dataset_{args.dataset}", f"clients_{args.client_number}"],
+            tags=[f"model_{args.model}", f"dataset_{args.dataset}", 
+                  f"clients_{args.client_number}", f"partition_{args.partition_method}"],
+            group=f"{args.model}_{args.dataset}"
         )
+        
+        # 设置自定义面板
+        wandb.define_metric("round")
+        wandb.define_metric("global/*", step_metric="round")
+        wandb.define_metric("local/*", step_metric="round")
+        wandb.define_metric("client/*", step_metric="round")
+        wandb.define_metric("time/*", step_metric="round")
+        wandb.define_metric("params/*", step_metric="round") 
+        
     except Exception as e:
         print(f"警告: wandb初始化失败: {e}")
         # 使用离线模式
@@ -216,6 +227,7 @@ def allocate_device_resources(client_number):
 class SimpleDataDistributionClusterer:
     def __init__(self, num_clusters=3):
         self.num_clusters = num_clusters
+        self.clustering_history = []  # 记录聚类历史
     
     def cluster_clients(self, client_models, client_ids, eval_dataset=None, device='cuda'):
         # 简单地根据client_id平均分配到各个聚类
@@ -227,8 +239,68 @@ class SimpleDataDistributionClusterer:
         for i, client_id in enumerate(client_ids):
             cluster_idx = i % self.num_clusters
             clusters[cluster_idx].append(client_id)
+
+        # 记录聚类结果
+        self.clustering_history.append({
+            'timestamp': time.time(),
+            'clusters': copy.deepcopy(clusters),
+            'num_clients': len(client_ids)
+        })
             
         return clusters
+
+    def get_clustering_statistics(self):
+        """获取聚类统计信息"""
+        stats = []
+        for i, cluster_record in enumerate(self.clustering_history):
+            clusters = cluster_record['clusters']
+            
+            # 计算聚类大小分布
+            cluster_sizes = [len(clients) for clients in clusters.values()]
+            avg_size = sum(cluster_sizes) / max(1, len(cluster_sizes))
+            min_size = min(cluster_sizes) if cluster_sizes else 0
+            max_size = max(cluster_sizes) if cluster_sizes else 0
+            
+            stats.append({
+                'iteration': i,
+                'num_clusters': len(clusters),
+                'num_clients': cluster_record['num_clients'],
+                'avg_cluster_size': avg_size,
+                'min_cluster_size': min_size,
+                'max_cluster_size': max_size,
+                'cluster_sizes': cluster_sizes
+            })
+        
+        return stats
+
+def print_cluster_info(cluster_map, client_resources, logger):
+    """打印聚类信息详情"""
+    logger.info("===== 聚类分布情况 =====")
+    for cluster_id, client_ids in cluster_map.items():
+        client_tiers = [client_resources[client_id]['tier'] for client_id in client_ids]
+        avg_tier = sum(client_tiers) / len(client_tiers) if client_tiers else 0
+        tier_distribution = {}
+        for tier in client_tiers:
+            tier_distribution[tier] = tier_distribution.get(tier, 0) + 1
+            
+        logger.info(f"聚类 {cluster_id}: {len(client_ids)}个客户端")
+        logger.info(f"  - 客户端ID: {client_ids}")
+        logger.info(f"  - 平均Tier: {avg_tier:.2f}")
+        logger.info(f"  - Tier分布: {tier_distribution}")
+        
+        # 计算客户端资源异质性
+        if client_ids:
+            compute_powers = [client_resources[cid]['compute_power'] for cid in client_ids]
+            network_speeds = [client_resources[cid]['network_speed'] for cid in client_ids]
+            
+            logger.info(f"  - 计算能力: 平均={sum(compute_powers)/len(compute_powers):.2f}, "
+                       f"最小={min(compute_powers):.2f}, 最大={max(compute_powers):.2f}")
+            logger.info(f"  - 网络速度: 平均={sum(network_speeds)/len(network_speeds):.2f}, "
+                       f"最小={min(network_speeds)}, 最大={max(network_speeds)}")
+    
+    # 计算全局聚类指标
+    all_clients = sum(len(clients) for clients in cluster_map.values())
+    logger.info(f"总计: {len(cluster_map)}个聚类, {all_clients}个客户端")
 
 # 主函数
 def main():
@@ -338,10 +410,13 @@ def main():
     
     # 添加forward方法
     def server_forward(self, x, tier=None):
-        features = self[0](x)
-        features = self[1](features)
-        logits = self[2](features)
-        return logits, features
+        # 更清晰的命名，反映维度变化
+        pooled_features = self[0](x)  # (batch_size, channels, 1, 1)
+        flattened_features = self[1](pooled_features)  # (batch_size, channels)
+        logits = self[2](flattened_features)  # (batch_size, class_num)
+        
+        # 明确返回展平后的2D特征
+        return logits, flattened_features
     
     server_model.forward = server_forward.__get__(server_model)
     server_model.num_classes = class_num
@@ -368,6 +443,9 @@ def main():
         client_models=client_models,
         client_ids=client_ids
     )
+
+    # 打印初始聚类信息
+    print_cluster_info(cluster_map, client_resources, logger)
     
     # 创建并行训练器
     logger.info("创建并行训练器...")
@@ -387,13 +465,33 @@ def main():
     # 开始训练循环
     logger.info(f"开始联邦学习训练 ({args.rounds} 轮)...")
     best_accuracy = 0.0
+
+    # 开始训练循环
+    logger.info(f"开始联邦学习训练 ({args.rounds} 轮)...")
+    best_accuracy = 0.0
+    
+    # 创建学习率追踪字典
+    lr_tracker = {client_id: args.lr for client_id in range(args.client_number)}
+    
+    # 记录每个客户端的性能历史
+    client_performance_history = {client_id: {"train_acc": [], "test_acc": [], "local_acc": [], "global_acc": []} 
+                                for client_id in range(args.client_number)}
+    
+    # 记录时间开销历史
+    time_history = {
+        "round_time": [],
+        "training_time": [],
+        "communication_time": [],
+        "aggregation_time": [],
+        "client_times": {client_id: [] for client_id in range(args.client_number)}
+    }
     
     for round_idx in range(args.rounds):
         round_start_time = time.time()
         logger.info(f"===== 轮次 {round_idx+1}/{args.rounds} =====")
         
         # 执行并行训练
-        train_results, eval_results, server_models, training_time = trainer.execute_parallel_training(round_idx)
+        train_results, eval_results, server_models, time_stats, training_time = trainer.execute_parallel_training(round_idx)
         
         # 防止空结果
         if not train_results or not eval_results:
@@ -402,6 +500,12 @@ def main():
         
         # 更新自适应控制器的历史记录
         controller.update_history(eval_results)
+
+        # 记录每个客户端的学习率
+        for client_id in range(args.client_number):
+            client = client_manager.get_client(client_id)
+            if client:
+                lr_tracker[client_id] = client.lr
         
         # 调整训练参数
         if round_idx > 0 and round_idx % 5 == 0:  # 每5轮调整一次
@@ -420,6 +524,7 @@ def main():
         
         # 聚合服务器模型
         logger.info("聚合服务器模型...")
+        aggregation_start_time = time.time()
         client_states = {client_id: result['model_state'] for client_id, result in train_results.items()}
         
         # 提取客户端tier信息
@@ -431,8 +536,10 @@ def main():
             client_weights=client_weights,
             client_clusters=cluster_map
         )
+        aggregation_time = time.time() - aggregation_start_time
         
         # 更新客户端模型的共享部分
+        comm_start_time = time.time()
         for client_id, model in client_models.items():
             # 保存个性化参数
             personalized_params = {}
@@ -459,6 +566,9 @@ def main():
         except Exception as e:
             logger.error(f"更新服务器模型失败: {str(e)}")
         
+        communication_time = time.time() - comm_start_time
+
+
         # 计算全局指标
         total_samples = 0
         weighted_acc = 0.0
@@ -479,6 +589,11 @@ def main():
                 for i, acc in enumerate(result['global_per_class_acc']):
                     class_accs[i] += acc * samples
                     class_counts[i] += samples
+            
+            # 更新客户端性能历史记录
+            client_performance_history[client_id]['test_acc'].append(result.get('test_loss', 0))
+            client_performance_history[client_id]['local_acc'].append(result.get('local_accuracy', 0))
+            client_performance_history[client_id]['global_acc'].append(result.get('global_accuracy', 0))
         
         # 计算平均值
         if total_samples > 0:
@@ -520,9 +635,17 @@ def main():
         if eval_results:
             avg_local_acc = sum(result.get('local_accuracy', 0) for result in eval_results.values()) / max(1, len(eval_results))
             avg_global_acc = sum(result.get('global_accuracy', 0) for result in eval_results.values()) / max(1, len(eval_results))
+            
+            # 计算每个客户端精度分布统计
+            client_acc_std = np.std([result.get('global_accuracy', 0) for result in eval_results.values()])
+            client_acc_min = min([result.get('global_accuracy', 0) for result in eval_results.values()])
+            client_acc_max = max([result.get('global_accuracy', 0) for result in eval_results.values()])
         else:
             avg_local_acc = 0.0
             avg_global_acc = 0.0
+            client_acc_std = 0.0
+            client_acc_min = 0.0
+            client_acc_max = 0.0
             
         # 计算平均特征对齐损失
         if train_results:
@@ -533,14 +656,25 @@ def main():
         # 计算轮次时间
         round_time = time.time() - round_start_time
         
+        # 更新时间历史记录
+        time_history["round_time"].append(round_time)
+        time_history["training_time"].append(training_time)
+        time_history["communication_time"].append(communication_time)
+        time_history["aggregation_time"].append(aggregation_time)
+        
+        for client_id, stats in time_stats.items():
+            if client_id in time_history["client_times"]:
+                time_history["client_times"][client_id].append(stats.get("total_time", 0))
+        
         # 输出统计信息
         logger.info(f"轮次 {round_idx+1} 统计:")
         logger.info(f"全局准确率: {global_acc:.2f}%, 最佳: {best_accuracy:.2f}%")
         logger.info(f"平均本地准确率: {avg_local_acc:.2f}%, 平均全局准确率: {avg_global_acc:.2f}%")
+        logger.info(f"客户端精度标准差: {client_acc_std:.2f}, 最低: {client_acc_min:.2f}%, 最高: {client_acc_max:.2f}%")
         logger.info(f"类别平衡度: {class_balance:.2f}")
         logger.info(f"特征对齐损失: {avg_feature_loss:.4f}")
         logger.info(f"alpha: {controller.alpha:.3f}, lambda_feature: {controller.lambda_feature:.3f}")
-        logger.info(f"耗时: {round_time:.2f}秒")
+        logger.info(f"轮次总时间: {round_time:.2f}秒, 训练: {training_time:.2f}秒, 通信: {communication_time:.2f}秒, 聚合: {aggregation_time:.2f}秒")
         
         # 记录到wandb
         try:
@@ -557,6 +691,9 @@ def main():
                 # 客户端性能
                 "local/accuracy": avg_local_acc,
                 "global/accuracy": avg_global_acc,
+                "global/accuracy_std": client_acc_std,
+                "global/accuracy_min": client_acc_min,
+                "global/accuracy_max": client_acc_max,
                 "feature/alignment": avg_feature_loss,
                 
                 # 训练参数
@@ -565,13 +702,53 @@ def main():
                 
                 # 时间统计
                 "time/round_seconds": round_time,
-                "time/training_seconds": training_time
+                "time/training_seconds": training_time,
+                "time/communication_seconds": communication_time,
+                "time/aggregation_seconds": aggregation_time,
             }
             
             # 记录每个类别的准确率
             for i, acc in enumerate(class_accs):
                 metrics[f"global/class_{i}_accuracy"] = acc
             
+            # 记录每个客户端的学习率和精度
+            for client_id in range(args.client_number):
+                if client_id in eval_results:
+                    metrics[f"client/{client_id}/global_accuracy"] = eval_results[client_id].get('global_accuracy', 0)
+                    metrics[f"client/{client_id}/local_accuracy"] = eval_results[client_id].get('local_accuracy', 0)
+                    metrics[f"client/{client_id}/test_loss"] = eval_results[client_id].get('test_loss', 0)
+                
+                # 记录学习率
+                metrics[f"client/{client_id}/learning_rate"] = lr_tracker.get(client_id, args.lr)
+                
+                # 记录时间开销
+                if client_id in time_stats:
+                    metrics[f"client/{client_id}/training_time"] = time_stats[client_id].get("training_time", 0)
+                    metrics[f"client/{client_id}/total_time"] = time_stats[client_id].get("total_time", 0)
+                    metrics[f"client/{client_id}/copy_time"] = time_stats[client_id].get("copy_time", 0)
+                    metrics[f"client/{client_id}/evaluation_time"] = time_stats[client_id].get("evaluation_time", 0)
+            
+            # 聚类情况
+            cluster_stats = {
+                f"cluster/{cluster_id}/size": len(clients) 
+                for cluster_id, clients in cluster_map.items()
+            }
+            metrics.update(cluster_stats)
+
+            # 计算聚类异质性指标
+            total_clients = sum(len(clients) for clients in cluster_map.values())
+            cluster_size_std = np.std([len(clients) for clients in cluster_map.values()])
+            metrics["cluster/size_std"] = cluster_size_std
+            metrics["cluster/count"] = len(cluster_map)
+
+            # 计算聚类内客户端Tier异质性
+            for cluster_id, clients in cluster_map.items():
+                if clients:
+                    client_tiers = [client_resources[cid]['tier'] for cid in clients]
+                    tier_std = np.std(client_tiers)
+                    metrics[f"cluster/{cluster_id}/tier_std"] = tier_std
+                    metrics[f"cluster/{cluster_id}/avg_tier"] = sum(client_tiers) / len(client_tiers)
+
             wandb.log(metrics)
         except Exception as e:
             logger.error(f"记录wandb指标失败: {str(e)}")
@@ -585,14 +762,59 @@ def main():
                     client_ids=client_ids
                 )
                 trainer.setup_training(cluster_map=cluster_map)
+                # 打印重新聚类信息
+                print_cluster_info(cluster_map, client_resources, logger)
             except Exception as e:
                 logger.error(f"重新聚类失败: {str(e)}")
     
-    # 训练完成
+    # 训练完成 - 记录最终性能总结
     logger.info(f"TierHFL训练完成! 最佳准确率: {best_accuracy:.2f}%")
-    
-    # 关闭wandb
+
+    # 记录聚类历史统计
     try:
+        clustering_stats = clusterer.get_clustering_statistics()
+        for i, stats in enumerate(clustering_stats):
+            logger.info(f"聚类迭代 {i}: {stats['num_clusters']}个聚类, " 
+                    f"平均大小={stats['avg_cluster_size']:.2f}, "
+                    f"大小分布={stats['cluster_sizes']}")
+            
+        # 添加到wandb摘要
+        if len(clustering_stats) > 0:
+            final_stats = clustering_stats[-1]
+            wandb.run.summary.update({
+                "final_num_clusters": final_stats['num_clusters'],
+                "final_avg_cluster_size": final_stats['avg_cluster_size'],
+                "final_cluster_size_std": np.std(final_stats['cluster_sizes']) if final_stats['cluster_sizes'] else 0
+            })
+    except Exception as e:
+        logger.error(f"记录聚类统计信息失败: {str(e)}")
+    
+    # 输出时间统计摘要
+    avg_round_time = sum(time_history["round_time"]) / max(1, len(time_history["round_time"]))
+    avg_training_time = sum(time_history["training_time"]) / max(1, len(time_history["training_time"]))
+    avg_comm_time = sum(time_history["communication_time"]) / max(1, len(time_history["communication_time"]))
+    avg_agg_time = sum(time_history["aggregation_time"]) / max(1, len(time_history["aggregation_time"]))
+    
+    logger.info(f"平均轮次时间: {avg_round_time:.2f}秒")
+    logger.info(f"平均训练时间: {avg_training_time:.2f}秒 ({100*avg_training_time/avg_round_time:.1f}%)")
+    logger.info(f"平均通信时间: {avg_comm_time:.2f}秒 ({100*avg_comm_time/avg_round_time:.1f}%)")
+    logger.info(f"平均聚合时间: {avg_agg_time:.2f}秒 ({100*avg_agg_time/avg_round_time:.1f}%)")
+    
+    try:
+        # 记录最终性能数据
+        wandb.run.summary.update({
+            "best_accuracy": best_accuracy,
+            "final_global_accuracy": global_acc,
+            "final_local_accuracy": avg_local_acc,
+            "final_class_balance": class_balance,
+            "avg_round_time": avg_round_time,
+            "avg_training_time": avg_training_time,
+            "avg_communication_time": avg_comm_time,
+            "avg_aggregation_time": avg_agg_time,
+            "total_rounds": args.rounds
+        })
+        
+        # 关闭wandb
         wandb.finish()
     except:
         pass
