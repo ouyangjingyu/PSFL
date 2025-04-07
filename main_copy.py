@@ -47,7 +47,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.getcwd(), "../")))
 from model.resnet import create_tierhfl_client_model, create_tierhfl_server_model,LayerNormCNN
 from utils.tierhfl_aggregator import StabilizedAggregator
 from utils.tierhfl_client import TierHFLClientManager
-from utils.tierhfl_trainer import ClusterAwareParallelTrainer, AdaptiveTrainingController, DataDistributionClusterer
+from utils.tierhfl_trainer import ClusterAwareParallelTrainer, AdaptiveTrainingController, ModelFeatureClusterer
+
 
 # 导入数据加载和处理模块
 from api.data_preprocessing.cifar10.data_loader import load_partition_data_cifar10
@@ -97,7 +98,7 @@ def parse_arguments():
     # TierHFL特有参数
     parser.add_argument('--init_alpha', default=0.3, type=float, help='初始本地与全局损失平衡因子')
     parser.add_argument('--init_lambda', default=0.3, type=float, help='初始特征对齐损失权重')
-    parser.add_argument('--beta', default=0.8, type=float, help='聚合动量因子')
+    parser.add_argument('--beta', default=0.5, type=float, help='聚合动量因子')
     
     args = parser.parse_args()
     return args
@@ -222,32 +223,6 @@ def allocate_device_resources(client_number):
         }
     
     return resources
-
-# 简化的数据分布聚类器
-class SimpleDataDistributionClusterer:
-    def __init__(self, num_clusters=3):
-        self.num_clusters = num_clusters
-        self.clustering_history = []  # 记录聚类历史
-    
-    def cluster_clients(self, client_models, client_ids, eval_dataset=None, device='cuda'):
-        # 简单地根据client_id平均分配到各个聚类
-        clusters = {}
-        for i in range(self.num_clusters):
-            clusters[i] = []
-            
-        # 平均分配
-        for i, client_id in enumerate(client_ids):
-            cluster_idx = i % self.num_clusters
-            clusters[cluster_idx].append(client_id)
-
-        # 记录聚类结果
-        self.clustering_history.append({
-            'timestamp': time.time(),
-            'clusters': copy.deepcopy(clusters),
-            'num_clients': len(client_ids)
-        })
-            
-        return clusters
 
     def get_clustering_statistics(self):
         """获取聚类统计信息"""
@@ -450,11 +425,11 @@ def main():
     
     # 创建稳定化聚合器
     logger.info("创建稳定化聚合器...")
-    aggregator = StabilizedAggregator(beta=args.beta, device=device)
+    aggregator = StabilizedAggregator(beta=0.5, device=device)
     
     # 创建客户端聚类器
     logger.info("创建数据分布聚类器...")
-    clusterer = SimpleDataDistributionClusterer(num_clusters=args.n_clusters)
+    clusterer = ModelFeatureClusterer(num_clusters=args.n_clusters)
     
     # 创建自适应训练控制器
     logger.info("创建自适应训练控制器...")
@@ -516,6 +491,10 @@ def main():
     for round_idx in range(args.rounds):
         round_start_time = time.time()
         logger.info(f"===== 轮次 {round_idx+1}/{args.rounds} =====")
+
+        # 在主循环中初始化prev_global_acc
+        if round_idx == 0:
+            prev_global_acc = 0.0
         
         # 执行并行训练
         train_results, eval_results, server_models, time_stats, training_time = trainer.execute_parallel_training(round_idx)
@@ -643,6 +622,12 @@ def main():
             global_loss = 0.0
             class_balance = float('inf')
         
+
+        if round_idx > 0:
+            aggregator.adjust_beta(round_idx, global_acc, prev_global_acc)
+            logger.info(f"动态调整beta值: {aggregator.beta:.3f}")
+
+        prev_global_acc = global_acc  # 更新prev_global_acc为当前轮次的global_acc
         # 更新最佳准确率
         is_best = global_acc > best_accuracy
         if is_best:

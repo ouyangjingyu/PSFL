@@ -466,3 +466,74 @@ class DataDistributionClusterer:
         })
         
         return clusters
+        
+class ModelFeatureClusterer:
+    def __init__(self, num_clusters=3):
+        self.num_clusters = num_clusters
+        self.clustering_history = []
+    
+    def cluster_clients(self, client_models, client_ids, eval_dataset=None, device='cuda'):
+        """基于模型特征的聚类方法"""
+        clusters = {i: [] for i in range(self.num_clusters)}
+        
+        # 提取模型特征
+        client_features = {}
+        for client_id in client_ids:
+            if client_id in client_models:
+                model = client_models[client_id]
+                features = []
+                
+                # 只提取卷积层和归一化层统计特征
+                for name, param in model.named_parameters():
+                    if ('conv' in name or 'norm' in name) and 'weight' in name:
+                        # 提取统计信息而非原始参数
+                        param_data = param.detach().cpu()
+                        features.extend([
+                            param_data.mean().item(),
+                            param_data.std().item(),
+                            param_data.abs().max().item(),
+                            (param_data > 0).float().mean().item()  # 正值比例
+                        ])
+                
+                if features:
+                    client_features[client_id] = np.array(features)
+        
+        # 尝试K-means聚类
+        if len(client_features) >= self.num_clusters:
+            try:
+                from sklearn.cluster import KMeans
+                features_matrix = np.array(list(client_features.values()))
+                kmeans = KMeans(n_clusters=self.num_clusters, random_state=42).fit(features_matrix)
+                
+                # 构建聚类映射
+                feature_client_ids = list(client_features.keys())
+                for i, label in enumerate(kmeans.labels_):
+                    client_id = feature_client_ids[i]
+                    clusters[label].append(client_id)
+                
+                # 处理没有特征的客户端
+                for client_id in client_ids:
+                    if client_id not in client_features:
+                        # 分配到最小聚类
+                        min_cluster = min(clusters.items(), key=lambda x: len(x[1]))[0]
+                        clusters[min_cluster].append(client_id)
+            except Exception as e:
+                print(f"K-means聚类失败: {str(e)}，使用备选方案")
+                # 回退到均匀分配
+                for i, client_id in enumerate(client_ids):
+                    cluster_idx = i % self.num_clusters
+                    clusters[cluster_idx].append(client_id)
+        else:
+            # 备选方案：均匀分配
+            for i, client_id in enumerate(client_ids):
+                cluster_idx = i % self.num_clusters
+                clusters[cluster_idx].append(client_id)
+        
+        # 记录聚类结果
+        self.clustering_history.append({
+            'timestamp': time.time(),
+            'clusters': copy.deepcopy(clusters),
+            'num_clients': len(client_ids)
+        })
+            
+        return clusters

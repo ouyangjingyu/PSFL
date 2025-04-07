@@ -12,9 +12,17 @@ class StabilizedAggregator:
         self.cluster_weights = None  # 聚类权重
     
      # 添加自适应动量方法
-    def adjust_beta(self, round_idx):
-        """随着训练轮次逐渐降低动量因子"""
-        self.beta = max(0.1, self.beta * 0.95)  # 每轮减少5%，但不低于0.1
+    def adjust_beta(self, round_idx, global_acc, prev_global_acc):
+        """基于训练进度和性能动态调整动量因子"""
+        # 前期使用较小beta促进充分探索
+        if round_idx < 15:
+            self.beta = max(0.3, 0.8 - round_idx * 0.03)
+        # 性能停滞时降低beta增加新信息
+        elif global_acc - prev_global_acc < 0.2:
+            self.beta = max(0.2, self.beta * 0.9)
+        # 性能增长明显时可适度增加beta提高稳定性
+        elif global_acc - prev_global_acc > 1.0:
+            self.beta = min(0.7, self.beta * 1.05)
     def set_cluster_weights(self, weights):
         """设置聚类权重"""
         self.cluster_weights = weights

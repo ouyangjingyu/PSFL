@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import time
 import copy
 import numpy as np
+import math
 
 # 混合损失 - 平衡个性化和全局性能
 class HybridLoss(nn.Module):
@@ -21,24 +22,21 @@ class HybridLoss(nn.Module):
         """更新平衡因子"""
         self.alpha = alpha
 
-# 修复后的特征对齐损失 - 处理不同维度的特征
-# 在utils/tierhfl_client.py中约第49行
-class FeatureAlignmentLoss(nn.Module):
+# 特征对齐损失 - 处理不同维度的特征
+class EnhancedFeatureAlignmentLoss(nn.Module):
     def __init__(self):
-        super(FeatureAlignmentLoss, self).__init__()
+        super(EnhancedFeatureAlignmentLoss, self).__init__()
         
-    def forward(self, client_features, server_features):
-        """计算特征对齐损失，使用自适应池化统一尺寸"""
+    def forward(self, client_features, server_features, round_idx=0):
+        """改进的特征对齐损失计算"""
         # 确保特征是4D或2D张量
         if len(client_features.shape) == 4:  # 4D: [B, C, H, W]
             batch_size = client_features.size(0)
-            # 应用全局平均池化得到每个通道的表示
             client_pooled = F.adaptive_avg_pool2d(client_features, (1, 1))
             client_features = client_pooled.view(batch_size, -1)
             
         if len(server_features.shape) == 4:  # 4D: [B, C, H, W]
             batch_size = server_features.size(0)
-            # 应用全局平均池化得到每个通道的表示
             server_pooled = F.adaptive_avg_pool2d(server_features, (1, 1))
             server_features = server_pooled.view(batch_size, -1)
         
@@ -46,26 +44,25 @@ class FeatureAlignmentLoss(nn.Module):
         if client_features.size(1) != server_features.size(1):
             target_dim = min(client_features.size(1), server_features.size(1))
             
-            # 使用线性投影到相同维度
             if client_features.size(1) > target_dim:
                 client_features = client_features[:, :target_dim]
             
             if server_features.size(1) > target_dim:
                 server_features = server_features[:, :target_dim]
-        
-        # 计算特征之间的余弦相似度
+                
+        # 标准化特征向量
         client_norm = F.normalize(client_features, dim=1)
         server_norm = F.normalize(server_features, dim=1)
         
-        # 余弦相似度损失
+        # 余弦相似度
         cosine_sim = torch.mean(torch.sum(client_norm * server_norm, dim=1))
         cosine_loss = 1.0 - cosine_sim
         
-        # 均方误差损失
-        mse_loss = F.mse_loss(client_features, server_features)
+        # 随训练轮次渐进增强特征对齐强度
+        alignment_weight = min(0.8, 0.2 + round_idx/100)
         
-        # 结合多种损失
-        return 0.7 * cosine_loss + 0.3 * mse_loss
+        return cosine_loss * alignment_weight
+
 
 # 增强型客户端 - 支持分层模型和双重学习目标
 class TierHFLClient:
@@ -85,7 +82,7 @@ class TierHFLClient:
         
         # 创建损失函数
         self.hybrid_loss = HybridLoss(self.alpha)
-        self.feature_alignment_loss = FeatureAlignmentLoss()
+        self.feature_alignment_loss = EnhancedFeatureAlignmentLoss()
         
         # 训练统计信息
         self.stats = {
@@ -113,24 +110,39 @@ class TierHFLClient:
         client_model.train()
         server_model.train()
         
-        # 创建优化器 - 区分个性化参数和共享参数
+        # 自适应平衡因子调整 - 在方法开始添加
+        base_alpha = 0.5
+        if round_idx < 10:
+            # 初始阶段强调个性化学习
+            self.update_alpha(min(0.7, base_alpha + 0.2))
+        else:
+            # 根据性能差距动态调整
+            local_global_gap = 0
+            if len(self.stats['train_acc']) > 0 and len(self.stats['global_loss']) > 0:
+                local_global_gap = self.stats['train_acc'][-1] - self.stats.get('global_acc', [0])[-1]
+                
+            if local_global_gap > 10:
+                self.update_alpha(max(0.3, base_alpha - 0.1))
+            elif local_global_gap < -5:
+                self.update_alpha(min(0.7, base_alpha + 0.1))
+            else:
+                self.update_alpha(base_alpha)
+        
+        # 混合优化器与差异化学习率 - 替换现有优化器创建代码
         if hasattr(client_model, 'get_shared_params') and hasattr(client_model, 'get_personalized_params'):
             shared_params = list(client_model.get_shared_params().values())
             personalized_params = list(client_model.get_personalized_params().values())
             
-            # 使用不同学习率和权重衰减
-            # optimizer = torch.optim.Adam([
-            #     {'params': shared_params, 'lr': self.lr, 'weight_decay': 1e-4},  # 添加权重衰减
-            #     {'params': personalized_params, 'lr': self.lr * 1.5, 'weight_decay': 5e-4}  # 个性化参数使用更高权重衰减
-            # ])
-            # 使用不同学习率 - 反转权重，提升共享参数学习率
-            optimizer = torch.optim.Adam([
-                {'params': shared_params, 'lr': self.lr * 1.2},  # 提高共享参数学习率
-                {'params': personalized_params, 'lr': self.lr}   # 降低个性化参数学习率
-            ])
+            # 共享参数使用Adam，个性化参数使用SGD+动量
+            optimizer_shared = torch.optim.Adam(shared_params, lr=self.lr)
+            optimizer_personal = torch.optim.SGD(personalized_params, 
+                                            lr=self.lr * 1.5,
+                                            momentum=0.9,
+                                            weight_decay=1e-4)
         else:
-            # 后备方案，使用所有参数
-            optimizer = torch.optim.Adam(client_model.parameters(), lr=self.lr)
+            # 后备方案
+            optimizer_shared = torch.optim.Adam(client_model.parameters(), lr=self.lr)
+            optimizer_personal = None
         
         # 开始计时
         start_time = time.time()
@@ -167,7 +179,9 @@ class TierHFLClient:
                 data, target = data.to(self.device), target.to(self.device)
                 
                 # 清除梯度
-                optimizer.zero_grad()
+                optimizer_shared.zero_grad()
+                if optimizer_personal:
+                    optimizer_personal.zero_grad()
                 
                 # 客户端前向传播
                 local_logits, features = client_model(data)
@@ -211,7 +225,9 @@ class TierHFLClient:
                 torch.nn.utils.clip_grad_norm_(client_model.parameters(), max_norm=1.0)
                 
                 # 更新参数
-                optimizer.step()
+                optimizer_shared.step()
+                if optimizer_personal:
+                    optimizer_personal.step()
                 
                 # 更新统计信息
                 epoch_stats['total_loss'] += total_loss.item()
