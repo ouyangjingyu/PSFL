@@ -44,7 +44,7 @@ warnings.filterwarnings("ignore")
 sys.path.insert(0, os.path.abspath(os.path.join(os.getcwd(), "../")))
 
 # 导入自定义模块
-from model.resnet import create_tierhfl_client_model, create_tierhfl_server_model
+from model.resnet import create_tierhfl_client_model, create_tierhfl_server_model,LayerNormCNN
 from utils.tierhfl_aggregator import StabilizedAggregator
 from utils.tierhfl_client import TierHFLClientManager
 from utils.tierhfl_trainer import ClusterAwareParallelTrainer, AdaptiveTrainingController, DataDistributionClusterer
@@ -95,8 +95,8 @@ def parse_arguments():
     parser.add_argument('--max_workers', default=None, type=int, help='最大并行工作线程数')
     
     # TierHFL特有参数
-    parser.add_argument('--init_alpha', default=0.5, type=float, help='初始本地与全局损失平衡因子')
-    parser.add_argument('--init_lambda', default=0.1, type=float, help='初始特征对齐损失权重')
+    parser.add_argument('--init_alpha', default=0.3, type=float, help='初始本地与全局损失平衡因子')
+    parser.add_argument('--init_lambda', default=0.3, type=float, help='初始特征对齐损失权重')
     parser.add_argument('--beta', default=0.8, type=float, help='聚合动量因子')
     
     args = parser.parse_args()
@@ -302,6 +302,29 @@ def print_cluster_info(cluster_map, client_resources, logger):
     all_clients = sum(len(clients) for clients in cluster_map.values())
     logger.info(f"总计: {len(cluster_map)}个聚类, {all_clients}个客户端")
 
+def create_server_model():
+    # 获取客户端模型的输出特征维度
+    feature_dim = 32  
+    class_num = 10  # 假设类别数为10
+    
+    server_model = nn.Sequential(
+        nn.AdaptiveAvgPool2d((1, 1)),
+        nn.Flatten(),
+        nn.Linear(feature_dim, class_num)
+    )
+    
+    # 添加forward方法
+    def server_forward(self, x, tier=None):
+        pooled_features = self[0](x)      # 池化操作
+        flattened_features = self[1](pooled_features)  # 展平
+        logits = self[2](flattened_features)  # 分类
+        return logits, flattened_features
+    
+    server_model.forward = server_forward.__get__(server_model)
+    server_model.num_classes = class_num
+    
+    return server_model
+
 # 主函数
 def main():
     # 解析命令行参数
@@ -365,23 +388,31 @@ def main():
         tier = resource["tier"]
         # 简单起见，为每个客户端创建一个简单的ResNet模型
         model = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(16),
+            nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1),  # 增加通道数
+            LayerNormCNN(32),  # 使用一致的LayerNormCNN
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),  # 添加额外卷积层
+            LayerNormCNN(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),  # 添加池化层
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),  # 添加额外卷积层
+            LayerNormCNN(128),
             nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
-            nn.Linear(16, class_num)
+            nn.Dropout(0.3),  # 添加Dropout减少过拟合
+            nn.Linear(128, class_num)
         )
         
         # 为每个tier添加get_shared_params和get_personalized_params方法
         def get_shared_params(self):
             return {name: param for name, param in self.named_parameters() 
-                   if not any(x in name for x in ['4', 'fc', 'linear', 'classifier'])}
+                if not any(x in name for x in ['12', '13', 'fc', 'linear', 'classifier'])}
             
         def get_personalized_params(self):
             return {name: param for name, param in self.named_parameters() 
-                   if any(x in name for x in ['4', 'fc', 'linear', 'classifier'])}
-            
+                if any(x in name for x in ['12', '13', 'fc', 'linear', 'classifier'])}
+                    
         # 添加forward方法来返回logits和特征
         def forward(self, x):
             for i in range(3):  # 直到BatchNorm2d
@@ -402,11 +433,7 @@ def main():
     logger.info("创建服务器模型...")
     
     # 简单的服务器模型
-    server_model = nn.Sequential(
-        nn.AdaptiveAvgPool2d((1, 1)),
-        nn.Flatten(),
-        nn.Linear(16, class_num)
-    )
+    server_model = create_server_model()
     
     # 添加forward方法
     def server_forward(self, x, tier=None):
@@ -508,7 +535,7 @@ def main():
                 lr_tracker[client_id] = client.lr
         
         # 调整训练参数
-        if round_idx > 0 and round_idx % 5 == 0:  # 每5轮调整一次
+        if round_idx > 0 and round_idx % 2 == 0:  # 每2轮调整一次
             params = controller.adjust_parameters()
             logger.info(f"调整训练参数: alpha={params['alpha']:.3f}, lambda_feature={params['lambda_feature']:.3f}")
             
@@ -766,6 +793,38 @@ def main():
                 print_cluster_info(cluster_map, client_resources, logger)
             except Exception as e:
                 logger.error(f"重新聚类失败: {str(e)}")
+
+        # 每10轮更新学习率
+        if round_idx > 0 and round_idx % 10 == 0:  # 每10轮衰减一次学习率
+            logger.info("更新客户端学习率...")
+            for client_id in range(args.client_number):
+                client = client_manager.get_client(client_id)
+                if client:
+                    updated = client.update_learning_rate(round_idx, args.lr_factor)
+                    if updated:
+                        lr_tracker[client_id] = client.lr
+                        logger.info(f"客户端 {client_id} 学习率更新为: {client.lr:.6f}")
+
+        # 在主循环中实现周期性模型扰动
+        if round_idx > 0 and round_idx % 15 == 0:  # 每15轮执行一次
+            logger.info("执行周期性模型扰动，避免过早收敛...")
+            
+            # 对全局模型参数添加小的随机扰动
+            with torch.no_grad():
+                for param in server_model.parameters():
+                    # 添加小比例的高斯噪声
+                    noise = torch.randn_like(param) * 0.01 * param.std()
+                    param.add_(noise)
+            
+            # 降低聚合动量因子以允许更大变化
+            aggregator.beta = max(0.1, aggregator.beta * 0.7)
+            
+            # 临时提高特征对齐权重
+            old_lambda = controller.lambda_feature
+            controller.lambda_feature = min(0.8, controller.lambda_feature * 1.5)
+            client_manager.update_all_clients_feature_lambda(controller.lambda_feature)
+            
+            logger.info(f"模型扰动完成: beta={aggregator.beta:.3f}, lambda_feature={controller.lambda_feature:.3f}")
     
     # 训练完成 - 记录最终性能总结
     logger.info(f"TierHFL训练完成! 最佳准确率: {best_accuracy:.2f}%")

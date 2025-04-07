@@ -292,40 +292,74 @@ class AdaptiveTrainingController:
                 self.history['global_imbalance'].append(sum(valid_imbalances) / len(valid_imbalances))
     
     def adjust_parameters(self):
-        """调整训练参数"""
-        if len(self.history['local_accuracy']) < 2:
+        """调整训练参数，更加动态的策略"""
+        if len(self.history['local_accuracy']) < 3:
             return {'alpha': self.alpha, 'lambda_feature': self.lambda_feature}
         
-        # 获取最近两轮的性能指标
-        recent_local_acc = self.history['local_accuracy'][-2:]
-        recent_global_acc = self.history['global_accuracy'][-2:]
+        # 获取最近几轮的性能指标
+        window_size = min(5, len(self.history['local_accuracy']))
+        recent_local_acc = self.history['local_accuracy'][-window_size:]
+        recent_global_acc = self.history['global_accuracy'][-window_size:]
         
         # 计算趋势
-        local_trend = recent_local_acc[1] - recent_local_acc[0]
-        global_trend = recent_global_acc[1] - recent_global_acc[0]
+        local_trend = recent_local_acc[-1] - recent_local_acc[-3]
+        global_trend = recent_global_acc[-1] - recent_global_acc[-3]
         
-        # 是否有不平衡度记录
-        if len(self.history['global_imbalance']) >= 2:
-            recent_imbalance = self.history['global_imbalance'][-2:]
-            imbalance_trend = recent_imbalance[1] - recent_imbalance[0]
+        # 当前性能
+        current_local_acc = recent_local_acc[-1]
+        current_global_acc = recent_global_acc[-1]
+        
+        # 计算不平衡度趋势
+        if len(self.history['global_imbalance']) >= 3:
+            recent_imbalance = self.history['global_imbalance'][-3:]
+            imbalance_trend = recent_imbalance[-1] - recent_imbalance[0]
         else:
             imbalance_trend = 0
         
-        # 调整alpha - 个性化与全局平衡
-        if global_trend < -1.0 and local_trend > 0:
-            # 全局性能下降但本地性能上升，增加个性化权重
-            self.alpha = min(0.8, self.alpha + 0.05)
-        elif global_trend > 1.0 and local_trend < 0:
-            # 全局性能上升但本地性能下降，增加全局权重
-            self.alpha = max(0.2, self.alpha - 0.05)
+        # 新策略：根据性能差距和趋势调整alpha
+        acc_gap = current_local_acc - current_global_acc
         
-        # 调整lambda_feature - 特征对齐
-        if imbalance_trend > 0.5:
-            # 不平衡度增加，增强特征对齐
-            self.lambda_feature = min(0.5, self.lambda_feature + 0.05)
-        elif global_trend > 1.0 and imbalance_trend < 0:
-            # 全局性能上升且不平衡度下降，适当减弱特征对齐
-            self.lambda_feature = max(0.05, self.lambda_feature - 0.02)
+        # # 调整alpha - 个性化与全局平衡
+        # if acc_gap > 5.0:
+        #     # 本地模型明显更好，增加个性化权重
+        #     self.alpha = min(0.9, self.alpha + 0.1)
+        # elif acc_gap < -5.0:
+        #     # 全局模型明显更好，增加全局权重
+        #     self.alpha = max(0.1, self.alpha - 0.1)
+        # elif global_trend < -1.0 and local_trend > 0:
+        #     # 全局性能下降但本地性能上升，适当增加个性化权重
+        #     self.alpha = min(0.6, self.alpha + 0.03)
+        # elif global_trend > 0.5 and local_trend < 0:
+        #     # 全局性能上升但本地性能下降，适当增加全局权重
+        #     self.alpha = max(0.2, self.alpha - 0.05)
+
+        # # 调整lambda_feature - 特征对齐
+        # if imbalance_trend > 0.5 or current_global_acc < 40:
+        #     # 不平衡度增加或全局性能差，更强力增强特征对齐
+        #     self.lambda_feature = min(0.5, self.lambda_feature + 0.1)
+        # elif global_trend < -1.0:
+        #     # 全局性能下降，增强特征对齐
+        #     self.lambda_feature = min(0.5, self.lambda_feature + 0.05)
+        # elif global_trend > 1.0 and imbalance_trend < 0:
+        #     # 全局性能上升且不平衡度下降，适当减弱特征对齐
+        #     self.lambda_feature = max(0.05, self.lambda_feature - 0.03)
+
+        # 调整alpha - 个性化与全局平衡，更加倾向全局性能
+        if global_trend < -1.0 and local_trend > 0:
+            # 全局性能下降但本地性能上升，适度增加个性化权重
+            self.alpha = min(0.6, self.alpha + 0.03)  # 限制最大值并减小增量
+        elif global_trend > 0.5 or (global_trend > 0 and local_trend < 0):
+            # 更积极地降低alpha以促进全局学习
+            self.alpha = max(0.1, self.alpha - 0.05)
+
+        # 增强特征对齐的调整
+        if global_trend < 0 or imbalance_trend > 0.2:
+            # 当全局性能下降或不平衡度增加时，增强特征对齐
+            self.lambda_feature = min(0.8, self.lambda_feature + 0.1)
+        elif global_trend > 2.0 and imbalance_trend < 0:
+            # 全局性能显著上升且不平衡度下降，适当减弱特征对齐
+            self.lambda_feature = max(0.2, self.lambda_feature - 0.05)
+        
         
         return {
             'alpha': self.alpha,
@@ -339,14 +373,96 @@ class DataDistributionClusterer:
         self.num_clusters = num_clusters
     
     def cluster_clients(self, client_models, client_ids, eval_dataset=None, device='cuda'):
-        """基于数据分布特性对客户端进行聚类"""
-        # 简单的聚类实现 - 平均分配
-        clusters = {}
-        for i in range(self.num_clusters):
-            clusters[i] = []
+        """基于客户端评估性能和模型参数聚类"""
+        # 防止客户端数小于聚类数
+        if len(client_ids) <= self.num_clusters:
+            clusters = {i: [client_id] for i, client_id in enumerate(client_ids[:self.num_clusters])}
+            self.clustering_history.append({
+                'timestamp': time.time(),
+                'clusters': copy.deepcopy(clusters),
+                'num_clients': len(client_ids)
+            })
+            return clusters
+        
+        # 收集客户端模型参数
+        client_features = {}
+        for client_id in client_ids:
+            if client_id in client_models:
+                model = client_models[client_id]
+                params_vec = []
+                # 只提取共享参数
+                for name, param in model.named_parameters():
+                    if not any(x in name for x in ['fc', 'linear', 'classifier']):
+                        params_vec.append(param.detach().cpu().view(-1))
+                
+                if params_vec:
+                    # 连接所有参数
+                    client_features[client_id] = torch.cat(params_vec).numpy()
+        
+        # 如果没有足够的特征数据，使用简单分配
+        if len(client_features) < self.num_clusters:
+            clusters = {}
+            for i in range(self.num_clusters):
+                clusters[i] = []
             
-        for i, client_id in enumerate(client_ids):
-            cluster_id = i % self.num_clusters
-            clusters[cluster_id].append(client_id)
+            for i, client_id in enumerate(client_ids):
+                cluster_idx = i % self.num_clusters
+                clusters[cluster_idx].append(client_id)
+                
+            self.clustering_history.append({
+                'timestamp': time.time(),
+                'clusters': copy.deepcopy(clusters),
+                'num_clients': len(client_ids)
+            })
+            return clusters
+        
+        # 使用K-means算法聚类
+        try:
+            from sklearn.cluster import KMeans
+            
+            # 准备特征矩阵
+            feature_matrix = np.array(list(client_features.values()))
+            
+            # 标准化特征
+            feature_mean = np.mean(feature_matrix, axis=0)
+            feature_std = np.std(feature_matrix, axis=0) + 1e-5
+            feature_matrix = (feature_matrix - feature_mean) / feature_std
+            
+            # 执行K-means聚类
+            kmeans = KMeans(n_clusters=self.num_clusters, random_state=0).fit(feature_matrix)
+            
+            # 获取聚类标签
+            cluster_labels = kmeans.labels_
+            
+            # 构建聚类映射
+            clusters = {i: [] for i in range(self.num_clusters)}
+            
+            # 分配客户端到聚类
+            for i, client_id in enumerate(client_features.keys()):
+                cluster_idx = cluster_labels[i]
+                clusters[cluster_idx].append(client_id)
+            
+            # 分配没有特征的客户端
+            for client_id in client_ids:
+                if client_id not in client_features:
+                    # 找到最小的聚类
+                    min_cluster = min(clusters.items(), key=lambda x: len(x[1]))[0]
+                    clusters[min_cluster].append(client_id)
+        except:
+            # 如果K-means失败，回退到简单分配
+            clusters = {}
+            for i in range(self.num_clusters):
+                clusters[i] = []
+            
+            for i, client_id in enumerate(client_ids):
+                cluster_idx = i % self.num_clusters
+                clusters[cluster_idx].append(client_id)
+        
+        # 记录聚类结果
+        self.clustering_history.append({
+            'timestamp': time.time(),
+            'clusters': copy.deepcopy(clusters),
+            'num_clients': len(client_ids)
+        })
         
         return clusters

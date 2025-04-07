@@ -5,12 +5,16 @@ from collections import defaultdict
 
 # 稳定化聚合器 - 处理数据异质性的聚合问题
 class StabilizedAggregator:
-    def __init__(self, beta=0.8, device='cuda'):
+    def __init__(self, beta=0.5, device='cuda'):
         self.beta = beta  # 动量因子
         self.device = device
         self.previous_model = None  # 上一轮的聚合模型
         self.cluster_weights = None  # 聚类权重
-        
+    
+     # 添加自适应动量方法
+    def adjust_beta(self, round_idx):
+        """随着训练轮次逐渐降低动量因子"""
+        self.beta = max(0.1, self.beta * 0.95)  # 每轮减少5%，但不低于0.1
     def set_cluster_weights(self, weights):
         """设置聚类权重"""
         self.cluster_weights = weights

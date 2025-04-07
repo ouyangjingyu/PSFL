@@ -22,38 +22,50 @@ class HybridLoss(nn.Module):
         self.alpha = alpha
 
 # 修复后的特征对齐损失 - 处理不同维度的特征
+# 在utils/tierhfl_client.py中约第49行
 class FeatureAlignmentLoss(nn.Module):
     def __init__(self):
         super(FeatureAlignmentLoss, self).__init__()
         
     def forward(self, client_features, server_features):
-        """计算特征对齐损失，适应不同的特征维度"""
-        # 确保特征是2D张量 (batch_size x feature_dim)
-        if len(client_features.shape) > 2:
+        """计算特征对齐损失，使用自适应池化统一尺寸"""
+        # 确保特征是4D或2D张量
+        if len(client_features.shape) == 4:  # 4D: [B, C, H, W]
             batch_size = client_features.size(0)
-            client_features = client_features.view(batch_size, -1)
+            # 应用全局平均池化得到每个通道的表示
+            client_pooled = F.adaptive_avg_pool2d(client_features, (1, 1))
+            client_features = client_pooled.view(batch_size, -1)
             
-        if len(server_features.shape) > 2:
+        if len(server_features.shape) == 4:  # 4D: [B, C, H, W]
             batch_size = server_features.size(0)
-            server_features = server_features.view(batch_size, -1)
+            # 应用全局平均池化得到每个通道的表示
+            server_pooled = F.adaptive_avg_pool2d(server_features, (1, 1))
+            server_features = server_pooled.view(batch_size, -1)
         
-        # 统一最后一维的大小 - 使用简单截断方法而非池化
+        # 统一特征维度
         if client_features.size(1) != server_features.size(1):
-            target_size = min(client_features.size(1), server_features.size(1))
+            target_dim = min(client_features.size(1), server_features.size(1))
             
-            # 截断到相同维度
-            client_features = client_features[:, :target_size]
-            server_features = server_features[:, :target_size]
+            # 使用线性投影到相同维度
+            if client_features.size(1) > target_dim:
+                client_features = client_features[:, :target_dim]
+            
+            if server_features.size(1) > target_dim:
+                server_features = server_features[:, :target_dim]
         
-        # 规范化特征
+        # 计算特征之间的余弦相似度
         client_norm = F.normalize(client_features, dim=1)
         server_norm = F.normalize(server_features, dim=1)
         
-        # 计算余弦相似度
+        # 余弦相似度损失
         cosine_sim = torch.mean(torch.sum(client_norm * server_norm, dim=1))
+        cosine_loss = 1.0 - cosine_sim
         
-        # 转换为损失（1-相似度）
-        return 1.0 - cosine_sim
+        # 均方误差损失
+        mse_loss = F.mse_loss(client_features, server_features)
+        
+        # 结合多种损失
+        return 0.7 * cosine_loss + 0.3 * mse_loss
 
 # 增强型客户端 - 支持分层模型和双重学习目标
 class TierHFLClient:
@@ -83,6 +95,13 @@ class TierHFLClient:
             'global_loss': [],
             'feature_loss': []
         }
+
+    def update_learning_rate(self, round_idx, lr_factor=0.85, decay_rounds=10):
+        """根据轮次更新学习率"""
+        if round_idx > 0 and round_idx % decay_rounds == 0:
+            self.lr *= lr_factor
+            return True
+        return False
         
     def train(self, client_model, server_model, round_idx=0):
         """客户端训练过程"""
@@ -99,10 +118,15 @@ class TierHFLClient:
             shared_params = list(client_model.get_shared_params().values())
             personalized_params = list(client_model.get_personalized_params().values())
             
-            # 使用不同学习率
+            # 使用不同学习率和权重衰减
+            # optimizer = torch.optim.Adam([
+            #     {'params': shared_params, 'lr': self.lr, 'weight_decay': 1e-4},  # 添加权重衰减
+            #     {'params': personalized_params, 'lr': self.lr * 1.5, 'weight_decay': 5e-4}  # 个性化参数使用更高权重衰减
+            # ])
+            # 使用不同学习率 - 反转权重，提升共享参数学习率
             optimizer = torch.optim.Adam([
-                {'params': shared_params, 'lr': self.lr},
-                {'params': personalized_params, 'lr': self.lr * 1.5}  # 个性化参数使用更高学习率
+                {'params': shared_params, 'lr': self.lr * 1.2},  # 提高共享参数学习率
+                {'params': personalized_params, 'lr': self.lr}   # 降低个性化参数学习率
             ])
         else:
             # 后备方案，使用所有参数
@@ -128,9 +152,14 @@ class TierHFLClient:
             'total': 0,
             'batch_count': 0
         }
-        
+        # 添加早停相关变量
+        early_stop_patience = 3
+        best_loss = float('inf')
+        patience_counter = 0
         # 训练循环
         for epoch in range(self.local_epochs):
+            epoch_loss = 0.0
+            num_batches = 0
             for batch_idx, (data, target) in enumerate(self.train_data):
                 batch_start = time.time()
                 
@@ -172,6 +201,9 @@ class TierHFLClient:
                     total_loss = loss
                     feature_loss = torch.tensor(0.0, device=self.device)
                 
+                epoch_loss += total_loss.item()
+                num_batches += 1
+
                 # 反向传播
                 total_loss.backward()
                 
@@ -201,6 +233,19 @@ class TierHFLClient:
             epoch_local_losses.append(epoch_stats['local_loss'] / epoch_stats['batch_count'])
             epoch_global_losses.append(epoch_stats['global_loss'] / epoch_stats['batch_count'])
             epoch_feature_losses.append(epoch_stats['feature_loss'] / epoch_stats['batch_count'])
+
+            # 检查早停条件
+            if num_batches > 0:
+                avg_epoch_loss = epoch_loss / num_batches
+                if avg_epoch_loss < best_loss * 0.995:  # 至少需要0.5%的改进
+                    best_loss = avg_epoch_loss
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    
+                if patience_counter >= early_stop_patience:
+                    print(f"客户端 {self.client_id} 早停于第 {epoch+1}/{self.local_epochs} 轮")
+                    break
         
         # 计算平均损失和准确率
         num_batches = epoch_stats['batch_count']
