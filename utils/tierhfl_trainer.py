@@ -9,10 +9,11 @@ import logging
 
 # 簇感知并行训练器 - 支持聚类并行训练
 class ClusterAwareParallelTrainer:
-    def __init__(self, client_manager, server_model, device="cuda", max_workers=None):
+    def __init__(self, client_manager, server_model, global_classifier=None, device="cuda", max_workers=None):
         """初始化训练器"""
         self.client_manager = client_manager
         self.server_model = server_model
+        self.global_classifier = global_classifier
         self.default_device = device
         
         # 设置最大并行工作线程数
@@ -81,8 +82,10 @@ class ClusterAwareParallelTrainer:
             # 计时 - 增加模型加载时间记录
             model_load_start = time.time()
             
-            # 将服务器模型移到正确设备
+            # 将服务器模型和全局分类器移到正确设备
             server_model = copy.deepcopy(self.server_model).to(device)
+            global_classifier = copy.deepcopy(self.global_classifier).to(device) if self.global_classifier else None
+            
             model_load_time = time.time() - model_load_start
             
             # 保存训练结果
@@ -90,6 +93,43 @@ class ClusterAwareParallelTrainer:
             cluster_eval_results = {}
             cluster_time_stats = {}  # 新增时间统计
             
+            if round_idx == 0:
+                self.logger.info(f"聚类 {cluster_id} 开始特征维度检查")
+                # 创建一个样本输入
+                sample_input = torch.randn(1, 3, 32, 32).to(device)
+                
+                for client_id in client_ids:
+                    client = self.client_manager.get_client(client_id)
+                    if client is None or client_id not in self.client_models:
+                        continue
+                        
+                    tier = client.tier
+                    try:
+                        client_model = copy.deepcopy(self.client_models[client_id]).to(device)
+                        self.logger.info(f"检查客户端 {client_id} (Tier {tier}) 的特征维度")
+                        
+                        # 执行前向传播
+                        local_logits, features = client_model(sample_input)
+                        self.logger.info(f"客户端 {client_id} 特征输出维度: {features.shape}, 本地分类器输出维度: {local_logits.shape}")
+                        
+                        # 检查服务器模型处理
+                        server_features = server_model(features, tier=tier)
+                        self.logger.info(f"服务器处理后特征维度: {server_features.shape}")
+                        
+                        # 检查全局分类器
+                        if global_classifier:
+                            global_logits = global_classifier(server_features)
+                            self.logger.info(f"全局分类器输出维度: {global_logits.shape}")
+                        
+                        # 客户端模型移回CPU
+                        client_model = client_model.cpu()
+                    except Exception as e:
+                        self.logger.error(f"客户端 {client_id} 维度检查失败: {str(e)}")
+                        import traceback
+                        self.logger.error(traceback.format_exc())
+                
+                self.logger.info(f"聚类 {cluster_id} 完成特征维度检查")
+
             # 训练每个客户端
             for client_id in client_ids:
                 client_start_time = time.time()  # 客户端总时间开始
@@ -109,9 +149,10 @@ class ClusterAwareParallelTrainer:
                     continue
                 copy_time = time.time() - copy_start_time
                 
-                # 执行训练
+                # 执行训练 - 传入全局分类器
                 try:
-                    train_result = client.train(client_model, server_model, round_idx)
+                    # 修改client.train方法以支持全局分类器
+                    train_result = client.train(client_model, server_model, global_classifier, round_idx)
                     cluster_results[client_id] = train_result
                     
                     # 更新客户端模型
@@ -125,10 +166,10 @@ class ClusterAwareParallelTrainer:
                     self.logger.error(traceback.format_exc())
                     continue
                 
-                # 执行评估
+                # 执行评估 - 传入全局分类器
                 eval_start_time = time.time()
                 try:
-                    eval_result = client.evaluate(client_model, server_model)
+                    eval_result = client.evaluate(client_model, server_model, global_classifier)
                     cluster_eval_results[client_id] = eval_result
                 except Exception as e:
                     self.logger.error(f"客户端 {client_id} 评估失败: {str(e)}")
@@ -149,6 +190,7 @@ class ClusterAwareParallelTrainer:
             results_queue.put({
                 'cluster_id': cluster_id,
                 'server_model': server_model.cpu().state_dict(),
+                'global_classifier': global_classifier.cpu().state_dict() if global_classifier else None,
                 'train_results': cluster_results,
                 'eval_results': cluster_eval_results,
                 'time_stats': cluster_time_stats,  # 新增时间统计
@@ -175,7 +217,7 @@ class ClusterAwareParallelTrainer:
         # 没有聚类映射时返回空结果
         if not self.cluster_map:
             self.logger.warning("没有设置聚类映射，无法执行训练")
-            return {}, {}, {}, {}, 0  # 修改返回值，增加时间统计
+            return {}, {}, {}, {}, {}, 0
         
         # 创建结果队列
         results_queue = queue.Queue()
@@ -212,6 +254,7 @@ class ClusterAwareParallelTrainer:
         train_results = {}
         eval_results = {}
         server_models = {}
+        global_classifier_states = {}  # 全局分类器状态
         time_stats = {}  # 新增时间统计收集
         
         while not results_queue.empty():
@@ -225,6 +268,8 @@ class ClusterAwareParallelTrainer:
             # 保存结果
             cluster_id = result['cluster_id']
             server_models[cluster_id] = result['server_model']
+            if 'global_classifier' in result and result['global_classifier']:
+                global_classifier_states[cluster_id] = result['global_classifier']
             
             # 合并训练结果
             for client_id, client_result in result['train_results'].items():
@@ -247,8 +292,43 @@ class ClusterAwareParallelTrainer:
         training_time = time.time() - start_time
         self.logger.info(f"并行训练完成，耗时: {training_time:.2f}秒")
         
-        return train_results, eval_results, server_models, time_stats, training_time  # 增加时间统计返回
+        return train_results, eval_results, server_models, global_classifier_states, time_stats, training_time
         
+    def _aggregate_classifiers(self, classifier_states, weights):
+        """聚合多个全局分类器状态"""
+        if not classifier_states:
+            return {}
+        
+        # 获取第一个状态的键
+        keys = next(iter(classifier_states.values())).keys()
+        
+        # 初始化结果
+        result = {}
+        
+        # 对每个参数进行加权平均
+        for key in keys:
+            # 初始化累加器
+            weighted_sum = None
+            total_weight = 0.0
+            
+            # 加权累加
+            for cluster_id, state in classifier_states.items():
+                if key in state:
+                    weight = weights.get(cluster_id, 0.0)
+                    total_weight += weight
+                    
+                    # 累加
+                    if weighted_sum is None:
+                        weighted_sum = weight * state[key].clone().to(self.default_device)
+                    else:
+                        weighted_sum += weight * state[key].clone().to(self.default_device)
+            
+            # 计算平均值
+            if weighted_sum is not None and total_weight > 0:
+                result[key] = weighted_sum / total_weight
+        
+        return result
+
 # 自适应训练控制器 - 动态调整训练参数
 class AdaptiveTrainingController:
     def __init__(self, initial_alpha=0.5, initial_lambda=0.1):
@@ -478,6 +558,9 @@ class ModelFeatureClusterer:
         
         # 提取模型特征
         client_features = {}
+        feature_dims = []  # 记录所有特征向量的维度
+        
+        # 第一步：提取特征并记录维度
         for client_id in client_ids:
             if client_id in client_models:
                 model = client_models[client_id]
@@ -488,6 +571,7 @@ class ModelFeatureClusterer:
                     if ('conv' in name or 'norm' in name) and 'weight' in name:
                         # 提取统计信息而非原始参数
                         param_data = param.detach().cpu()
+                        # 只收集标量特征，避免形状不一致
                         features.extend([
                             param_data.mean().item(),
                             param_data.std().item(),
@@ -496,17 +580,55 @@ class ModelFeatureClusterer:
                         ])
                 
                 if features:
-                    client_features[client_id] = np.array(features)
+                    # 确保features是一维数组
+                    features_array = np.array(features, dtype=np.float32)
+                    client_features[client_id] = features_array
+                    feature_dims.append(len(features_array))
+        
+        # 检查所有特征向量的维度是否一致
+        if feature_dims and len(set(feature_dims)) > 1:
+            # 如果维度不一致，找出最常见的维度
+            from collections import Counter
+            dim_counter = Counter(feature_dims)
+            common_dim = dim_counter.most_common(1)[0][0]
+            
+            print(f"发现不同维度的特征向量: {dict(dim_counter)}，使用最常见维度: {common_dim}")
+            
+            # 填充或裁剪特征向量到相同维度
+            for client_id in list(client_features.keys()):
+                feat = client_features[client_id]
+                if len(feat) != common_dim:
+                    if len(feat) < common_dim:
+                        # 如果特征太短，使用填充（用0填充）
+                        client_features[client_id] = np.pad(feat, (0, common_dim - len(feat)), 'constant')
+                    else:
+                        # 如果特征太长，进行裁剪
+                        client_features[client_id] = feat[:common_dim]
         
         # 尝试K-means聚类
         if len(client_features) >= self.num_clusters:
             try:
                 from sklearn.cluster import KMeans
-                features_matrix = np.array(list(client_features.values()))
-                kmeans = KMeans(n_clusters=self.num_clusters, random_state=42).fit(features_matrix)
+                # 转换为矩阵
+                feature_client_ids = list(client_features.keys())
+                features_matrix = np.vstack([client_features[cid] for cid in feature_client_ids])
+                
+                # 打印形状信息以调试
+                print(f"特征矩阵形状: {features_matrix.shape}")
+                
+                # 确保特征矩阵是浮点型
+                features_matrix = features_matrix.astype(np.float32)
+                
+                # 标准化特征
+                mean = np.mean(features_matrix, axis=0)
+                std = np.std(features_matrix, axis=0) + 1e-8
+                features_matrix = (features_matrix - mean) / std
+                
+                # 执行K-means
+                kmeans = KMeans(n_clusters=self.num_clusters, random_state=42, n_init=10)
+                kmeans.fit(features_matrix)
                 
                 # 构建聚类映射
-                feature_client_ids = list(client_features.keys())
                 for i, label in enumerate(kmeans.labels_):
                     client_id = feature_client_ids[i]
                     clusters[label].append(client_id)
@@ -517,12 +639,27 @@ class ModelFeatureClusterer:
                         # 分配到最小聚类
                         min_cluster = min(clusters.items(), key=lambda x: len(x[1]))[0]
                         clusters[min_cluster].append(client_id)
+                        
             except Exception as e:
                 print(f"K-means聚类失败: {str(e)}，使用备选方案")
-                # 回退到均匀分配
-                for i, client_id in enumerate(client_ids):
-                    cluster_idx = i % self.num_clusters
-                    clusters[cluster_idx].append(client_id)
+                import traceback
+                traceback.print_exc()
+                # 回退到备选方案 - 基于tier分组
+                tier_groups = {}
+                for client_id in client_ids:
+                    client = self.client_manager.get_client(client_id) if hasattr(self, 'client_manager') else None
+                    tier = getattr(client, 'tier', client_id % 7 + 1)  # 如果无法获取tier，使用client_id模拟
+                    
+                    if tier not in tier_groups:
+                        tier_groups[tier] = []
+                    tier_groups[tier].append(client_id)
+                
+                # 将tier组分配到聚类中
+                cluster_idx = 0
+                for tier, clients in tier_groups.items():
+                    for client_id in clients:
+                        clusters[cluster_idx % self.num_clusters].append(client_id)
+                        cluster_idx += 1
         else:
             # 备选方案：均匀分配
             for i, client_id in enumerate(client_ids):

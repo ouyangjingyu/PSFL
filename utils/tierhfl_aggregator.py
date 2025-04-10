@@ -8,8 +8,71 @@ class StabilizedAggregator:
     def __init__(self, beta=0.5, device='cuda'):
         self.beta = beta  # 动量因子
         self.device = device
-        self.previous_model = None  # 上一轮的聚合模型
+        self.previous_client_model = None  # 初始化客户端模型历史
+        self.previous_server_model = None  # 初始化服务器模型历史
         self.cluster_weights = None  # 聚类权重
+        self.accuracy_history = []  # 准确率历史记录
+    
+    # 聚合客户端模型
+    def aggregate_clients(self, client_states, client_weights=None, client_clusters=None):
+        """聚合客户端状态"""
+        # 没有客户端状态时直接返回空字典
+        if not client_states:
+            return {}
+            
+        # 如果已提供聚类信息，使用聚类聚合
+        if client_clusters:
+            aggregated_model = self._clustered_aggregation(client_states, client_weights, client_clusters)
+        else:
+            # 否则使用直接加权平均聚合
+            aggregated_model = self._weighted_average_aggregation(client_states, client_weights)
+        
+        # 应用动量
+        if self.previous_client_model is not None:
+            stabilized_model = {}
+            for k in aggregated_model:
+                if k in self.previous_client_model:
+                    stabilized_model[k] = self.beta * self.previous_client_model[k] + (1 - self.beta) * aggregated_model[k]
+                else:
+                    stabilized_model[k] = aggregated_model[k]
+            
+            aggregated_model = stabilized_model
+        
+        # 保存当前模型作为下一轮的历史
+        self.previous_client_model = copy.deepcopy(aggregated_model)
+        
+        return aggregated_model
+    
+    # 聚合服务器模型
+    def aggregate_server(self, server_states, cluster_weights=None):
+        """聚合服务器状态"""
+        # 没有服务器状态时直接返回空字典
+        if not server_states:
+            return {}
+            
+        # 默认使用平均权重
+        if cluster_weights is None:
+            cluster_weights = {i: 1.0/len(server_states) for i in server_states}
+            
+        # 使用加权平均聚合
+        aggregated_model = self._weighted_average(server_states, cluster_weights)
+        
+        # 应用动量
+        if self.previous_server_model is not None:
+            stabilized_model = {}
+            for k in aggregated_model:
+                if k in self.previous_server_model:
+                    stabilized_model[k] = self.beta * self.previous_server_model[k] + (1 - self.beta) * aggregated_model[k]
+                else:
+                    stabilized_model[k] = aggregated_model[k]
+            
+            aggregated_model = stabilized_model
+        
+        # 保存当前模型作为下一轮的历史
+        self.previous_server_model = copy.deepcopy(aggregated_model)
+        
+        return aggregated_model
+    
     
      # 添加自适应动量方法
     def adjust_beta(self, round_idx, global_acc, prev_global_acc):
@@ -105,24 +168,7 @@ class StabilizedAggregator:
         cluster_states = {cluster_id: model for cluster_id, model in cluster_models.items()}
         
         # 聚合
-        aggregated_model = self._weighted_average(cluster_states, cluster_weights)
-        
-        # 应用动量
-        if self.previous_model is not None:
-            # 使用动量更新
-            stabilized_model = {}
-            for k in aggregated_model:
-                if k in self.previous_model:
-                    stabilized_model[k] = self.beta * self.previous_model[k] + (1 - self.beta) * aggregated_model[k]
-                else:
-                    stabilized_model[k] = aggregated_model[k]
-            
-            aggregated_model = stabilized_model
-            
-        # 保存当前模型作为下一轮的历史
-        self.previous_model = copy.deepcopy(aggregated_model)
-        
-        return aggregated_model
+        return self._weighted_average(cluster_states, cluster_weights)
     
     def _weighted_average_aggregation(self, client_states, client_weights):
         """简单的加权平均聚合"""
@@ -136,25 +182,8 @@ class StabilizedAggregator:
             client_weights = {client_id: 1.0 / len(filtered_states) for client_id in filtered_states}
         
         # 聚合
-        result = self._weighted_average(filtered_states, client_weights)
+        return self._weighted_average(filtered_states, client_weights)
         
-        # 应用动量
-        if self.previous_model is not None:
-            # 动量更新
-            stabilized_model = {}
-            for k in result:
-                if k in self.previous_model:
-                    stabilized_model[k] = self.beta * self.previous_model[k] + (1 - self.beta) * result[k]
-                else:
-                    stabilized_model[k] = result[k]
-            
-            result = stabilized_model
-        
-        # 保存当前模型作为下一轮的历史
-        self.previous_model = copy.deepcopy(result)
-        
-        return result
-    
     def _weighted_average(self, state_dict, weights):
         """计算加权平均"""
         if not state_dict:
@@ -189,12 +218,27 @@ class StabilizedAggregator:
                 result[key] = weighted_sum / total_weight
         
         return result
-    
+        
     def _filter_personalized_params(self, state_dict):
         """过滤掉个性化参数"""
         filtered_state = {}
         for k, v in state_dict.items():
             # 排除分类器参数
-            if not any(name in k for name in ['classifier', 'local_head', 'fc']):
+            if not any(name in k for name in ['classifier', 'local_head', 'fc', 'linear']):
                 filtered_state[k] = v
         return filtered_state
+        
+    def update_accuracy_history(self, accuracy):
+        """更新准确率历史并调整beta"""
+        self.accuracy_history.append(accuracy)
+        
+        # 动态调整beta值
+        if len(self.accuracy_history) >= 2:
+            acc_diff = self.accuracy_history[-1] - self.accuracy_history[-2]
+            
+            # 准确率下降或停滞时，降低beta
+            if acc_diff < 0.1:
+                self.beta = max(0.1, self.beta * 0.9)
+            # 准确率提升时，提高beta
+            elif acc_diff > 1.0:
+                self.beta = min(0.6, self.beta * 1.05)

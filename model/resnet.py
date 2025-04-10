@@ -217,103 +217,334 @@ class TierHFLClientModel(nn.Module):
         return personalized_params
 
 # TierHFL-ResNet服务器模型
-class TierHFLServerModel(nn.Module):
-    def __init__(self, block, layers, num_classes=10):
-        super(TierHFLServerModel, self).__init__()
-        self.num_classes = num_classes
+# class TierHFLServerModel(nn.Module):
+#     def __init__(self, block, layers, num_classes=10):
+#         super(TierHFLServerModel, self).__init__()
+#         self.num_classes = num_classes
         
-        # 服务器端处理模块 - 针对不同tier
-        self.tier_modules = nn.ModuleDict()
-        planes = [16, 16, 32, 32, 64, 64]
-        strides = [1, 1, 2, 1, 2, 1]
+#         # 服务器端处理模块 - 针对不同tier
+#         self.tier_modules = nn.ModuleDict()
+#         planes = [16, 16, 32, 32, 64, 64]
+#         strides = [1, 1, 2, 1, 2, 1]
         
-        # 创建每个tier对应的处理模块
-        for tier in range(1, 8):
-            tier_str = f'tier_{tier}'
-            self.tier_modules[tier_str] = nn.ModuleList()
+#         # 创建每个tier对应的处理模块
+#         for tier in range(1, 8):
+#             tier_str = f'tier_{tier}'
+#             self.tier_modules[tier_str] = nn.ModuleList()
             
-            # 根据tier确定起始层和inplanes
-            start_layer = max(0, 7 - tier)
-            inplanes = 16  # 默认起始通道数
+#             # 根据tier确定起始层和inplanes
+#             start_layer = max(0, 7 - tier)
+#             inplanes = 16  # 默认起始通道数
             
-            # 调整inplanes基于tier
-            if tier == 7:
-                inplanes = 16
-            elif tier == 6:
-                inplanes = 16 * block.expansion
-            elif tier == 5:
-                inplanes = 16 * block.expansion
-            elif tier == 4:
-                inplanes = 32 * block.expansion
-            elif tier == 3:
-                inplanes = 32 * block.expansion
-            elif tier == 2:
-                inplanes = 64 * block.expansion
-            elif tier == 1:
-                inplanes = 64 * block.expansion
+#             # 调整inplanes基于tier
+#             if tier == 7:
+#                 inplanes = 16
+#             elif tier == 6:
+#                 inplanes = 16 * block.expansion
+#             elif tier == 5:
+#                 inplanes = 16 * block.expansion
+#             elif tier == 4:
+#                 inplanes = 32 * block.expansion
+#             elif tier == 3:
+#                 inplanes = 32 * block.expansion
+#             elif tier == 2:
+#                 inplanes = 64 * block.expansion
+#             elif tier == 1:
+#                 inplanes = 64 * block.expansion
                 
-            # 创建该tier需要的层
-            for i in range(start_layer, 6):
-                if i == start_layer:
-                    this_layer = self._make_layer(block, planes[i], layers[i], 
-                                                 stride=strides[i], inplanes=inplanes)
-                else:
-                    inplanes = planes[i-1] * block.expansion
-                    this_layer = self._make_layer(block, planes[i], layers[i], 
-                                                 stride=strides[i], inplanes=inplanes)
-                self.tier_modules[tier_str].append(this_layer)
+#             # 创建该tier需要的层
+#             for i in range(start_layer, 6):
+#                 if i == start_layer:
+#                     this_layer = self._make_layer(block, planes[i], layers[i], 
+#                                                  stride=strides[i], inplanes=inplanes)
+#                 else:
+#                     inplanes = planes[i-1] * block.expansion
+#                     this_layer = self._make_layer(block, planes[i], layers[i], 
+#                                                  stride=strides[i], inplanes=inplanes)
+#                 self.tier_modules[tier_str].append(this_layer)
         
-        # 全局分类器
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.global_classifier = nn.Linear(64 * block.expansion, num_classes)
+#         # 全局分类器
+#         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+#         self.global_classifier = nn.Linear(64 * block.expansion, num_classes)
         
-        # 简化的特征处理
-        self.feature_processor = SimpleFeatureProcessor(64 * block.expansion)
+#         # 简化的特征处理
+#         self.feature_processor = SimpleFeatureProcessor(64 * block.expansion)
         
-        # 初始化权重
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, LayerNormCNN):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
+#         # 初始化权重
+#         for m in self.modules():
+#             if isinstance(m, nn.Conv2d):
+#                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+#             elif isinstance(m, LayerNormCNN):
+#                 nn.init.constant_(m.weight, 1)
+#                 nn.init.constant_(m.bias, 0)
 
-    def _make_layer(self, block, planes, blocks, stride=1, inplanes=None):
-        inplanes = self.inplanes if inplanes is None else inplanes
-        downsample = None
-        if stride != 1 or inplanes != planes * block.expansion:
-            downsample = nn.Sequential(
-                conv1x1(inplanes, planes * block.expansion, stride),
-                LayerNormCNN(planes * block.expansion),
-            )
+#     def _make_layer(self, block, planes, blocks, stride=1, inplanes=None):
+#         inplanes = self.inplanes if inplanes is None else inplanes
+#         downsample = None
+#         if stride != 1 or inplanes != planes * block.expansion:
+#             downsample = nn.Sequential(
+#                 conv1x1(inplanes, planes * block.expansion, stride),
+#                 LayerNormCNN(planes * block.expansion),
+#             )
 
-        layers = []
-        layers.append(block(inplanes, planes, stride, downsample))
-        self.inplanes = planes * block.expansion
-        for _ in range(1, blocks):
-            layers.append(block(self.inplanes, planes))
+#         layers = []
+#         layers.append(block(inplanes, planes, stride, downsample))
+#         self.inplanes = planes * block.expansion
+#         for _ in range(1, blocks):
+#             layers.append(block(self.inplanes, planes))
 
-        return nn.Sequential(*layers)
+#         return nn.Sequential(*layers)
 
+#     def forward(self, x, tier=1):
+#         # 获取对应tier的处理模块
+#         tier_str = f'tier_{tier}'
+        
+#         # 处理特征
+#         for layer in self.tier_modules[tier_str]:
+#             x = layer(x)
+        
+#         # 应用特征处理
+#         x = self.feature_processor(x)
+        
+#         # 全局分类
+#         x = self.avgpool(x)
+#         x = torch.flatten(x, 1)
+#         logits = self.global_classifier(x)
+        
+#         return logits, x  # 返回分类结果和特征
+
+# 创建客户端模型函数
+
+class EnhancedServerModel(nn.Module):
+    def __init__(self):
+        super(EnhancedServerModel, self).__init__()
+        
+        # 针对不同tier级别的特征处理模块
+        self.tier_processors = nn.ModuleDict({
+            # Tier 7客户端输出16通道特征
+            'tier_7': nn.Sequential(
+                nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
+                LayerNormCNN(32),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+                LayerNormCNN(64),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+                LayerNormCNN(128),
+                nn.ReLU(inplace=True),
+            ),
+            # Tier 6客户端输出16通道特征
+            'tier_6': nn.Sequential(
+                nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
+                LayerNormCNN(32),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+                LayerNormCNN(64),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+                LayerNormCNN(128),
+                nn.ReLU(inplace=True),
+            ),
+            # Tier 5客户端输出32通道特征
+            'tier_5': nn.Sequential(
+                nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+                LayerNormCNN(64),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+                LayerNormCNN(128),
+                nn.ReLU(inplace=True),
+            ),
+            # Tier 4客户端输出64通道特征
+            'tier_4': nn.Sequential(
+                nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
+                LayerNormCNN(64),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+                LayerNormCNN(128),
+                nn.ReLU(inplace=True),
+            ),
+            # Tier 3客户端输出64通道特征 - 轻量处理
+            'tier_3': nn.Sequential(
+                nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+                LayerNormCNN(128),
+                nn.ReLU(inplace=True),
+            ),
+            # Tier 2客户端输出128通道特征 - 轻量处理
+            'tier_2': nn.Sequential(
+                nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1),
+                LayerNormCNN(128),
+                nn.ReLU(inplace=True),
+            ),
+            # Tier 1客户端输出128通道特征 - 仅做标准化和处理
+            'tier_1': nn.Sequential(
+                nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1),
+                LayerNormCNN(128),
+                nn.ReLU(inplace=True),
+            ),
+        })
+        
+        # 统一特征处理 - 所有处理后都输出128维特征
+        self.feature_adapter = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten()
+        )
+    
     def forward(self, x, tier=1):
         # 获取对应tier的处理模块
         tier_str = f'tier_{tier}'
         
         # 处理特征
-        for layer in self.tier_modules[tier_str]:
-            x = layer(x)
+        if tier_str in self.tier_processors:
+            x = self.tier_processors[tier_str](x)
         
-        # 应用特征处理
-        x = self.feature_processor(x)
+        # 特征适配
+        features = self.feature_adapter(x)
         
-        # 全局分类
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-        logits = self.global_classifier(x)
+        return features
         
-        return logits, x  # 返回分类结果和特征
+    # 添加获取共享参数方法以支持聚合
+    def get_shared_params(self):
+        return {name: param for name, param in self.named_parameters()}
 
-# 创建客户端模型函数
+
+class TierAwareClientModel(nn.Module):
+    def __init__(self, num_classes=10, tier=1):
+        super(TierAwareClientModel, self).__init__()
+        self.tier = tier
+        
+        # 基础层 - 输出16通道
+        self.base = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=3, padding=1, bias=False),
+            LayerNormCNN(16),
+            nn.ReLU(inplace=True)
+        )
+        
+        # 计算每层的输出通道数
+        self.channels = [16, 16, 32, 64, 64, 128, 128]  # 各个层的输出通道数
+        self.out_channels = 16  # 默认基础层输出通道
+        
+        # 根据tier创建层
+        if tier <= 6:  # Tier 6及以下都有第一层
+            self.layer1 = self._make_residual_group(16, 16, 2)
+            self.out_channels = 16
+        
+        if tier <= 5:  # Tier 5及以下都有第二层
+            self.layer2 = self._make_residual_group(16, 32, 2, stride=2)
+            self.out_channels = 32
+        
+        if tier <= 4:  # Tier 4及以下都有第三层
+            self.layer3 = self._make_residual_group(32, 64, 2, stride=2)
+            self.out_channels = 64
+        
+        if tier <= 3:  # Tier 3及以下都有第四层
+            self.layer4 = self._make_residual_group(64, 64, 2)
+            self.out_channels = 64
+        
+        if tier <= 2:  # Tier 2及以下都有第五层
+            self.layer5 = self._make_residual_group(64, 128, 2, stride=2)
+            self.out_channels = 128
+        
+        if tier <= 1:  # 只有Tier 1有第六层
+            self.layer6 = self._make_residual_group(128, 128, 2)
+            self.out_channels = 128
+            
+        # 本地分类器 - 根据out_channels确定输入维度
+        self.local_classifier = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+            nn.Dropout(0.3),
+            nn.Linear(self.out_channels, num_classes)
+        )
+        
+    def _make_residual_group(self, in_planes, out_planes, blocks, stride=1):
+        layers = []
+        
+        # 第一个可能需要下采样的块
+        downsample = None
+        if stride != 1 or in_planes != out_planes:
+            downsample = nn.Sequential(
+                nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False),
+                LayerNormCNN(out_planes)
+            )
+            
+        layers.append(self._make_residual_block(in_planes, out_planes, stride, downsample))
+        
+        # 添加剩余的块
+        for _ in range(1, blocks):
+            layers.append(self._make_residual_block(out_planes, out_planes))
+            
+        return nn.Sequential(*layers)
+    
+    def _make_residual_block(self, in_planes, out_planes, stride=1, downsample=None):
+        return BasicBlock(in_planes, out_planes, stride, downsample)
+        
+    def forward(self, x):
+        # 基础层
+        x = self.base(x)
+        
+        # 根据tier级别应用相应的层
+        if hasattr(self, 'layer1'):
+            x = self.layer1(x)
+        if hasattr(self, 'layer2'):
+            x = self.layer2(x)
+        if hasattr(self, 'layer3'):
+            x = self.layer3(x)
+        if hasattr(self, 'layer4'):
+            x = self.layer4(x)
+        if hasattr(self, 'layer5'):
+            x = self.layer5(x)
+        if hasattr(self, 'layer6'):
+            x = self.layer6(x)
+        
+        # 保存特征以传递给服务器
+        features = x
+        
+        # 应用本地分类器
+        x_pool = self.local_classifier[0:2](x)  # 应用池化和展平
+        local_features = x_pool
+        local_logits = self.local_classifier[2:](x_pool)  # 应用剩余分类器层
+        
+        return local_logits, features
+    
+    def get_shared_params(self):
+        shared_params = {}
+        for name, param in self.named_parameters():
+            if 'local_classifier' not in name:
+                shared_params[name] = param
+        return shared_params
+    
+    def get_personalized_params(self):
+        personalized_params = {}
+        for name, param in self.named_parameters():
+            if 'local_classifier' in name:
+                personalized_params[name] = param
+        return personalized_params
+
+class GlobalClassifier(nn.Module):
+    def __init__(self, feature_dim=128, num_classes=10):
+        super(GlobalClassifier, self).__init__()
+        self.num_classes = num_classes
+        
+        # 多层分类器，有更强的表达能力
+        self.classifier = nn.Sequential(
+            nn.Linear(feature_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(256, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(128, num_classes)
+        )
+    
+    def forward(self, features):
+        logits = self.classifier(features)
+        return logits
+        
+    # 添加获取参数方法以支持聚合
+    def get_params(self):
+        return {name: param for name, param in self.named_parameters()}
+
+
 def create_tierhfl_client_model(tier, num_classes=10, model_type='resnet56'):
     if model_type == 'resnet56':
         return TierHFLClientModel(BasicBlock, [3, 3, 3, 3, 3, 3], num_classes, tier)
@@ -330,3 +561,4 @@ def create_tierhfl_server_model(num_classes=10, model_type='resnet56'):
         return TierHFLServerModel(Bottleneck, [6, 6, 6, 6, 6, 6], num_classes)
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
+

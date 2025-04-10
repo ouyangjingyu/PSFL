@@ -100,41 +100,26 @@ class TierHFLClient:
             return True
         return False
         
-    def train(self, client_model, server_model, round_idx=0):
-        """客户端训练过程"""
+    def train(self, client_model, server_model, global_classifier, round_idx=0):
+        """客户端训练过程-- 拆分学习模式"""
         # 确保模型在正确的设备上
         client_model = client_model.to(self.device)
         server_model = server_model.to(self.device)
+        global_classifier = global_classifier.to(self.device)
         
         # 设置为训练模式
         client_model.train()
         server_model.train()
+        global_classifier.train()
         
-        # 自适应平衡因子调整 - 在方法开始添加
-        base_alpha = 0.5
-        if round_idx < 10:
-            # 初始阶段强调个性化学习
-            self.update_alpha(min(0.7, base_alpha + 0.2))
-        else:
-            # 根据性能差距动态调整
-            local_global_gap = 0
-            if len(self.stats['train_acc']) > 0 and len(self.stats['global_loss']) > 0:
-                local_global_gap = self.stats['train_acc'][-1] - self.stats.get('global_acc', [0])[-1]
-                
-            if local_global_gap > 10:
-                self.update_alpha(max(0.3, base_alpha - 0.1))
-            elif local_global_gap < -5:
-                self.update_alpha(min(0.7, base_alpha + 0.1))
-            else:
-                self.update_alpha(base_alpha)
-        
-        # 混合优化器与差异化学习率 - 替换现有优化器创建代码
+         # 优化器设置
         if hasattr(client_model, 'get_shared_params') and hasattr(client_model, 'get_personalized_params'):
             shared_params = list(client_model.get_shared_params().values())
             personalized_params = list(client_model.get_personalized_params().values())
             
-            # 共享参数使用Adam，个性化参数使用SGD+动量
+            # 共享参数使用Adam
             optimizer_shared = torch.optim.Adam(shared_params, lr=self.lr)
+            # 个性化参数使用更高学习率的SGD+动量
             optimizer_personal = torch.optim.SGD(personalized_params, 
                                             lr=self.lr * 1.5,
                                             momentum=0.9,
@@ -165,7 +150,7 @@ class TierHFLClient:
             'batch_count': 0
         }
         # 添加早停相关变量
-        early_stop_patience = 3
+        early_stop_patience = 10
         best_loss = float('inf')
         patience_counter = 0
         # 训练循环
@@ -184,34 +169,35 @@ class TierHFLClient:
                     optimizer_personal.zero_grad()
                 
                 # 客户端前向传播
-                local_logits, features = client_model(data)
-                
-                # 服务器前向传播
                 try:
-                    server_output = server_model(features, tier=self.tier)
-                    if isinstance(server_output, tuple) and len(server_output) == 2:
-                        global_logits, server_features = server_output
-                    else:
-                        # 如果服务器模型只返回一个输出，假设它是global_logits
-                        global_logits = server_output
-                        server_features = features  # 直接使用客户端特征
+                    local_logits, features = client_model(data)
                 except Exception as e:
-                    print(f"服务器前向传播失败: {str(e)}")
+                    print(f"客户端模型前向传播失败: {str(e)}")
+                    continue
+                
+                # 服务器前向传播 - 只得到特征
+                try:
+                    server_features = server_model(features, tier=self.tier)
+                    
+                    # 全局分类器前向传播
+                    global_logits = global_classifier(server_features)
+                except Exception as e:
+                    print(f"服务器特征提取或全局分类器前向传播失败: {str(e)}, 特征形状: {features.shape}")
                     # 使用local_logits作为备用
                     global_logits = local_logits
-                    server_features = features
+                    server_features = features.view(features.size(0), -1)  # 确保是2D张量
                 
                 # 计算混合损失
                 loss, local_loss, global_loss = self.hybrid_loss(local_logits, global_logits, target)
                 
-                # 尝试计算特征对齐损失
+                # 计算特征对齐损失
                 try:
-                    feature_loss = self.feature_alignment_loss(features, server_features)
-                    # 添加特征对齐损失
+                    # 本地特征与服务器特征对齐
+                    # 需要确保特征维度匹配，可能需要调整
+                    feature_loss = self.feature_alignment_loss(features, server_features, round_idx)
                     total_loss = loss + self.lambda_feature * feature_loss
                 except Exception as e:
                     print(f"特征对齐损失计算失败: {str(e)}")
-                    # 使用基本损失作为备用
                     total_loss = loss
                     feature_loss = torch.tensor(0.0, device=self.device)
                 
@@ -244,6 +230,11 @@ class TierHFLClient:
                 # 记录批次处理时间
                 batch_times.append(time.time() - batch_start)
             
+            # 计算每轮平均损失
+            if num_batches > 0:
+                epoch_loss = epoch_loss / num_batches
+                print(f"客户端 {self.client_id} - 轮次 {epoch+1}/{self.local_epochs}, 损失: {epoch_loss:.4f}")
+    
             # 记录每个epoch的损失
             epoch_losses.append(epoch_stats['total_loss'] / epoch_stats['batch_count'])
             epoch_local_losses.append(epoch_stats['local_loss'] / epoch_stats['batch_count'])
@@ -296,15 +287,17 @@ class TierHFLClient:
             'total_batches': num_batches
         }
         
-    def evaluate(self, client_model, server_model):
+    def evaluate(self, client_model, server_model, global_classifier):
         """客户端评估过程"""
         # 确保模型在正确的设备上
         client_model = client_model.to(self.device)
         server_model = server_model.to(self.device)
+        global_classifier = global_classifier.to(self.device)
         
         # 设置为评估模式
         client_model.eval()
         server_model.eval()
+        global_classifier.eval()
         
         # 统计信息
         local_correct = 0
@@ -334,12 +327,8 @@ class TierHFLClient:
                 
                 # 服务器前向传播
                 try:
-                    server_output = server_model(features, tier=self.tier)
-                    if isinstance(server_output, tuple) and len(server_output) == 2:
-                        global_logits, _ = server_output
-                    else:
-                        # 如果服务器模型只返回一个输出，假设它是global_logits
-                        global_logits = server_output
+                    server_features = server_model(features, tier=self.tier)
+                    global_logits = global_classifier(server_features)
                 except Exception as e:
                     print(f"评估时服务器前向传播失败: {str(e)}")
                     # 使用local_logits作为备用
