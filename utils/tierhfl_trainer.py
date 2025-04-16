@@ -6,6 +6,9 @@ import copy
 import numpy as np
 from collections import defaultdict
 import logging
+import random
+import torch.nn.functional as F
+import math
 
 # 簇感知并行训练器 - 支持聚类并行训练
 class ClusterAwareParallelTrainer:
@@ -87,7 +90,56 @@ class ClusterAwareParallelTrainer:
             global_classifier = copy.deepcopy(self.global_classifier).to(device) if self.global_classifier else None
             
             model_load_time = time.time() - model_load_start
-            
+            # 新增：针对全局分类器的预热训练
+            if round_idx < 5 and global_classifier is not None:
+                self.logger.info(f"聚类 {cluster_id} 开始全局分类器预热训练")
+                
+                # 为全局分类器创建专用优化器
+                classifier_optimizer = torch.optim.Adam(
+                    global_classifier.parameters(),
+                    lr=0.001,
+                    weight_decay=0.0001  # 增加正则化
+                )
+                
+                # 从客户端收集训练批次
+                warmup_batches = []
+                for client_id in client_ids:
+                    client = self.client_manager.get_client(client_id)
+                    if client is None or client_id not in self.client_models:
+                        continue
+                    
+                    client_model = copy.deepcopy(self.client_models[client_id]).to(device)
+                    
+                    # 收集少量批次用于预热训练
+                    batch_count = 0
+                    for data, target in client.train_data:
+                        if batch_count >= 5:  # 每个客户端最多5个批次
+                            break
+                        warmup_batches.append((client_id, data, target))
+                        batch_count += 1
+                
+                # 预热训练全局分类器
+                if warmup_batches:
+                    for _ in range(3):  # 多次遍历预热数据
+                        random.shuffle(warmup_batches)
+                        
+                        for client_id, data, target in warmup_batches:
+                            data, target = data.to(device), target.to(device)
+                            client = self.client_manager.get_client(client_id)
+                            client_model = copy.deepcopy(self.client_models[client_id]).to(device)
+                            
+                            with torch.no_grad():  # 不计算客户端模型梯度
+                                _, features = client_model(data)
+                                server_features = server_model(features, tier=client.tier)
+                            
+                            # 只训练全局分类器
+                            classifier_optimizer.zero_grad()
+                            global_logits = global_classifier(server_features)
+                            loss = F.cross_entropy(global_logits, target)
+                            loss.backward()
+                            torch.nn.utils.clip_grad_norm_(global_classifier.parameters(), max_norm=1.0)
+                            classifier_optimizer.step()
+                            
             # 保存训练结果
             cluster_results = {}
             cluster_eval_results = {}
@@ -130,6 +182,20 @@ class ClusterAwareParallelTrainer:
                 
                 self.logger.info(f"聚类 {cluster_id} 完成特征维度检查")
 
+            # 检查聚类中是否包含客户端6
+            has_client6 = 6 in client_ids
+            if has_client6:
+                print(f"\n[CLUSTER TRAINER] 聚类 {cluster_id} 包含客户端6")
+                print(f"[CLUSTER TRAINER] 聚类 {cluster_id} 所有客户端: {client_ids}")
+                
+                # 设置调试标志
+                if hasattr(server_model, '_debug_client_id'):
+                    server_model._debug_client_id = 6
+                if global_classifier and hasattr(global_classifier, '_debug_client_id'):
+                    global_classifier._debug_client_id = 6
+
+            
+
             # 训练每个客户端
             for client_id in client_ids:
                 client_start_time = time.time()  # 客户端总时间开始
@@ -140,6 +206,25 @@ class ClusterAwareParallelTrainer:
                     self.logger.warning(f"客户端 {client_id} 不存在或没有模型，跳过")
                     continue
                 
+                # 特殊监控客户端6
+                is_client6 = client_id == 6
+                if is_client6:
+                    print(f"\n[TRAINER] 开始处理客户端6，所属聚类: {cluster_id}, 轮次: {round_idx}")
+                    print(f"[TRAINER] 客户端6 Tier: {client.tier}, 学习率: {client.lr}")
+                    
+                    # 检查模型参数统计
+                    client_model = self.client_models[client_id]
+                    n_params = sum(p.numel() for p in client_model.parameters())
+                    print(f"[TRAINER] 客户端6模型参数数量: {n_params}")
+                    
+                    # 为客户端模型添加调试标志
+                    if hasattr(client_model, 'client_id'):
+                        client_model.client_id = 6
+                    
+                    # 为损失函数添加调试标志
+                    if hasattr(client.feature_alignment_loss, '_debug_client_id'):
+                        client.feature_alignment_loss._debug_client_id = 6
+
                 # 计时 - 模型复制
                 copy_start_time = time.time()
                 try:
@@ -166,14 +251,33 @@ class ClusterAwareParallelTrainer:
                     self.logger.error(traceback.format_exc())
                     continue
                 
-                # 执行评估 - 传入全局分类器
+                # 执行评估 - 针对客户端6添加更详细日志
+                if is_client6:
+                    print(f"[TRAINER] 开始评估客户端6...")
+                    
                 eval_start_time = time.time()
+
                 try:
                     eval_result = client.evaluate(client_model, server_model, global_classifier)
                     cluster_eval_results[client_id] = eval_result
+                    
+                    if is_client6:
+                        print(f"[TRAINER] 客户端6评估结果:")
+                        print(f"  - 本地准确率: {eval_result.get('local_accuracy', 0):.2f}%")
+                        print(f"  - 全局准确率: {eval_result.get('global_accuracy', 0):.2f}%")
+                        print(f"  - 测试损失: {eval_result.get('test_loss', 0):.4f}")
+                        
+                        # 检查每个类别的准确率
+                        if 'global_per_class_acc' in eval_result:
+                            print(f"  - 全局每类准确率: {[f'{acc:.1f}%' for acc in eval_result['global_per_class_acc']]}")
                 except Exception as e:
                     self.logger.error(f"客户端 {client_id} 评估失败: {str(e)}")
+                    if is_client6:
+                        print(f"[TRAINER] 客户端6评估出错: {str(e)}")
+                        import traceback
+                        traceback.print_exc()
                     continue
+
                 eval_time = time.time() - eval_start_time
                 
                 # 记录时间开销
@@ -328,6 +432,125 @@ class ClusterAwareParallelTrainer:
                 result[key] = weighted_sum / total_weight
         
         return result
+
+    def diagnose_client6_features(self, round_idx=0):
+        """针对客户端6提取并保存中间特征，用于问题诊断"""
+        # 只有在客户端6存在于集群中时才进行诊断
+        client6_exists = False
+        for cluster_id, clients in self.cluster_map.items():
+            if 6 in clients:
+                client6_exists = True
+                client6_cluster = cluster_id
+                break
+        
+        if not client6_exists:
+            self.logger.warning("客户端6不存在，无法诊断")
+            return
+        
+        self.logger.info(f"开始诊断客户端6 (聚类 {client6_cluster})...")
+        
+        # 获取客户端6和其模型
+        client6 = self.client_manager.get_client(6)
+        if client6 is None or 6 not in self.client_models:
+            self.logger.warning("无法获取客户端6或其模型")
+            return
+            
+        client6_model = copy.deepcopy(self.client_models[6]).to(self.default_device)
+        server_model = copy.deepcopy(self.server_model).to(self.default_device)
+        global_classifier = copy.deepcopy(self.global_classifier).to(self.default_device)
+        
+        # 设置为评估模式
+        client6_model.eval()
+        server_model.eval()
+        global_classifier.eval()
+        
+        # 创建一个特征提取函数
+        def extract_features(data_loader, n_batches=5):
+            features_dict = {
+                'client_inputs': [],
+                'client_features': [],
+                'server_features': [],
+                'global_logits': [],
+                'targets': []
+            }
+            
+            with torch.no_grad():
+                for i, (inputs, targets) in enumerate(data_loader):
+                    if i >= n_batches:
+                        break
+                        
+                    inputs = inputs.to(self.default_device)
+                    targets = targets.to(self.default_device)
+                    
+                    # 客户端前向传播
+                    local_logits, client_features = client6_model(inputs)
+                    
+                    # 服务器前向传播
+                    try:
+                        server_features = server_model(client_features, tier=client6.tier)
+                        global_logits = global_classifier(server_features)
+                    except Exception as e:
+                        self.logger.error(f"特征提取错误: {str(e)}")
+                        continue
+                    
+                    # 保存特征
+                    features_dict['client_inputs'].append(inputs.cpu().numpy())
+                    features_dict['client_features'].append(client_features.cpu().numpy())
+                    features_dict['server_features'].append(server_features.cpu().numpy())
+                    features_dict['global_logits'].append(global_logits.cpu().numpy())
+                    features_dict['targets'].append(targets.cpu().numpy())
+            
+            # 合并批次数据
+            for k in features_dict:
+                if features_dict[k]:
+                    features_dict[k] = np.concatenate(features_dict[k], axis=0)
+            
+            return features_dict
+        
+        # 提取训练和测试集特征
+        try:
+            import numpy as np
+            
+            self.logger.info("提取客户端6测试集特征...")
+            test_features = extract_features(client6.test_data)
+            
+            # 保存诊断信息
+            import os
+            os.makedirs('diagnostics', exist_ok=True)
+            
+            # 保存特征到numpy文件
+            np.savez_compressed(
+                f'diagnostics/client6_features_round{round_idx}.npz',
+                **test_features
+            )
+            
+            self.logger.info(f"客户端6特征已保存到 diagnostics/client6_features_round{round_idx}.npz")
+            
+            # 打印一些统计信息
+            if len(test_features['global_logits']) > 0:
+                preds = np.argmax(test_features['global_logits'], axis=1)
+                unique_preds = np.unique(preds)
+                
+                self.logger.info(f"全局分类器预测统计:")
+                self.logger.info(f"- 样本数量: {len(preds)}")
+                self.logger.info(f"- 不同类别数量: {len(unique_preds)}")
+                self.logger.info(f"- 预测的类别: {unique_preds}")
+                
+                if len(unique_preds) == 1:
+                    self.logger.warning(f"警告: 全局分类器对所有样本预测相同类别 ({unique_preds[0]})")
+                    
+                    # 分析服务器特征
+                    server_feat = test_features['server_features']
+                    self.logger.info(f"服务器特征统计:")
+                    self.logger.info(f"- 均值: {np.mean(server_feat):.4f}")
+                    self.logger.info(f"- 标准差: {np.std(server_feat):.4f}")
+                    self.logger.info(f"- 最小值: {np.min(server_feat):.4f}")
+                    self.logger.info(f"- 最大值: {np.max(server_feat):.4f}")
+                    self.logger.info(f"- 零值比例: {np.mean(np.abs(server_feat) < 1e-5)*100:.2f}%")
+        except Exception as e:
+            self.logger.error(f"诊断过程出错: {str(e)}")
+            import traceback
+            traceback.print_exc()
 
 # 自适应训练控制器 - 动态调整训练参数
 class AdaptiveTrainingController:
@@ -556,6 +779,13 @@ class ModelFeatureClusterer:
         """基于模型特征的聚类方法"""
         clusters = {i: [] for i in range(self.num_clusters)}
         
+        print("\n[CLUSTERING] 开始客户端聚类...")
+    
+        # 检查客户端6是否在列表中
+        has_client6 = 6 in client_ids
+        if has_client6:
+            print("[CLUSTERING] 客户端6将参与聚类")
+        
         # 提取模型特征
         client_features = {}
         feature_dims = []  # 记录所有特征向量的维度
@@ -584,6 +814,15 @@ class ModelFeatureClusterer:
                     features_array = np.array(features, dtype=np.float32)
                     client_features[client_id] = features_array
                     feature_dims.append(len(features_array))
+
+                    # 特别检查客户端6的特征
+                    if client_id == 6:
+                        print(f"[CLUSTERING] 客户端6特征维度: {len(features_array)}")
+                        print(f"[CLUSTERING] 客户端6特征统计: min={features_array.min():.4f}, max={features_array.max():.4f}, mean={features_array.mean():.4f}, std={features_array.std():.4f}")
+                        # 检查是否有异常值
+                        nan_count = np.isnan(features_array).sum()
+                        inf_count = np.isinf(features_array).sum()
+                        print(f"[CLUSTERING] 客户端6特征异常值: NaN={nan_count}, Inf={inf_count}")
         
         # 检查所有特征向量的维度是否一致
         if feature_dims and len(set(feature_dims)) > 1:
@@ -666,6 +905,31 @@ class ModelFeatureClusterer:
                 cluster_idx = i % self.num_clusters
                 clusters[cluster_idx].append(client_id)
         
+
+        # 执行聚类后检查客户端6的分配
+        for cluster_id, clients in clusters.items():
+            if 6 in clients:
+                print(f"[CLUSTERING] 客户端6被分配到聚类 {cluster_id}")
+                print(f"[CLUSTERING] 聚类 {cluster_id} 中的所有客户端: {clients}")
+                
+                # 计算该聚类与其他聚类的差异
+                if len(client_features) > 0 and 6 in client_features:
+                    client6_feature = client_features[6]
+                    for other_id, other_feature in client_features.items():
+                        if other_id == 6 or other_id not in client_ids:
+                            continue
+                        
+                        # 计算特征向量余弦相似度
+                        try:
+                            # 确保长度一致
+                            min_len = min(len(client6_feature), len(other_feature))
+                            sim = np.dot(client6_feature[:min_len], other_feature[:min_len]) / (
+                                np.linalg.norm(client6_feature[:min_len]) * np.linalg.norm(other_feature[:min_len])
+                            )
+                            print(f"[CLUSTERING] 客户端6与客户端{other_id}的特征相似度: {sim:.4f}")
+                        except Exception as e:
+                            print(f"[CLUSTERING] 计算相似度出错: {str(e)}")
+
         # 记录聚类结果
         self.clustering_history.append({
             'timestamp': time.time(),

@@ -2,6 +2,7 @@ import torch
 import copy
 import numpy as np
 from collections import defaultdict
+import math
 
 # 稳定化聚合器 - 处理数据异质性的聚合问题
 class StabilizedAggregator:
@@ -44,12 +45,39 @@ class StabilizedAggregator:
         return aggregated_model
     
     # 聚合服务器模型
-    def aggregate_server(self, server_states, cluster_weights=None):
-        """聚合服务器状态"""
-        # 没有服务器状态时直接返回空字典
+    def aggregate_server(self, server_states, cluster_weights=None, eval_results=None, cluster_map=None):
+        """基于性能感知的服务器状态聚合"""
         if not server_states:
             return {}
+        
+        # 如果提供了评估结果和聚类映射，计算基于性能的权重
+        if eval_results and cluster_map:
+            performance_weights = {}
+            total_weight = 0.0
             
+            for cluster_id, model_state in server_states.items():
+                # 计算该聚类中客户端的平均全局准确率
+                cluster_clients = cluster_map.get(cluster_id, [])
+                valid_clients = [c for c in cluster_clients if c in eval_results]
+                
+                if valid_clients:
+                    avg_acc = sum(eval_results[c].get('global_accuracy', 0) 
+                            for c in valid_clients) / len(valid_clients)
+                    
+                    # 使用sigmoid函数映射准确率到权重
+                    weight = 1.0 / (1.0 + math.exp(-0.1 * (avg_acc - 50)))
+                    performance_weights[cluster_id] = weight
+                    total_weight += weight
+                else:
+                    performance_weights[cluster_id] = 0.5
+                    total_weight += 0.5
+            
+            # 归一化权重
+            if total_weight > 0:
+                for cluster_id in performance_weights:
+                    performance_weights[cluster_id] /= total_weight
+                cluster_weights = performance_weights
+                
         # 默认使用平均权重
         if cluster_weights is None:
             cluster_weights = {i: 1.0/len(server_states) for i in server_states}
@@ -68,12 +96,10 @@ class StabilizedAggregator:
             
             aggregated_model = stabilized_model
         
-        # 保存当前模型作为下一轮的历史
         self.previous_server_model = copy.deepcopy(aggregated_model)
         
         return aggregated_model
-    
-    
+        
      # 添加自适应动量方法
     def adjust_beta(self, round_idx, global_acc, prev_global_acc):
         """基于训练进度和性能动态调整动量因子"""

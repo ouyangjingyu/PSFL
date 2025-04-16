@@ -38,6 +38,7 @@ import warnings
 from collections import defaultdict
 import torchvision
 import torchvision.transforms as transforms
+import math
 
 # 忽略警告
 warnings.filterwarnings("ignore")
@@ -46,7 +47,7 @@ warnings.filterwarnings("ignore")
 sys.path.insert(0, os.path.abspath(os.path.join(os.getcwd(), "../")))
 
 # 导入自定义模块
-from model.resnet import create_tierhfl_client_model, create_tierhfl_server_model,LayerNormCNN, EnhancedServerModel, GlobalClassifier, TierAwareClientModel
+from model.resnet import EnhancedServerModel, TierAwareClientModel,ImprovedGlobalClassifier
 from utils.tierhfl_aggregator import StabilizedAggregator
 from utils.tierhfl_client import TierHFLClientManager
 from utils.tierhfl_trainer import ClusterAwareParallelTrainer, AdaptiveTrainingController, ModelFeatureClusterer
@@ -453,7 +454,7 @@ def main():
     
     # 创建全局分类器
     logger.info("创建全局分类器...")
-    global_classifier = GlobalClassifier(feature_dim=128, num_classes=class_num).to(device)
+    global_classifier = ImprovedGlobalClassifier(feature_dim=128, num_classes=class_num).to(device)
     
     # 创建稳定化聚合器
     logger.info("创建稳定化聚合器...")
@@ -575,7 +576,11 @@ def main():
         # 聚合服务器模型
         if server_models:
             cluster_weights = {cluster_id: 1.0/len(server_models) for cluster_id in server_models.keys()}
-            aggregated_server_model = aggregator.aggregate_server(server_models, cluster_weights)
+            aggregated_server_model = aggregator.aggregate_server(
+                server_models, 
+                eval_results=eval_results,
+                cluster_map=cluster_map
+            )
             
             # 更新服务器模型
             try:
@@ -583,19 +588,66 @@ def main():
             except Exception as e:
                 logger.error(f"更新服务器模型失败: {str(e)}")
         
-        # 聚合全局分类器
+        # 聚合全局分类器 - 使用基于性能的权重
         if global_classifier_states:
-            classifier_weights = {cluster_id: 1.0/len(global_classifier_states) for cluster_id in global_classifier_states.keys()}
-            aggregated_classifier = trainer._aggregate_classifiers(global_classifier_states, classifier_weights)
+            # 计算基于性能的聚合权重
+            classifier_weights = {}
+            total_weight = 0.0
+            for cluster_id in global_classifier_states.keys():
+                cluster_clients = cluster_map.get(cluster_id, [])
+                valid_clients = [c for c in cluster_clients if c in eval_results]
+                
+                if valid_clients:
+                    avg_acc = sum(eval_results[c].get('global_accuracy', 0) 
+                               for c in valid_clients) / len(valid_clients)
+                    weight = 1.0 / (1.0 + math.exp(-0.1 * (avg_acc - 50)))
+                    classifier_weights[cluster_id] = weight
+                    total_weight += weight
+                else:
+                    classifier_weights[cluster_id] = 0.5
+                    total_weight += 0.5
+            
+            # 归一化权重
+            if total_weight > 0:
+                for cluster_id in classifier_weights:
+                    classifier_weights[cluster_id] /= total_weight
+            
+            # 聚合分类器
+            aggregated_classifier = trainer._aggregate_classifiers(
+                global_classifier_states, 
+                classifier_weights
+            )
             
             # 更新全局分类器
             try:
                 global_classifier.load_state_dict(aggregated_classifier)
             except Exception as e:
                 logger.error(f"更新全局分类器失败: {str(e)}")
-        
+
         aggregation_time = time.time() - aggregation_start_time
+        # 监控全局分类器预测分布
+        class_distribution = [0] * class_num
+        num_predictions = 0
         
+        for client_id, result in eval_results.items():
+            if 'global_predictions' in result:
+                for pred in result['global_predictions']:
+                    if 0 <= pred < class_num:
+                        class_distribution[pred] += 1
+                        num_predictions += 1
+        
+        # 输出分类器预测分布统计
+        if num_predictions > 0:
+            pred_distribution = [count/num_predictions*100 for count in class_distribution]
+            logger.info(f"全局分类器类别分布: {[f'{dist:.1f}%' for dist in pred_distribution]}")
+            
+            # 检查分类不平衡问题
+            max_class = np.argmax(class_distribution)
+            max_percent = max(pred_distribution)
+            if max_percent > 30:
+                logger.warning(f"全局分类器存在类别不平衡问题，类别 {max_class} 占比 {max_percent:.1f}%")
+        
+            
         # 更新客户端模型的共享部分
         comm_start_time = time.time()
         for client_id, model in client_models.items():
@@ -624,6 +676,26 @@ def main():
             client_models[client_id] = model
         
         communication_time = time.time() - comm_start_time
+
+        # ...监控全局分类器预测分布（新增）
+        class_distribution = [0] * class_num
+        for client_id, result in eval_results.items():
+            if 'global_predictions' in result:
+                for pred in result['global_predictions']:
+                    if 0 <= pred < class_num:
+                        class_distribution[pred] += 1
+                        
+        # 输出分类器预测分布统计
+        if class_distribution:
+            total_preds = sum(class_distribution)
+            pred_distribution = [count/max(1, total_preds)*100 for count in class_distribution]
+            logger.info(f"全局分类器类别分布: {[f'{dist:.1f}%' for dist in pred_distribution]}")
+            
+            # 检查分类不平衡问题
+            max_class = np.argmax(class_distribution)
+            max_percent = max(pred_distribution)
+            if max_percent > 30:
+                logger.warning(f"全局分类器存在类别不平衡问题，类别 {max_class} 占比 {max_percent:.1f}%")
 
         # 计算全局指标
         total_samples = 0
@@ -870,6 +942,11 @@ def main():
             wandb.log(metrics)
         except Exception as e:
             logger.error(f"记录wandb指标失败: {str(e)}")
+        
+        # 特别针对客户端6进行诊断分析
+        if round_idx <= 5:  # 只在前几轮执行诊断，避免过多信息
+            logger.info("执行客户端6诊断...")
+            trainer.diagnose_client6_features(round_idx)
         
         # 每10轮重新聚类一次
         if (round_idx + 1) % 10 == 0 and round_idx < args.rounds - 10:

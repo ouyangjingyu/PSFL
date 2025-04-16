@@ -29,19 +29,35 @@ class EnhancedFeatureAlignmentLoss(nn.Module):
         
     def forward(self, client_features, server_features, round_idx=0):
         """改进的特征对齐损失计算"""
+        # 添加调试模式
+        debug_mode = hasattr(self, '_debug_client_id') and self._debug_client_id == 6
+        
+        if debug_mode:
+            print(f"\n[Feature Loss DEBUG] 客户端特征形状: {client_features.shape}")
+            print(f"[Feature Loss DEBUG] 服务器特征形状: {server_features.shape}")
+        
         # 确保特征是4D或2D张量
         if len(client_features.shape) == 4:  # 4D: [B, C, H, W]
             batch_size = client_features.size(0)
             client_pooled = F.adaptive_avg_pool2d(client_features, (1, 1))
             client_features = client_pooled.view(batch_size, -1)
             
+            if debug_mode:
+                print(f"[Feature Loss DEBUG] 池化后客户端特征形状: {client_features.shape}")
+        
         if len(server_features.shape) == 4:  # 4D: [B, C, H, W]
             batch_size = server_features.size(0)
             server_pooled = F.adaptive_avg_pool2d(server_features, (1, 1))
             server_features = server_pooled.view(batch_size, -1)
+            
+            if debug_mode:
+                print(f"[Feature Loss DEBUG] 池化后服务器特征形状: {server_features.shape}")
         
         # 统一特征维度
         if client_features.size(1) != server_features.size(1):
+            if debug_mode:
+                print(f"[Feature Loss DEBUG] 特征维度不匹配! 客户端: {client_features.size(1)}, 服务器: {server_features.size(1)}")
+            
             target_dim = min(client_features.size(1), server_features.size(1))
             
             if client_features.size(1) > target_dim:
@@ -50,19 +66,35 @@ class EnhancedFeatureAlignmentLoss(nn.Module):
             if server_features.size(1) > target_dim:
                 server_features = server_features[:, :target_dim]
                 
-        # 标准化特征向量
-        client_norm = F.normalize(client_features, dim=1)
-        server_norm = F.normalize(server_features, dim=1)
+            if debug_mode:
+                print(f"[Feature Loss DEBUG] 调整后维度: {target_dim}")
         
-        # 余弦相似度
-        cosine_sim = torch.mean(torch.sum(client_norm * server_norm, dim=1))
-        cosine_loss = 1.0 - cosine_sim
+        # 标准化特征向量并检测异常值
+        try:
+            client_norm = F.normalize(client_features, dim=1)
+            server_norm = F.normalize(server_features, dim=1)
+            
+            if debug_mode:
+                print(f"[Feature Loss DEBUG] 客户端归一化后是否有NaN: {torch.isnan(client_norm).any().item()}")
+                print(f"[Feature Loss DEBUG] 服务器归一化后是否有NaN: {torch.isnan(server_norm).any().item()}")
+            
+            # 余弦相似度
+            cosine_sim = torch.mean(torch.sum(client_norm * server_norm, dim=1))
+            cosine_loss = 1.0 - cosine_sim
+            
+            if debug_mode:
+                print(f"[Feature Loss DEBUG] 余弦相似度: {cosine_sim.item():.4f}")
+                print(f"[Feature Loss DEBUG] 特征对齐损失: {cosine_loss.item():.4f}")
+        except Exception as e:
+            if debug_mode:
+                print(f"[Feature Loss DEBUG] 计算特征对齐损失出错: {str(e)}")
+            # 出错时返回一个默认损失值
+            return torch.tensor(1.0, device=client_features.device)
         
         # 随训练轮次渐进增强特征对齐强度
         alignment_weight = min(0.8, 0.2 + round_idx/100)
         
         return cosine_loss * alignment_weight
-
 
 # 增强型客户端 - 支持分层模型和双重学习目标
 class TierHFLClient:
@@ -293,7 +325,8 @@ class TierHFLClient:
         client_model = client_model.to(self.device)
         server_model = server_model.to(self.device)
         global_classifier = global_classifier.to(self.device)
-        
+        # 添加调试标志
+        is_client6 = (self.client_id == 6)
         # 设置为评估模式
         client_model.eval()
         server_model.eval()
@@ -317,22 +350,74 @@ class TierHFLClient:
         global_class_correct = [0] * num_classes
         global_class_total = [0] * num_classes
         
+        # 添加收集全局分类器预测的功能
+        global_predictions = []
         with torch.no_grad():
             for data, target in self.test_data:
+                batch_count = 0  # 添加批次计数
                 # 将数据移到设备上
                 data, target = data.to(self.device), target.to(self.device)
                 
                 # 客户端前向传播
                 local_logits, features = client_model(data)
+
+                # 只对前几个批次进行详细调试，避免信息过多
+                do_debug = is_client6 and batch_count < 3
+                
+                if do_debug:
+                    print(f"\n[Client6 Debug] 批次 {batch_count} 客户端特征:")
+                    print(f"- 形状: {features.shape}")
+                    print(f"- 范围: {features.min().item():.4f} 到 {features.max().item():.4f}")
+                    
+                    # 检查特征是否有异常值
+                    has_nan = torch.isnan(features).any().item()
+                    has_inf = torch.isinf(features).any().item()
+                    print(f"- 特征有NaN: {has_nan}, 有Inf: {has_inf}")
                 
                 # 服务器前向传播
                 try:
                     server_features = server_model(features, tier=self.tier)
+
+                    if do_debug:
+                        print(f"[Client6 Debug] 服务器处理后特征:")
+                        print(f"- 形状: {server_features.shape}")
+                        print(f"- 范围: {server_features.min().item():.4f} 到 {server_features.max().item():.4f}")
+                        print(f"- 均值: {server_features.mean().item():.4f}")
+                        print(f"- 标准差: {server_features.std().item():.4f}")
+                        
+                        # 检查特征是否有异常值
+                        has_nan = torch.isnan(server_features).any().item()
+                        has_inf = torch.isinf(server_features).any().item()
+                        print(f"- 特征有NaN: {has_nan}, 有Inf: {has_inf}")
+
+
+
                     global_logits = global_classifier(server_features)
+
+                    if do_debug:
+                        print(f"[Client6 Debug] 全局分类器输出:")
+                        print(f"- 形状: {global_logits.shape}")
+                        print(f"- 范围: {global_logits.min().item():.4f} 到 {global_logits.max().item():.4f}")
+                        
+                        # 检查是否所有样本预测相同类别
+                        pred_classes = torch.argmax(global_logits, dim=1)
+                        unique_preds = torch.unique(pred_classes)
+                        print(f"- 预测的类别: {pred_classes[:5].cpu().numpy()}")
+                        print(f"- 不同类别数量: {len(unique_preds)}")
+                        print(f"- 预测概率分布: {torch.softmax(global_logits[0], dim=0).cpu().numpy().round(3)}")
+                        
+                        # 如果都预测同一个类别，这是问题的关键
+                        if len(unique_preds) == 1:
+                            print(f"!!! 警告: 全局分类器总是预测同一类别: {unique_preds.item()} !!!")
                 except Exception as e:
-                    print(f"评估时服务器前向传播失败: {str(e)}")
+                    if is_client6:
+                        print(f"[Client6 Error] 服务器处理或全局分类时出错: {str(e)}")
+                        import traceback
+                        traceback.print_exc()
                     # 使用local_logits作为备用
                     global_logits = local_logits
+                
+                batch_count += 1
                 
                 # 计算损失
                 loss = criterion(global_logits, target)
@@ -345,6 +430,9 @@ class TierHFLClient:
                 # 计算全局准确率
                 _, global_pred = global_logits.max(1)
                 global_correct += global_pred.eq(target).sum().item()
+
+                # 收集预测结果
+                global_predictions.extend(global_pred.cpu().numpy().tolist())
                 
                 # 更新总样本数
                 total += target.size(0)
@@ -382,7 +470,8 @@ class TierHFLClient:
             'global_accuracy': global_accuracy,
             'local_per_class_acc': local_per_class_acc,
             'global_per_class_acc': global_per_class_acc,
-            'global_imbalance': global_imbalance
+            'global_imbalance': global_imbalance,
+            'global_predictions': global_predictions  # 添加预测结果收集
         }
     
     def update_alpha(self, alpha):
@@ -400,8 +489,8 @@ class TierHFLClientManager:
         self.clients = {}
         self.default_device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
-    def add_client(self, client_id, tier, train_data, test_data, 
-                   device=None, lr=0.001, local_epochs=1):
+    # 在客户端管理器中添加监控方法
+    def add_client(self, client_id, tier, train_data, test_data, device=None, lr=0.001, local_epochs=1):
         """添加客户端"""
         device = device or self.default_device
         
@@ -414,6 +503,31 @@ class TierHFLClientManager:
             lr=lr,
             local_epochs=local_epochs
         )
+        
+        # 针对客户端6添加特殊监控
+        if client_id == 6:
+            print(f"\n[CLIENT MANAGER] 注册客户端6 - Tier: {tier}")
+            print(f"[CLIENT MANAGER] 客户端6训练集样本数: {len(train_data.dataset)}")
+            print(f"[CLIENT MANAGER] 客户端6测试集样本数: {len(test_data.dataset)}")
+            
+            # 检查数据集分布
+            try:
+                # 获取前5个样本的标签
+                print("[CLIENT MANAGER] 分析客户端6数据集...")
+                sample_labels = []
+                for i, (_, labels) in enumerate(train_data):
+                    sample_labels.extend(labels.tolist())
+                    if i >= 2:  # 只检查前几个批次
+                        break
+                
+                # 统计标签分布
+                label_counts = {}
+                for label in sample_labels:
+                    label_counts[label] = label_counts.get(label, 0) + 1
+                    
+                print(f"[CLIENT MANAGER] 客户端6训练集标签分布(部分): {label_counts}")
+            except Exception as e:
+                print(f"[CLIENT MANAGER] 分析客户端6数据时出错: {str(e)}")
         
         self.clients[client_id] = client
         return client
