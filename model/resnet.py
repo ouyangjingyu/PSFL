@@ -3,14 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-# 添加Mish激活函数定义
-class Mish(nn.Module):
-    def __init__(self):
-        super().__init__()
-    
-    def forward(self, x):
-        return x * torch.tanh(F.softplus(x))
-        
 # 替代BatchNorm的LayerNorm实现 - 适用于CNN
 class LayerNormCNN(nn.Module):
     def __init__(self, num_channels, eps=1e-5):
@@ -454,38 +446,14 @@ class TierAwareClientModel(nn.Module):
             self.layer6 = self._make_residual_group(128, 128, 2)
             self.out_channels = 128
             
-        # # 本地分类器 - 根据out_channels确定输入维度
-        # self.local_classifier = nn.Sequential(
-        #     nn.AdaptiveAvgPool2d((1, 1)),
-        #     nn.Flatten(),
-        #     nn.Dropout(0.3),
-        #     nn.Linear(self.out_channels, num_classes)
-        # )
-
-        # 改进的本地分类器 - 添加更高效的激活函数
+        # 本地分类器 - 根据out_channels确定输入维度
         self.local_classifier = nn.Sequential(
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
-            nn.LayerNorm(self.out_channels),
-            nn.Linear(self.out_channels, 128 if tier <= 3 else self.out_channels//2),
-            # 使用Mish激活函数提升非线性表达能力
-            Mish(),  # 需要添加自定义Mish类
-            nn.LayerNorm(128 if tier <= 3 else self.out_channels//2),
-            nn.Linear(128 if tier <= 3 else self.out_channels//2, num_classes)
+            nn.Dropout(0.3),
+            nn.Linear(self.out_channels, num_classes)
         )
-
-
-        # 添加初始化方法
-        self._initialize_classifier_weights()
-            
-    def _initialize_classifier_weights(self):
-        """初始化分类器权重"""
-        for m in self.local_classifier.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            
+        
     def _make_residual_group(self, in_planes, out_planes, blocks, stride=1):
         layers = []
         
@@ -539,13 +507,10 @@ class TierAwareClientModel(nn.Module):
         # 保存特征以传递给服务器
         features = x
         
-        # # 应用本地分类器
-        # x_pool = self.local_classifier[0:2](x)  # 应用池化和展平
-        # local_features = x_pool
-        # local_logits = self.local_classifier[2:](x_pool)  # 应用剩余分类器层
-
         # 应用本地分类器
-        local_logits = self.local_classifier(x)  
+        x_pool = self.local_classifier[0:2](x)  # 应用池化和展平
+        local_features = x_pool
+        local_logits = self.local_classifier[2:](x_pool)  # 应用剩余分类器层
 
         # 添加特征调试
         if client_id == 6:

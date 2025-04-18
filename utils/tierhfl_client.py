@@ -144,35 +144,18 @@ class TierHFLClient:
         server_model.train()
         global_classifier.train()
         
-
-        # 优化器设置部分
+         # 优化器设置
         if hasattr(client_model, 'get_shared_params') and hasattr(client_model, 'get_personalized_params'):
             shared_params = list(client_model.get_shared_params().values())
             personalized_params = list(client_model.get_personalized_params().values())
             
-            # 大幅提高分类器学习率强化个性化
-            classifier_lr_multiplier = 4.0
-            if self.tier <= 3:  # 高性能设备可用更激进学习率
-                classifier_lr_multiplier = 5.0
-            
-            classifier_lr = self.lr * classifier_lr_multiplier
-            
-            # 优化特征提取部分
-            optimizer_shared = torch.optim.Adam(
-                shared_params, 
-                lr=self.lr,
-                weight_decay=1e-4
-            )
-            
-            # 优化个性化分类器部分
-            optimizer_personal = torch.optim.AdamW(  # 从SGD改为AdamW
-                personalized_params, 
-                lr=classifier_lr,
-                weight_decay=2e-4  # 更强的正则化
-            )
-            
-            if self.client_id % 10 == 0:  # 避免过多日志，只显示部分客户端信息
-                print(f"客户端 {self.client_id} - 特征学习率: {self.lr:.6f}, 分类器学习率: {classifier_lr:.6f}")
+            # 共享参数使用Adam
+            optimizer_shared = torch.optim.Adam(shared_params, lr=self.lr)
+            # 个性化参数使用更高学习率的SGD+动量
+            optimizer_personal = torch.optim.SGD(personalized_params, 
+                                            lr=self.lr * 1.5,
+                                            momentum=0.9,
+                                            weight_decay=1e-4)
         else:
             # 后备方案
             optimizer_shared = torch.optim.Adam(client_model.parameters(), lr=self.lr)
@@ -198,12 +181,10 @@ class TierHFLClient:
             'total': 0,
             'batch_count': 0
         }
-        # 初始化早停相关变量
-        early_stop_patience = max(5, 10 - round_idx // 10)  # 随着训练进行减少耐心
+        # 添加早停相关变量
+        early_stop_patience = 10
         best_loss = float('inf')
         patience_counter = 0
-        min_epochs = 2  # 最少训练轮次
-        initial_loss = float('inf')
         # 训练循环
         for epoch in range(self.local_epochs):
             epoch_loss = 0.0
@@ -295,27 +276,15 @@ class TierHFLClient:
             # 检查早停条件
             if num_batches > 0:
                 avg_epoch_loss = epoch_loss / num_batches
-                
-                # 记录初始损失
-                if epoch == 0:
-                    initial_loss = avg_epoch_loss
-                
-                # 记录最佳损失
-                is_best = avg_epoch_loss < best_loss * 0.995  # 至少需要0.5%的改进
-                if is_best:
+                if avg_epoch_loss < best_loss * 0.995:  # 至少需要0.5%的改进
                     best_loss = avg_epoch_loss
                     patience_counter = 0
                 else:
                     patience_counter += 1
                     
-                # 决定是否早停
-                if patience_counter >= early_stop_patience and epoch >= min_epochs:
-                    relative_improvement = (initial_loss - best_loss) / initial_loss
-                    
-                    # 根据相对改进决定是否继续训练
-                    if relative_improvement > 0.05:  # 至少5%的改进
-                        print(f"客户端 {self.client_id} 早停于第 {epoch+1}/{self.local_epochs} 轮")
-                        break
+                if patience_counter >= early_stop_patience:
+                    print(f"客户端 {self.client_id} 早停于第 {epoch+1}/{self.local_epochs} 轮")
+                    break
         
         # 计算平均损失和准确率
         num_batches = epoch_stats['batch_count']
