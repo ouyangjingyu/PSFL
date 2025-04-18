@@ -595,79 +595,40 @@ class AdaptiveTrainingController:
                 self.history['global_imbalance'].append(sum(valid_imbalances) / len(valid_imbalances))
     
     def adjust_parameters(self):
-        """调整训练参数，更加动态的策略"""
+        """优化的参数调整策略，强化个性化能力"""
         if len(self.history['local_accuracy']) < 3:
             return {'alpha': self.alpha, 'lambda_feature': self.lambda_feature}
         
-        # 获取最近几轮的性能指标
-        window_size = min(5, len(self.history['local_accuracy']))
-        recent_local_acc = self.history['local_accuracy'][-window_size:]
-        recent_global_acc = self.history['global_accuracy'][-window_size:]
+        # 获取性能指标
+        current_local_acc = self.history['local_accuracy'][-1]
+        current_global_acc = self.history['global_accuracy'][-1]
         
-        # 计算趋势
-        local_trend = recent_local_acc[-1] - recent_local_acc[-3]
-        global_trend = recent_global_acc[-1] - recent_global_acc[-3]
-        
-        # 当前性能
-        current_local_acc = recent_local_acc[-1]
-        current_global_acc = recent_global_acc[-1]
-        
-        # 计算不平衡度趋势
-        if len(self.history['global_imbalance']) >= 3:
-            recent_imbalance = self.history['global_imbalance'][-3:]
-            imbalance_trend = recent_imbalance[-1] - recent_imbalance[0]
-        else:
-            imbalance_trend = 0
-        
-        # 新策略：根据性能差距和趋势调整alpha
+        # 计算本地和全局准确率差距
         acc_gap = current_local_acc - current_global_acc
         
-        # # 调整alpha - 个性化与全局平衡
-        # if acc_gap > 5.0:
-        #     # 本地模型明显更好，增加个性化权重
-        #     self.alpha = min(0.9, self.alpha + 0.1)
-        # elif acc_gap < -5.0:
-        #     # 全局模型明显更好，增加全局权重
-        #     self.alpha = max(0.1, self.alpha - 0.1)
-        # elif global_trend < -1.0 and local_trend > 0:
-        #     # 全局性能下降但本地性能上升，适当增加个性化权重
-        #     self.alpha = min(0.6, self.alpha + 0.03)
-        # elif global_trend > 0.5 and local_trend < 0:
-        #     # 全局性能上升但本地性能下降，适当增加全局权重
-        #     self.alpha = max(0.2, self.alpha - 0.05)
-
-        # # 调整lambda_feature - 特征对齐
-        # if imbalance_trend > 0.5 or current_global_acc < 40:
-        #     # 不平衡度增加或全局性能差，更强力增强特征对齐
-        #     self.lambda_feature = min(0.5, self.lambda_feature + 0.1)
-        # elif global_trend < -1.0:
-        #     # 全局性能下降，增强特征对齐
-        #     self.lambda_feature = min(0.5, self.lambda_feature + 0.05)
-        # elif global_trend > 1.0 and imbalance_trend < 0:
-        #     # 全局性能上升且不平衡度下降，适当减弱特征对齐
-        #     self.lambda_feature = max(0.05, self.lambda_feature - 0.03)
-
-        # 调整alpha - 个性化与全局平衡，更加倾向全局性能
-        if global_trend < -1.0 and local_trend > 0:
-            # 全局性能下降但本地性能上升，适度增加个性化权重
-            self.alpha = min(0.6, self.alpha + 0.03)  # 限制最大值并减小增量
-        elif global_trend > 0.5 or (global_trend > 0 and local_trend < 0):
-            # 更积极地降低alpha以促进全局学习
-            self.alpha = max(0.1, self.alpha - 0.05)
-
-        # 增强特征对齐的调整
-        if global_trend < 0 or imbalance_trend > 0.2:
-            # 当全局性能下降或不平衡度增加时，增强特征对齐
-            self.lambda_feature = min(0.8, self.lambda_feature + 0.1)
-        elif global_trend > 2.0 and imbalance_trend < 0:
-            # 全局性能显著上升且不平衡度下降，适当减弱特征对齐
-            self.lambda_feature = max(0.2, self.lambda_feature - 0.05)
+        # 训练轮次
+        round_idx = len(self.history['local_accuracy'])
+        early_stage = round_idx < 20
+        late_stage = round_idx >= 60
         
+        # 优化alpha，优先提升本地模型性能
+        if current_local_acc < 75:  # 本地准确率较低时
+            self.alpha = min(0.8, self.alpha + 0.05)  # 快速增加本地权重
+        elif acc_gap < -5:  # 全局模型明显优于本地模型
+            self.alpha = min(0.7, self.alpha + 0.03)  # 增加本地权重
+        elif current_local_acc >= 85:  # 本地模型已经很好
+            self.alpha = max(0.6, min(0.75, self.alpha))  # 稳定在较高区间
+        else:  # 默认情况
+            self.alpha = min(0.75, self.alpha + 0.02)  # 缓慢增加本地权重
+        
+        # 特征对齐调整 - 后期减弱约束增强个性化
+        if late_stage:
+            self.lambda_feature = max(0.05, self.lambda_feature - 0.02)
         
         return {
             'alpha': self.alpha,
             'lambda_feature': self.lambda_feature
-        }
+        } 
 
 # 数据分布聚类器 - 基于数据特性进行聚类
 class DataDistributionClusterer:

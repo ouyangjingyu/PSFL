@@ -39,6 +39,7 @@ from collections import defaultdict
 import torchvision
 import torchvision.transforms as transforms
 import math
+import itertools
 
 # 忽略警告
 warnings.filterwarnings("ignore")
@@ -326,50 +327,147 @@ def load_global_test_set(args):
     else:
         # 默认返回CIFAR10
         return load_global_test_set_cifar10(args)
-def evaluate_global_model(client_model, server_model, global_classifier, global_test_loader, device, tier=1):
-    """评估全局模型在全局测试集上的性能"""
-    # 确保所有模型都移到同一设备
-    client_model = client_model.to(device)
-    server_model = server_model.to(device)
-    global_classifier = global_classifier.to(device)
-    # 打印设备信息以验证
-    print(f"评估设备检查 - 数据将移至: {device}")
-    print(f"客户端模型设备: {next(client_model.parameters()).device}")
-    print(f"服务器模型设备: {next(server_model.parameters()).device}")
-    print(f"全局分类器设备: {next(global_classifier.parameters()).device}")
-    # 设置为评估模式
-    client_model.eval()
-    server_model.eval()
-    global_classifier.eval()
+
+def evaluate_generalization(client_models, server_model, global_classifier, client_resources, 
+                          test_data_local_dict, device, class_num):
+    """评估模型的泛化性能 - 三种场景测试"""
+    logger.info("执行综合泛化性评估...")
     
-    correct = 0
-    total = 0
+    # 场景1: 所有客户端使用相同的全局服务器和分类器，测试各自本地数据
+    scenario1_results = {}
     
-    with torch.no_grad():
-        for data, target in global_test_loader:
-            # 确保数据也在同一设备上
-            data, target = data.to(device), target.to(device)
+    # 场景2: 所有客户端使用相同的服务器和分类器，但处理其他客户端的小部分数据
+    scenario2_results = {}
+    
+    # 场景3: 所有客户端合作处理全局IID测试集
+    scenario3_correct = 0
+    scenario3_total = 0
+    
+    # 转换CIFAR10标准测试集为可以分片的列表
+    global_test_data = []
+    for data, target in global_test_loader:
+        for i in range(len(target)):
+            global_test_data.append((data[i:i+1], target[i:i+1]))
+    
+    # 计算每个客户端应处理的全局数据量
+    client_ids = list(client_models.keys())
+    samples_per_client = max(1, len(global_test_data) // len(client_ids))
+    
+    # 分配给每个客户端
+    client_global_data = {}
+    for i, client_id in enumerate(client_ids):
+        start_idx = i * samples_per_client
+        end_idx = min(start_idx + samples_per_client, len(global_test_data))
+        client_global_data[client_id] = global_test_data[start_idx:end_idx]
+    
+    # 执行测试
+    for client_id, model in client_models.items():
+        # 获取客户端和tier
+        client_tier = client_resources[client_id]['tier']
+        
+        # 准备模型
+        client_model = copy.deepcopy(model).to(device)
+        server_model_copy = copy.deepcopy(server_model).to(device)
+        global_classifier_copy = copy.deepcopy(global_classifier).to(device)
+        
+        # 设置评估模式
+        client_model.eval()
+        server_model_copy.eval()
+        global_classifier_copy.eval()
+        
+        # 场景1: 测试本地数据
+        if client_id in test_data_local_dict:
+            correct1 = 0
+            total1 = 0
             
-            try:
-                # 完整的前向传播
-                _, features = client_model(data)
-                server_features = server_model(features, tier=tier)
-                logits = global_classifier(server_features)
+            with torch.no_grad():
+                for data, target in test_data_local_dict[client_id]:
+                    data, target = data.to(device), target.to(device)
+                    
+                    try:
+                        # 完整的前向传播
+                        _, features = client_model(data)
+                        server_features = server_model_copy(features, tier=client_tier)
+                        logits = global_classifier_copy(server_features)
+                        
+                        _, predicted = logits.max(1)
+                        total1 += target.size(0)
+                        correct1 += predicted.eq(target).sum().item()
+                    except Exception as e:
+                        logger.error(f"场景1测试客户端{client_id}出错: {str(e)}")
+                        continue
+            
+            if total1 > 0:
+                scenario1_results[client_id] = 100.0 * correct1 / total1
+        
+        # 场景2: 测试其他客户端的少量数据
+        other_client_id = (client_id + len(client_ids)//2) % len(client_ids)
+        if other_client_id in test_data_local_dict:
+            correct2 = 0
+            total2 = 0
+            sample_count = 0
+            
+            with torch.no_grad():
+                for data, target in test_data_local_dict[other_client_id]:
+                    if sample_count >= 10:  # 限制测试量，避免过长时间
+                        break
+                    
+                    data, target = data.to(device), target.to(device)
+                    sample_count += 1
+                    
+                    try:
+                        # 完整的前向传播
+                        _, features = client_model(data)
+                        server_features = server_model_copy(features, tier=client_tier)
+                        logits = global_classifier_copy(server_features)
+                        
+                        _, predicted = logits.max(1)
+                        total2 += target.size(0)
+                        correct2 += predicted.eq(target).sum().item()
+                    except Exception as e:
+                        logger.error(f"场景2测试客户端{client_id}处理客户端{other_client_id}数据出错: {str(e)}")
+                        continue
+            
+            if total2 > 0:
+                scenario2_results[f"{client_id}->{other_client_id}"] = 100.0 * correct2 / total2
+        
+        # 场景3: 测试分配的全局IID数据
+        if client_id in client_global_data:
+            for data, target in client_global_data[client_id]:
+                data, target = data.to(device), target.to(device)
                 
-                _, predicted = logits.max(1)
-                total += target.size(0)
-                correct += predicted.eq(target).sum().item()
-            except Exception as e:
-                print(f"评估中出现错误: {str(e)}")
-                # 打印设备信息以便调试
-                print(f"数据设备: {data.device}, 客户端模型设备: {next(client_model.parameters()).device}")
-                print(f"服务器模型设备: {next(server_model.parameters()).device}")
-                print(f"全局分类器设备: {next(global_classifier.parameters()).device}")
-                # 遇到错误继续处理下一批数据
-                continue
+                try:
+                    # 完整的前向传播
+                    _, features = client_model(data)
+                    server_features = server_model_copy(features, tier=client_tier)
+                    logits = global_classifier_copy(server_features)
+                    
+                    _, predicted = logits.max(1)
+                    scenario3_total += target.size(0)
+                    scenario3_correct += predicted.eq(target).sum().item()
+                except Exception as e:
+                    logger.error(f"场景3测试客户端{client_id}出错: {str(e)}")
+                    continue
     
-    accuracy = 100.0 * correct / max(1, total)
-    return accuracy
+    # 计算场景3准确率
+    scenario3_accuracy = 0
+    if scenario3_total > 0:
+        scenario3_accuracy = 100.0 * scenario3_correct / scenario3_total
+    
+    # 计算场景1和2的平均准确率
+    avg_scenario1 = sum(scenario1_results.values()) / max(1, len(scenario1_results))
+    avg_scenario2 = sum(scenario2_results.values()) / max(1, len(scenario2_results))
+    
+    # 综合结果
+    generalization_results = {
+        'local_data_accuracy': avg_scenario1,
+        'cross_client_accuracy': avg_scenario2,
+        'collaborative_global_accuracy': scenario3_accuracy,
+        'client_local_results': scenario1_results,
+        'client_cross_results': scenario2_results
+    }
+    
+    return generalization_results
 
 # 主函数
 def main():
@@ -734,36 +832,166 @@ def main():
             avg_split_learning_accuracy = sum(split_learning_accuracies) / len(split_learning_accuracies)
             logger.info(f"拆分学习阶段全局分类器平均准确率: {avg_split_learning_accuracy:.2f}%")
         
-        # 评估全局模型在独立测试集上的性能
-        # 选择一个tier 1的客户端进行评估
-        tier1_clients = [cid for cid, resource in client_resources.items() if resource['tier'] == 1]
-        if tier1_clients:
-            sample_client_id = tier1_clients[0]
-        else:
-            sample_client_id = list(client_models.keys())[0]
+
+        # 实现跨客户端验证来测试泛化性
+        # 每10轮执行一次跨客户端验证评估
+        if round_idx % 10 == 0 and round_idx > 0:
+            logger.info("执行跨客户端验证评估...")
             
-        # 获取选中客户端的tier
-        sample_client_model = client_models[sample_client_id]
-        sample_client_tier = client_resources[sample_client_id]['tier']  # 添加这行定义tier
-
-        # 确保所有模型在同一设备上
-        sample_client_model = sample_client_model.to(device)
-        server_model = server_model.to(device)
-        global_classifier = global_classifier.to(device)
-
-        global_model_accuracy = evaluate_global_model(
-            sample_client_model, server_model, global_classifier, 
-            global_test_loader, device, tier=sample_client_tier)
-
-        # 记录设备信息
-        logger.info(f"评估设备: {device}")
-        logger.info(f"使用客户端 {sample_client_id}（Tier {sample_client_tier}）进行全局评估")
-        logger.info(f"客户端模型设备: {next(sample_client_model.parameters()).device}")
-        logger.info(f"服务器模型设备: {next(server_model.parameters()).device}")
-        logger.info(f"全局分类器设备: {next(global_classifier.parameters()).device}")
-        
-        logger.info(f"全局模型在独立测试集上的准确率: {global_model_accuracy:.2f}%")
-        
+            # 随机选择几对客户端进行交叉测试
+            num_test_pairs = min(5, args.client_number // 2)
+            client_ids = list(range(args.client_number))
+            random.shuffle(client_ids)
+            test_pairs = [(client_ids[i], client_ids[i+num_test_pairs]) 
+                        for i in range(min(num_test_pairs, len(client_ids)-num_test_pairs))]
+            
+            cross_results = {}
+            
+            for source_id, target_id in test_pairs:
+                source_client = client_manager.get_client(source_id)
+                target_client = client_manager.get_client(target_id)
+                
+                if not source_client or not target_client:
+                    continue
+                    
+                # 准备模型
+                source_model = copy.deepcopy(client_models[source_id]).to(device)
+                source_model.eval()
+                
+                server_model_copy = copy.deepcopy(server_model).to(device)
+                global_classifier_copy = copy.deepcopy(global_classifier).to(device)
+                
+                server_model_copy.eval()
+                global_classifier_copy.eval()
+                
+                # 用源客户端处理目标客户端数据
+                correct = 0
+                total = 0
+                
+                with torch.no_grad():
+                    for batch_idx, (data, target) in enumerate(target_client.test_data):
+                        if batch_idx >= 5:  # 限制测试批次
+                            break
+                            
+                        data, target = data.to(device), target.to(device)
+                        
+                        try:
+                            # 客户端特征提取
+                            _, features = source_model(data)
+                            
+                            # 服务器处理
+                            server_features = server_model_copy(
+                                features, tier=client_resources[source_id]['tier'])
+                            
+                            # 全局分类
+                            logits = global_classifier_copy(server_features)
+                            
+                            _, predicted = logits.max(1)
+                            total += target.size(0)
+                            correct += predicted.eq(target).sum().item()
+                        except Exception as e:
+                            logger.error(f"跨客户端测试错误: {str(e)}")
+                            continue
+                
+                if total > 0:
+                    accuracy = 100.0 * correct / total
+                    cross_results[f"{source_id}->{target_id}"] = accuracy
+                    logger.info(f"客户端{source_id}处理客户端{target_id}数据: {accuracy:.2f}%")
+            
+            # 计算平均跨客户端准确率
+            if cross_results:
+                avg_cross_acc = sum(cross_results.values()) / len(cross_results)
+                logger.info(f"平均跨客户端准确率: {avg_cross_acc:.2f}%")
+                wandb.log({
+                    "cross_client/avg_accuracy": avg_cross_acc,
+                    "round": round_idx
+                })
+                
+        # 在相同位置，添加独立IID测试 - 更准确测量泛化性
+        if round_idx % 10 == 0 and round_idx > 0:
+            logger.info("执行独立IID测试评估系统泛化能力...")
+            
+            # 加载标准CIFAR10测试集 - 完全IID
+            test_transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize([0.49139968, 0.48215827, 0.44653124], 
+                                    [0.24703233, 0.24348505, 0.26158768])
+            ])
+            
+            iid_testset = torchvision.datasets.CIFAR10(
+                root=args.data_dir, train=False, download=True, transform=test_transform)
+            iid_testloader = torch.utils.data.DataLoader(
+                iid_testset, batch_size=100, shuffle=False, num_workers=2)
+            
+            # 随机选择不同tier的客户端
+            tier_clients = {}
+            for client_id, resource in client_resources.items():
+                tier = resource['tier']
+                if tier not in tier_clients:
+                    tier_clients[tier] = []
+                tier_clients[tier].append(client_id)
+            
+            # 确保每个tier至少有一个代表
+            test_clients = []
+            for tier in range(1, 8):
+                if tier in tier_clients and tier_clients[tier]:
+                    test_clients.append(random.choice(tier_clients[tier]))
+            
+            # 如果没有足够覆盖所有tier，补充随机选择
+            while len(test_clients) < min(5, args.client_number):
+                candidate = random.randint(0, args.client_number-1)
+                if candidate not in test_clients:
+                    test_clients.append(candidate)
+            
+            # 测试每个选定客户端
+            generalization_results = {}
+            
+            for client_id in test_clients:
+                # 准备模型
+                client_model = copy.deepcopy(client_models[client_id]).to(device)
+                server_model_copy = copy.deepcopy(server_model).to(device)
+                global_classifier_copy = copy.deepcopy(global_classifier).to(device)
+                
+                client_model.eval()
+                server_model_copy.eval()
+                global_classifier_copy.eval()
+                
+                # 执行前向传播
+                correct = 0
+                total = 0
+                
+                with torch.no_grad():
+                    for data, target in iid_testloader:
+                        data, target = data.to(device), target.to(device)
+                        
+                        try:
+                            # 完整的前向传播
+                            _, features = client_model(data)
+                            server_features = server_model_copy(
+                                features, tier=client_resources[client_id]['tier'])
+                            logits = global_classifier_copy(server_features)
+                            
+                            _, predicted = logits.max(1)
+                            total += target.size(0)
+                            correct += predicted.eq(target).sum().item()
+                        except Exception as e:
+                            logger.error(f"IID测试客户端{client_id}错误: {str(e)}")
+                            continue
+                
+                if total > 0:
+                    accuracy = 100.0 * correct / total
+                    generalization_results[client_id] = accuracy
+                    logger.info(f"客户端{client_id} (Tier {client_resources[client_id]['tier']}) "
+                            f"IID测试准确率: {accuracy:.2f}%")
+            
+            # 计算平均准确率
+            if generalization_results:
+                avg_gen_acc = sum(generalization_results.values()) / len(generalization_results)
+                logger.info(f"平均IID泛化准确率: {avg_gen_acc:.2f}%")
+                wandb.log({
+                    "generalization/iid_accuracy": avg_gen_acc,
+                    "round": round_idx
+                })
         # 计算平均值
         if total_samples > 0:
             global_acc = weighted_acc / total_samples
@@ -803,6 +1031,8 @@ def main():
         is_best = global_acc > best_accuracy
         if is_best:
             best_accuracy = global_acc
+            # 选择一个客户端保存模型
+            sample_client_id = list(client_models.keys())[0]
             # 保存最佳模型
             try:
                 torch.save({
@@ -854,7 +1084,7 @@ def main():
         # 输出统计信息
         logger.info(f"轮次 {round_idx+1} 统计:")
         logger.info(f"全局准确率: {global_acc:.2f}%, 最佳: {best_accuracy:.2f}%")
-        logger.info(f"全局模型在独立测试集上的准确率: {global_model_accuracy:.2f}%")
+        # logger.info(f"全局模型在独立测试集上的准确率: {global_model_accuracy:.2f}%")
         logger.info(f"拆分学习阶段全局分类器平均准确率: {avg_split_learning_accuracy:.2f}%")
         logger.info(f"平均本地准确率: {avg_local_acc:.2f}%, 平均全局准确率: {avg_global_acc:.2f}%")
         logger.info(f"客户端精度标准差: {client_acc_std:.2f}, 最低: {client_acc_min:.2f}%, 最高: {client_acc_max:.2f}%")
@@ -874,7 +1104,7 @@ def main():
                 "global/best_accuracy": best_accuracy,
                 "global/is_best_model": 1 if is_best else 0,
                 "global/class_balance": class_balance,
-                "global/independent_test_accuracy": global_model_accuracy,
+                # "global/independent_test_accuracy": global_model_accuracy,
                 "global/split_learning_accuracy": avg_split_learning_accuracy,
                 
                 # 客户端性能
