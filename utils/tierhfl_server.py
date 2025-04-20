@@ -253,12 +253,28 @@ class TierHFLCentralServer:
         group = self.get_server_group(group_id)
         if group:
             group.add_client(client_id)
+        else:
+            # 如果指定的组不存在，记录错误并尝试分配到第一个可用组
+            print(f"错误：组 {group_id} 不存在，尝试将客户端 {client_id} 分配到其他组")
+            if self.server_groups:
+                first_group_id = next(iter(self.server_groups.keys()))
+                self.client_to_group[client_id] = first_group_id
+                self.server_groups[first_group_id].add_client(client_id)
     
     def get_client_group(self, client_id):
         """获取客户端所在的组"""
         group_id = self.client_to_group.get(client_id)
-        if group_id:
-            return self.get_server_group(group_id)
+        if group_id is not None and group_id in self.server_groups:
+            return self.server_groups[group_id]
+        
+        # 如果找不到分配或组不存在，返回第一个可用的组
+        if self.server_groups:
+            print(f"客户端 {client_id} 无有效组分配，使用默认组")
+            default_group_id = next(iter(self.server_groups.keys()))
+            # 自动分配到默认组
+            self.assign_client_to_group(client_id, default_group_id)
+            return self.server_groups[default_group_id]
+        
         return None
     
     def process_client_features(self, client_id, features, return_gradients=False):

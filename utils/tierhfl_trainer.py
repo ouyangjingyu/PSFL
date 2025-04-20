@@ -81,20 +81,23 @@ class TierHFLTrainer:
             })
     
     def execute_parallel_training(self, client_models, round_idx):
-        """执行并行训练
-        
-        Args:
-            client_models: 客户端模型字典
-            round_idx: 当前训练轮次
-            
-        Returns:
-            训练结果
-        """
+        """执行并行训练 - 修复分组映射问题"""
         start_time = time.time()
         
         # 客户端分组
         client_groups = self.grouping_strategy.group_clients(
             self.client_manager, client_models, round_idx)
+        
+        # 重置中央服务器中的所有客户端分组
+        for group_id in range(len(self.central_server.server_groups)):
+            self.central_server.server_groups[group_id].client_ids = []
+        
+        # 记录分组之前所有客户端的组映射
+        old_client_groups = {cid: self.central_server.client_to_group.get(cid) 
+                            for cid in client_models.keys()}
+        
+        # 清空所有现有映射
+        self.central_server.client_to_group = {}
         
         # 更新中央服务器中的客户端分组
         for group_id, client_ids in client_groups.items():
@@ -105,6 +108,15 @@ class TierHFLTrainer:
         self.logger.info(f"轮次 {round_idx} 客户端分组:")
         for group_id, client_ids in client_groups.items():
             self.logger.info(f"组 {group_id}: {client_ids}")
+        
+        # 验证每个客户端都被正确分配
+        for client_id in client_models.keys():
+            group = self.central_server.get_client_group(client_id)
+            if group is None:
+                self.logger.warning(f"客户端 {client_id} 未正确分配到服务器组，正在修复...")
+                # 使用旧分组或默认分配到第一个组
+                old_group_id = old_client_groups.get(client_id, 0)
+                self.central_server.assign_client_to_group(client_id, old_group_id)
         
         # 创建结果队列
         results_queue = queue.Queue()

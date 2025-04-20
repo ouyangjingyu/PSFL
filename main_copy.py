@@ -290,8 +290,18 @@ def main():
         test_loader=iid_test_loader,
         device=device
     )
-    
-    # 训练前评估
+
+    # 在训练前评估之前执行一次分组
+    logger.info("执行初始客户端分组")
+    initial_client_groups = grouping_strategy.group_clients(
+        client_manager, client_models, 0)  # 0表示第0轮
+
+    # 将分组结果应用到中央服务器
+    for group_id, client_ids in initial_client_groups.items():
+        for client_id in client_ids:
+            central_server.assign_client_to_group(client_id, group_id)
+
+    # 然后进行训练前评估
     logger.info("训练前初始评估")
     eval_result = evaluator.conduct_comprehensive_evaluation(
         client_models=client_models, round_idx=0)

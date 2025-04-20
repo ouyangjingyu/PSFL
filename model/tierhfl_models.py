@@ -5,11 +5,12 @@ import math
 from .resnet_base import BasicBlock, Bottleneck, ResNetBase
 
 class TierHFLClientModel(nn.Module):
-    """TierHFL客户端双路径模型"""
+    """TierHFL客户端双路径模型 - 简化版（移除global_path）"""
     def __init__(self, base_model='resnet56', num_classes=10, tier=1):
         super(TierHFLClientModel, self).__init__()
         self.tier = tier
         self.num_classes = num_classes
+        self.inplanes = 16  # 添加这一行初始化inplanes属性
         
         # 确定基础架构配置
         if base_model == 'resnet56':
@@ -21,115 +22,72 @@ class TierHFLClientModel(nn.Module):
         else:
             raise ValueError(f"不支持的基础模型: {base_model}")
         
-        # 共享基础层 - 所有Tier统一
-        self.shared_base = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True)
+        # 共享基础层 - 所有Tier统一结构和输出
+        # 初始卷积层单独定义，不放入Sequential中
+        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(16)
+        self.relu = nn.ReLU(inplace=True)
+        
+        # 然后分别构建各个层
+        self.layer1 = self._make_layer(block, 16, layers[0])
+        self.layer2 = self._make_layer(block, 32, layers[1]//3, stride=2)  # 减少深度但保留降采样
+        
+        # 全局特征适配层 - 统一输出通道为64
+        self.global_adapter = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((8, 8))  # 统一空间维度
         )
         
-        # 计算输出通道基于Tier级别
-        tier_channels = self._calculate_tier_channels(tier)
+        # 个性化特征路径 - 根据tier调整复杂度
+        self.inplanes = 32  # 重置inplanes为layer2的输出通道数
+        local_layers = self._adjust_local_path_for_tier(layers, tier)
+        self.local_path = self._make_local_path(32, local_layers, block)
         
-        # 1. 通用特征路径 - 较浅网络，结果会上传到服务器
-        global_layers = self._adjust_layers_for_tier(layers, tier)
-        self.global_path = self._make_global_path(16, global_layers, block)
-        
-        # 2. 个性化特征路径 - 根据设备能力调整复杂度
-        local_layers = self._adjust_layers_for_tier(layers, tier, is_local=True)
-        self.local_path = self._make_local_path(16, local_layers, block)
-        
-
-        # 计算该tier输出的特征维度
-        self.out_channels = self._calculate_tier_channels(tier)
         # 本地分类器
-        self.local_classifier = nn.Sequential(
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Dropout(0.3),
-            nn.Linear(self.out_channels, num_classes)
-        )
+        self.local_classifier = self._create_local_classifier()
         
         # 初始化权重
         self._initialize_weights()
     
-    def _calculate_tier_channels(self, tier):
-        """根据Tier级别计算特征通道数"""
-        if tier == 1:  # 最强设备
-            return 64
+    def _make_layer(self, block, planes, blocks, stride=1):
+        """构建ResNet层"""
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.inplanes, planes * block.expansion,
+                          kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes * block.expansion),
+            )
+
+        layers = []
+        layers.append(block(self.inplanes, planes, stride, downsample))
+        self.inplanes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+
+        return nn.Sequential(*layers)
+    
+    def _adjust_local_path_for_tier(self, layers, tier):
+        """根据Tier调整个性化路径深度"""
+        if tier == 1:
+            return [0, 0, max(1, layers[2]//2)]  # 完整深度的一半
         elif tier == 2:
-            return 48
+            return [0, 0, max(1, layers[2]//3)]  # 1/3深度
         elif tier == 3:
-            return 32
-        else:  # tier >= 4，最弱设备
-            return 16
-    
-    def _adjust_layers_for_tier(self, layers, tier, is_local=False):
-        """根据Tier调整网络深度"""
-        if is_local:  # 个性化路径深度
-            if tier == 1:
-                return layers  # 完整深度
-            elif tier == 2:
-                return [max(2, l//2) for l in layers]  # 半深度
-            elif tier == 3:
-                return [max(1, l//3) for l in layers]  # 1/3深度
-            else:
-                return [1, 1, 1]  # 最小深度
-        else:  # 全局路径深度
-            if tier == 1 or tier == 2:
-                return [2, 2, 0]  # 高性能设备，轻量全局路径
-            elif tier == 3:
-                return [2, 1, 0]  # 中等性能
-            else:
-                return [1, 0, 0]  # 低性能设备，极简全局路径
-    
-    def _make_global_path(self, in_channels, layers, block):
-        """构建全局特征路径"""
-        strides = [1, 2, 2]
-        channels = [16, 32, 64]
-        modules = []
-        
-        for i, num_blocks in enumerate(layers):
-            if num_blocks == 0:
-                continue
-                
-            stride = strides[i]
-            out_channels = channels[i]
-            
-            # 添加残差块
-            downsample = None
-            if stride != 1 or in_channels != out_channels * block.expansion:
-                downsample = nn.Sequential(
-                    nn.Conv2d(in_channels, out_channels * block.expansion,
-                             kernel_size=1, stride=stride, bias=False),
-                    nn.BatchNorm2d(out_channels * block.expansion)
-                )
-            
-            modules.append(block(in_channels, out_channels, stride, downsample))
-            in_channels = out_channels * block.expansion
-            
-            # 添加剩余块
-            for _ in range(1, num_blocks):
-                modules.append(block(in_channels, out_channels))
-        
-        # 按序列方式构建
-        if not modules:
-            # 如果没有模块，添加一个恒等映射
-            return nn.Identity()
-        return nn.Sequential(*modules)
+            return [0, 0, max(1, layers[2]//4)]  # 1/4深度
+        else:
+            return [0, 0, 1]  # 最小深度
     
     def _make_local_path(self, in_channels, layers, block):
         """构建个性化特征路径"""
-        strides = [1, 2, 2]
-        channels = [16, 32, 64]
         modules = []
         
-        for i, num_blocks in enumerate(layers):
-            if num_blocks == 0:
-                continue
-                
-            stride = strides[i]
-            out_channels = channels[i]
+        # 只处理第三层
+        if layers[2] > 0:
+            stride = 2  # 第三层的stride
+            out_channels = 64
             
             # 添加残差块
             downsample = None
@@ -144,14 +102,26 @@ class TierHFLClientModel(nn.Module):
             in_channels = out_channels * block.expansion
             
             # 添加剩余块
-            for _ in range(1, num_blocks):
+            for _ in range(1, layers[2]):
                 modules.append(block(in_channels, out_channels))
         
-        # 按序列方式构建
+        # 如果没有模块，添加一个简单的卷积层
         if not modules:
-            # 如果没有模块，添加一个恒等映射
-            return nn.Identity()
+            return nn.Sequential(
+                nn.Conv2d(in_channels, 64, kernel_size=3, padding=1, stride=2, bias=False),
+                nn.BatchNorm2d(64),
+                nn.ReLU(inplace=True)
+            )
         return nn.Sequential(*modules)
+    
+    def _create_local_classifier(self):
+        """创建本地分类器"""
+        return nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+            nn.Dropout(0.3),
+            nn.Linear(64, self.num_classes)
+        )
     
     def _initialize_weights(self):
         """初始化网络权重"""
@@ -168,10 +138,14 @@ class TierHFLClientModel(nn.Module):
     def forward(self, x):
         """前向传播"""
         # 共享基础层
-        x_base = self.shared_base(x)
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.layer1(x)
+        x_base = self.layer2(x)
         
-        # 全局特征路径
-        global_features = self.global_path(x_base)
+        # 全局特征 - 简单适配，不执行复杂处理
+        global_features = self.global_adapter(x_base)
         
         # 个性化特征路径
         local_features = self.local_path(x_base)
@@ -179,67 +153,52 @@ class TierHFLClientModel(nn.Module):
         # 本地分类
         local_logits = self.local_classifier(local_features)
         
-        # 返回本地分类结果和全局特征(用于上传到服务器)
         return local_logits, global_features, local_features
 
 
 class TierHFLServerModel(nn.Module):
-    """TierHFL服务器特征处理模型"""
-    def __init__(self, base_model='resnet56', in_channels_list=[16, 32, 64], feature_dim=128):
+    """TierHFL服务器特征处理模型 - 适配简化客户端"""
+    def __init__(self, base_model='resnet56', feature_dim=128, in_channels_list=None, **kwargs):
         super(TierHFLServerModel, self).__init__()
-        self.in_channels_list = in_channels_list
         self.feature_dim = feature_dim
         
-        # 确定基础架构配置
-        if base_model == 'resnet56':
-            block = BasicBlock
-        elif base_model == 'resnet110':
-            block = Bottleneck
-        else:
-            raise ValueError(f"不支持的基础模型: {base_model}")
+        # 固定输入通道为64（与客户端全局特征通道匹配）
+        self.in_channels = 64
         
-        # 为不同输入通道创建特征处理器
-        self.feature_processors = nn.ModuleDict()
-        
-        for channels in in_channels_list:
-            # 每个处理器包含残差连接
-            layers = []
+        # 特征处理网络 - 简化版，专注于特征转换而非复杂处理
+        self.feature_extractor = nn.Sequential(
+            # 添加通道注意力增强特征质量
+            self._make_channel_attention(self.in_channels),
             
-            # 添加适配层
-            if channels != 64:
-                downsample = nn.Sequential(
-                    nn.Conv2d(channels, 64, kernel_size=1, bias=False),
-                    nn.BatchNorm2d(64),
-                    nn.ReLU(inplace=True)
-                )
-                layers.append(downsample)
-                current_channels = 64
-            else:
-                current_channels = channels
+            # 特征转换层
+            nn.Conv2d(self.in_channels, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
             
-            # 添加2个残差块
-            for _ in range(2):
-                layers.append(block(current_channels, 64))
-                current_channels = 64 * block.expansion
+            nn.Conv2d(128, feature_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(feature_dim),
+            nn.ReLU(inplace=True),
             
-            # 添加输出层
-            layers.extend([
-                nn.Conv2d(current_channels, feature_dim, kernel_size=1),
-                nn.BatchNorm2d(feature_dim),
-                nn.ReLU(inplace=True)
-            ])
-            
-            self.feature_processors[f"ch_{channels}"] = nn.Sequential(*layers)
-        
-        # 特征处理后的统一输出层
-        self.output_layer = nn.Sequential(
+            # 空间降维
             nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.LayerNorm(feature_dim)
+            nn.Flatten()
         )
+        
+        # 特征归一化
+        self.layer_norm = nn.LayerNorm(feature_dim)
         
         # 初始化权重
         self._initialize_weights()
+    
+    def _make_channel_attention(self, channels):
+        """创建通道注意力模块"""
+        return nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels // 4, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // 4, channels, kernel_size=1),
+            nn.Sigmoid()
+        )
     
     def _initialize_weights(self):
         """初始化网络权重"""
@@ -252,31 +211,13 @@ class TierHFLServerModel(nn.Module):
     
     def forward(self, x):
         """前向传播"""
-        # 获取输入通道数
-        in_channels = x.size(1)
+        # 特征提取和转换
+        features = self.feature_extractor(x)
         
-        # 选择最接近的处理器
-        closest_channels = min(self.in_channels_list, key=lambda c: abs(c - in_channels))
-        processor_key = f"ch_{closest_channels}"
+        # 特征归一化
+        normalized_features = self.layer_norm(features)
         
-        # 如果输入通道与处理器不匹配，进行调整
-        if in_channels != closest_channels:
-            if in_channels < closest_channels:
-                # 通道数不足，进行填充
-                padding = torch.zeros(x.size(0), closest_channels - in_channels, 
-                                     x.size(2), x.size(3), device=x.device)
-                x = torch.cat([x, padding], dim=1)
-            else:
-                # 通道数过多，进行裁剪
-                x = x[:, :closest_channels, :, :]
-        
-        # 应用特征处理器
-        x = self.feature_processors[processor_key](x)
-        
-        # 应用输出层
-        x = self.output_layer(x)
-        
-        return x
+        return normalized_features
 
 
 class TierHFLGlobalClassifier(nn.Module):

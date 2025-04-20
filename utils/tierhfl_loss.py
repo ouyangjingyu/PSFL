@@ -45,10 +45,7 @@ class TierHFLLoss(nn.Module):
         return total_loss, local_loss, global_loss, feature_loss
     
     def _feature_alignment(self, local_feat, global_feat):
-        """特征对齐损失计算
-        
-        使用归一化和余弦相似度对齐特征
-        """
+        """改进的特征对齐损失计算"""
         # 确保特征是二维张量
         if local_feat.dim() > 2:
             local_feat = F.adaptive_avg_pool2d(local_feat, (1, 1))
@@ -57,6 +54,26 @@ class TierHFLLoss(nn.Module):
         if global_feat.dim() > 2:
             global_feat = F.adaptive_avg_pool2d(global_feat, (1, 1))
             global_feat = global_feat.view(global_feat.size(0), -1)
+        
+        # 如果维度不匹配，采用投影使它们兼容
+        if local_feat.size(1) != global_feat.size(1):
+            # 选择较小的维度作为共同维度
+            common_dim = min(local_feat.size(1), global_feat.size(1))
+            
+            # 随机投影矩阵
+            if not hasattr(self, 'projection_matrix'):
+                # 首次创建投影矩阵
+                self.register_buffer(
+                    'projection_matrix',
+                    torch.randn(max(local_feat.size(1), global_feat.size(1)), common_dim, 
+                                device=local_feat.device)
+                )
+            
+            # 应用投影
+            if local_feat.size(1) > common_dim:
+                local_feat = torch.matmul(local_feat, self.projection_matrix[:local_feat.size(1), :])
+            if global_feat.size(1) > common_dim:
+                global_feat = torch.matmul(global_feat, self.projection_matrix[:global_feat.size(1), :])
         
         # 特征归一化
         local_norm = F.normalize(local_feat, dim=1)

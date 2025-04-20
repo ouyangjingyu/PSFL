@@ -19,29 +19,13 @@ class TierHFLClient:
         self.lr = lr
         self.local_epochs = local_epochs
         
-        # 创建优化器 - 差异化设计
-        # 共享基础层使用Adam
-        shared_params = [p for n, p in model.named_parameters() if 'shared_base' in n]
-        # 全局路径使用SGD+动量
-        global_params = [p for n, p in model.named_parameters() if 'global_path' in n]
-        # 个性化路径和本地分类器使用Adam
-        local_params = [p for n, p in model.named_parameters() 
-                       if 'local_path' in n or 'local_classifier' in n]
-        
-        self.optimizers = {
-            'shared': torch.optim.Adam(shared_params, lr=lr, weight_decay=1e-4),
-            'global': torch.optim.SGD(global_params, lr=lr*1.5, momentum=0.9, weight_decay=1e-4),
-            'local': torch.optim.Adam(local_params, lr=lr*1.2, weight_decay=1e-4)
-        }
+        # 创建优化器 -在train-epoch中创建
         
         # 学习率调度器
-        self.schedulers = {
-            'shared': torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizers['shared'], T_max=100, eta_min=lr*0.1),
-            'global': torch.optim.lr_scheduler.StepLR(
-                self.optimizers['global'], step_size=20, gamma=0.5),
-            'local': torch.optim.lr_scheduler.ReduceLROnPlateau(
-                self.optimizers['local'], mode='min', factor=0.7, patience=5, min_lr=lr*0.05)
+        self.lr_scheduler_configs = {
+            'shared': {'type': 'cosine', 'T_max': 100, 'eta_min': lr*0.1},
+            'global': {'type': 'step', 'step_size': 20, 'gamma': 0.5},
+            'local': {'type': 'plateau', 'factor': 0.7, 'patience': 5, 'min_lr': lr*0.05}
         }
         
         # 训练统计
@@ -105,70 +89,85 @@ class TierHFLClient:
         
         return similarity
     
-    def train_epoch(self, server_model, global_classifier, loss_fn, 
-                   gradient_guide, round_idx):
-        """训练一个epoch
-        
-        Args:
-            server_model: 服务器模型
-            global_classifier: 全局分类器
-            loss_fn: 损失函数
-            gradient_guide: 梯度引导模块
-            round_idx: 当前训练轮次
-            
-        Returns:
-            训练结果统计
-        """
+    def train_epoch(self, server_model, global_classifier, loss_fn, gradient_guide, round_idx):
+        """训练一个epoch - 修复梯度计算冲突"""
         self.model.train()
-        server_model.eval()  # 服务器模型在评估模式
-        global_classifier.eval()  # 全局分类器在评估模式
+        server_model.eval()
+        global_classifier.eval()
         
-        # 统计
+        # 获取参数组，分离共享层和个性化层
+        shared_params = [p for n, p in self.model.named_parameters() 
+                        if 'shared_base' in n or 'conv1' in n or 'bn1' in n or 
+                        'layer1' in n or 'layer2' in n or 'global_adapter' in n]
+        local_params = [p for n, p in self.model.named_parameters() 
+                    if 'local_path' in n or 'local_classifier' in n]
+        
+        # 创建优化器
+        shared_optimizer = torch.optim.Adam(shared_params, lr=self.lr, weight_decay=1e-4)
+        local_optimizer = torch.optim.Adam(local_params, lr=self.lr*1.2, weight_decay=1e-4)
+        
+        # 训练统计初始化
         epoch_loss = 0
         epoch_local_loss = 0
         epoch_global_loss = 0
         epoch_feature_loss = 0
         epoch_acc = 0
+        num_batches = 0
         
         # 记录训练开始时间
         start_time = time.time()
         
         # 训练循环
-        num_batches = 0
         for data, target in self.train_data:
-            # 移动数据到设备
             data, target = data.to(self.device), target.to(self.device)
             
-            # 清除梯度
-            for opt in self.optimizers.values():
-                opt.zero_grad()
+            # 步骤1: 训练个性化路径 - 完全独立的前向传播
+            local_optimizer.zero_grad()
             
-            # 客户端前向传播
-            local_logits, global_features, local_features = self.model(data)
+            # 前向传播
+            local_logits, _, _ = self.model(data)
+            local_loss = F.cross_entropy(local_logits, target)
             
-            # 暂时设置为评估模式以计算服务器处理结果
-            self.model.eval()
+            # 反向传播
+            local_loss.backward()
+            local_optimizer.step()
+            
+            # 步骤2: 训练共享层 - 新的前向传播
+            shared_optimizer.zero_grad()
+            
+            # 前向传播
+            _, global_features, local_features = self.model(data)
             with torch.no_grad():
-                # 服务器处理
                 server_features = server_model(global_features)
                 global_logits = global_classifier(server_features)
             
-            # 恢复训练模式
-            self.model.train()
+            # 计算全局损失和特征对齐损失
+            global_loss = F.cross_entropy(global_logits, target)
             
-            # 计算损失
-            loss, local_loss, global_loss, feature_loss = loss_fn(
-                local_logits, global_logits, local_features, 
-                server_features, target, round_idx)
+            # 简化特征对齐损失计算
+            if hasattr(loss_fn, '_feature_alignment'):
+                feature_loss = loss_fn._feature_alignment(local_features, server_features)
+            else:
+                # 简单的余弦相似度损失
+                local_feat_flat = F.adaptive_avg_pool2d(local_features, (1, 1)).view(local_features.size(0), -1)
+                server_feat_flat = server_features
+                
+                local_feat_norm = F.normalize(local_feat_flat, dim=1)
+                server_feat_norm = F.normalize(server_feat_flat, dim=1)
+                
+                feature_loss = torch.mean(1.0 - torch.sum(local_feat_norm * server_feat_norm, dim=1))
             
-            # 反向传播
-            loss.backward()
+            # 动态权重
+            alpha = max(0.3, min(0.7, 0.3 + 0.4 * (round_idx / 100)))
+            beta = 1.0 - alpha
             
-            # 应用优化器步骤
-            for opt in self.optimizers.values():
-                opt.step()
+            # 全局损失
+            shared_loss = alpha * global_loss + beta * feature_loss
+            shared_loss.backward()
+            shared_optimizer.step()
             
-            # 更新统计
+            # 累计统计
+            loss = local_loss + shared_loss
             epoch_loss += loss.item()
             epoch_local_loss += local_loss.item()
             epoch_global_loss += global_loss.item()
@@ -181,7 +180,7 @@ class TierHFLClient:
             
             num_batches += 1
         
-        # 计算平均损失和准确率
+        # 计算平均值
         epoch_loss /= num_batches
         epoch_local_loss /= num_batches
         epoch_global_loss /= num_batches
@@ -190,11 +189,6 @@ class TierHFLClient:
         
         # 计算训练时间
         training_time = time.time() - start_time
-        
-        # 更新学习率
-        self.schedulers['shared'].step()
-        self.schedulers['global'].step()
-        self.schedulers['local'].step(epoch_loss)
         
         # 更新统计信息
         self.stats['train_loss'].append(epoch_loss)
@@ -208,7 +202,7 @@ class TierHFLClient:
             'local_loss': epoch_local_loss,
             'global_loss': epoch_global_loss,
             'feature_loss': epoch_feature_loss,
-            'accuracy': epoch_acc * 100,  # 转为百分比
+            'accuracy': epoch_acc * 100,
             'training_time': training_time
         }
     
