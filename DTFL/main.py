@@ -26,6 +26,8 @@ import math
 import os.path
 import pandas as pd
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+import torchvision
+import torchvision.transforms as transforms
 
 import random
 import numpy as np
@@ -979,6 +981,121 @@ def calculate_client_samples(train_data_local_num_dict, idxs_users, dataset):
 for i in range(0, num_users):
     wandb.log({"Client{}_Tier".format(i): num_tiers - client_tier[i] + 1, "epoch": -1}, commit=False)
 
+
+def create_balanced_test_dataset(args):
+    """为DTFL创建均衡分布的测试集"""
+    # 根据数据集类型选择合适的转换
+    if args.dataset == "cifar10":
+        transform_test = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize([0.49139968, 0.48215827, 0.44653124], 
+                                [0.24703233, 0.24348505, 0.26158768])
+        ])
+        testset = torchvision.datasets.CIFAR10(
+            root=args.data_dir, train=False, download=True, transform=transform_test)
+    elif args.dataset == "cifar100":
+        transform_test = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize([0.5071, 0.4865, 0.4409],
+                                [0.2673, 0.2564, 0.2762])
+        ])
+        testset = torchvision.datasets.CIFAR100(
+            root=args.data_dir, train=False, download=True, transform=transform_test)
+    elif args.dataset == "cinic10":
+        transform_test = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize([0.47889522, 0.47227842, 0.43047404],
+                                [0.24205776, 0.23828046, 0.25874835])
+        ])
+        testset = torchvision.datasets.ImageFolder(
+            root=os.path.join(args.data_dir, 'cinic10', 'test'),
+            transform=transform_test)
+    else:
+        # 默认使用CIFAR10
+        transform_test = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize([0.49139968, 0.48215827, 0.44653124], 
+                                [0.24703233, 0.24348505, 0.26158768])
+        ])
+        testset = torchvision.datasets.CIFAR10(
+            root="./data", train=False, download=True, transform=transform_test)
+    
+    # 创建均衡的数据加载器
+    test_loader = torch.utils.data.DataLoader(
+        testset, batch_size=args.batch_size, shuffle=False, num_workers=2)
+    
+    return test_loader
+
+def evaluate_dtfl_generalization(args, iid_test_loader, net_glob_client_tier, net_glob_server_tier, device):
+    """评估DTFL模型在均衡分布测试集上的泛化性能"""
+    print("\n===== 评估DTFL全局模型泛化性 =====")
+    
+    # 初始化结果
+    results = {}
+    
+    # 对每个tier级别进行评估
+    for tier in range(1, 5):  # 使用4个tier级别
+        if tier in net_glob_client_tier and tier in net_glob_server_tier:
+            # 获取对应tier的客户端和服务器模型
+            client_model = copy.deepcopy(net_glob_client_tier[tier]).to(device)
+            server_model = copy.deepcopy(net_glob_server_tier[tier]).to(device)
+            
+            # 设置为评估模式
+            client_model.eval()
+            server_model.eval()
+            
+            # 计数器
+            correct = 0
+            total = 0
+            class_correct = [0] * 10  # 默认10类，可根据需要调整
+            class_total = [0] * 10
+            
+            # 评估
+            with torch.no_grad():
+                for data, target in iid_test_loader:
+                    data, target = data.to(device), target.to(device)
+                    
+                    # 客户端前向传播
+                    extracted_features, fx = client_model(data)
+                    
+                    # 服务器前向传播
+                    fx_server = server_model(fx)
+                    
+                    # 计算准确率
+                    _, predicted = fx_server.max(1)
+                    total += target.size(0)
+                    correct += predicted.eq(target).sum().item()
+                    
+                    # 每个类别的准确率
+                    for i in range(len(target)):
+                        label = target[i].item()
+                        if label < len(class_correct):
+                            class_total[label] += 1
+                            if predicted[i] == label:
+                                class_correct[label] += 1
+            
+            # 计算准确率
+            accuracy = 100.0 * correct / total if total > 0 else 0
+            class_acc = [100.0 * c / max(1, t) for c, t in zip(class_correct, class_total)]
+            
+            results[tier] = {
+                "accuracy": accuracy,
+                "class_acc": class_acc
+            }
+            
+            print(f"Tier {tier} - 均衡测试集准确率: {accuracy:.2f}%")
+            print(f"  类别准确率: {[f'{acc:.1f}%' for acc in class_acc]}")
+    
+    # 计算平均准确率
+    if results:
+        avg_accuracy = sum(r["accuracy"] for r in results.values()) / len(results)
+        print(f"\n平均均衡测试集准确率: {avg_accuracy:.2f}%")
+    else:
+        avg_accuracy = 0
+        print("\n没有可用模型进行评估")
+    
+    return results
+
 #------------ Training And Testing  -----------------
 net_glob_client.train()
 w_glob_client_tier ={}
@@ -1069,6 +1186,9 @@ computation_time_clients = {}
 for k in range(num_users):
     computation_time_clients[k] = []
 
+# 训练循环开始前增加创建测试集代码
+print("创建均衡分布测试集用于泛化性评估...")
+balanced_test_loader = create_balanced_test_dataset(args)
 # Main loop over rounds    
 for iter in range(epochs):
     if iter == int(50): # here we can change how the enviroement randomly change 
@@ -1159,7 +1279,29 @@ for iter in range(epochs):
                                               , delay_coefficient[idx], duration) # this is simulated delay
 
         wandb.log({"Client{}_Total_Delay".format(idx): simulated_delay[idx], "epoch": iter}, commit=False)
+
+    # 每5轮或最后一轮评估一次
+    if iter % 5 == 0 or iter == epochs - 1:
+        print(f"\n===== 轮次 {iter+1} 泛化性评估 =====")
+        dtfl_generalization_results = evaluate_dtfl_generalization(
+            args,
+            balanced_test_loader,
+            net_glob_client_tier,
+            net_glob_server_tier,
+            device
+        )
         
+        # 计算平均准确率
+        if dtfl_generalization_results:
+            balanced_avg_acc = sum(r["accuracy"] for r in dtfl_generalization_results.values()) / len(dtfl_generalization_results)
+            print(f"DTFL模型在均衡测试集上的平均准确率: {balanced_avg_acc:.2f}%")
+            
+            # 记录到wandb
+            wandb.log({
+                "global/balanced_test_accuracy": balanced_avg_acc,
+                "epoch": iter
+            }, commit=False)
+
     server_wait_first_to_last_client = (max(simulated_delay * client_epoch) - min(simulated_delay * client_epoch))
     training_time = (max(simulated_delay)) 
     total_training_time += training_time

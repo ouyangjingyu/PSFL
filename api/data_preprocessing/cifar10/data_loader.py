@@ -114,52 +114,6 @@ def load_cifar10_data(datadir):
 
     return (X_train, y_train, X_test, y_test)
 
-
-
-# def partition_data(dataset, datadir, partition, n_nets, alpha):
-#     X_train, y_train, X_test, y_test = load_cifar10_data(datadir)
-    
-#     if partition == "hetero":
-#         # 为训练集和测试集分别创建索引映射
-#         train_net_dataidx_map = {}
-#         test_net_dataidx_map = {}
-        
-#         # 分割训练集
-#         min_size = 0
-#         K = 10
-#         N = y_train.shape[0]
-        
-#         while min_size < 10:
-#             idx_batch = [[] for _ in range(n_nets)]
-#             for k in range(K):
-#                 idx_k = np.where(y_train == k)[0]
-#                 np.random.shuffle(idx_k)
-#                 proportions = np.random.dirichlet(np.repeat(alpha, n_nets))
-#                 proportions = np.array([p * (len(idx_j) < N / n_nets) for p, idx_j in zip(proportions, idx_batch)])
-#                 proportions = proportions / proportions.sum()
-#                 proportions = (np.cumsum(proportions) * len(idx_k)).astype(int)[:-1]
-#                 idx_batch = [idx_j + idx.tolist() for idx_j, idx in zip(idx_batch, np.split(idx_k, proportions))]
-#                 min_size = min([len(idx_j) for idx_j in idx_batch])
-                
-#         # 同样方式分割测试集
-#         test_idx_batch = [[] for _ in range(n_nets)]
-#         for k in range(K):
-#             idx_k = np.where(y_test == k)[0]
-#             np.random.shuffle(idx_k)
-#             proportions = np.random.dirichlet(np.repeat(alpha, n_nets))
-#             proportions = proportions / proportions.sum()
-#             proportions = (np.cumsum(proportions) * len(idx_k)).astype(int)[:-1]
-#             test_idx_batch = [idx_j + idx.tolist() for idx_j, idx in zip(test_idx_batch, np.split(idx_k, proportions))]
-
-#         # 保存训练和测试索引映射
-#         for j in range(n_nets):
-#             np.random.shuffle(idx_batch[j])
-#             train_net_dataidx_map[j] = idx_batch[j]
-#             np.random.shuffle(test_idx_batch[j])
-#             test_net_dataidx_map[j] = test_idx_batch[j]
-            
-#     return X_train, y_train, X_test, y_test, train_net_dataidx_map, test_net_dataidx_map
-
 # 修改后的数据划分函数，训练集和测试集的数据分布一致
 def partition_data(dataset, datadir, partition_method, n_nets, alpha):
     X_train, y_train, X_test, y_test = load_cifar10_data(datadir)
@@ -229,24 +183,6 @@ def get_dataloader_test(dataset, datadir, train_bs, test_bs, dataidxs_train, dat
     return get_dataloader_test_CIFAR10(datadir, train_bs, test_bs, dataidxs_train, dataidxs_test)
 
 
-
-# def get_dataloader_CIFAR10(datadir, train_bs, test_bs, train_dataidxs=None, test_dataidxs=None):
-#     dl_obj = CIFAR10_truncated
-#     transform_train, transform_test = _data_transforms_cifar10()
-
-#     # 使用不同的索引创建训练集和测试集
-#     train_ds = dl_obj(datadir, dataidxs=train_dataidxs, train=True, 
-#                      transform=transform_train, download=True)
-#     test_ds = dl_obj(datadir, dataidxs=test_dataidxs, train=False, 
-#                     transform=transform_test, download=True)
-
-#     train_dl = data.DataLoader(dataset=train_ds, batch_size=train_bs, 
-#                               shuffle=True, drop_last=False)
-#     test_dl = data.DataLoader(dataset=test_ds, batch_size=test_bs, 
-#                              shuffle=False, drop_last=False)
-
-#     return train_dl, test_dl
-
 def get_dataloader_CIFAR10(datadir, train_bs, test_bs, train_dataidxs=None, test_dataidxs=None):
     dl_obj = CIFAR10_truncated
     transform_train, transform_test = _data_transforms_cifar10()
@@ -313,47 +249,6 @@ def load_partition_data_distributed_cifar10(process_id, dataset, data_dir, parti
     return train_data_num, train_data_global, test_data_global, local_data_num, train_data_local, test_data_local, class_num
 
 
-# def load_partition_data_cifar10(dataset, data_dir, partition_method, partition_alpha, client_number, batch_size):
-#     # 获取分割的数据
-#     X_train, y_train, X_test, y_test, train_net_dataidx_map, test_net_dataidx_map = \
-#         partition_data(dataset, data_dir, partition_method, client_number, partition_alpha)
-    
-#     # 计算总的训练和测试样本数
-#     train_data_num = sum([len(train_net_dataidx_map[r]) for r in range(client_number)])
-#     test_data_num = sum([len(test_net_dataidx_map[r]) for r in range(client_number)])
-    
-#     class_num = len(np.unique(y_train))
-    
-#     # 获取全局数据加载器
-#     train_data_global, test_data_global = get_dataloader_CIFAR10(
-#         data_dir, batch_size, batch_size)
-    
-#     # 为每个客户端创建本地数据加载器和记录数据量
-#     data_local_num_dict = dict()
-#     train_data_local_dict = dict()
-#     test_data_local_dict = dict()
-    
-#     for client_idx in range(client_number):
-#         train_dataidxs = train_net_dataidx_map[client_idx]
-#         test_dataidxs = test_net_dataidx_map[client_idx]
-        
-#         # 记录每个客户端的数据量
-#         local_data_num = len(train_dataidxs)
-#         data_local_num_dict[client_idx] = local_data_num
-        
-#         # 创建本地数据加载器
-#         train_data_local, test_data_local = get_dataloader_CIFAR10(
-#             data_dir, batch_size, batch_size, 
-#             train_dataidxs, test_dataidxs)
-            
-#         train_data_local_dict[client_idx] = train_data_local
-#         test_data_local_dict[client_idx] = test_data_local
-        
-#         logging.info(f"Client {client_idx} - Training samples: {local_data_num}, "
-#                     f"Test samples: {len(test_dataidxs)}")
-    
-#     return train_data_num, test_data_num, train_data_global, test_data_global, \
-#            data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num
 
 def load_partition_data_cifar10(dataset, data_dir, partition_method, partition_alpha, client_number, batch_size):
     # Get partitioned data
@@ -396,3 +291,4 @@ def load_partition_data_cifar10(dataset, data_dir, partition_method, partition_a
     
     return train_data_num, test_data_num, train_data_global, test_data_global, \
            data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num
+

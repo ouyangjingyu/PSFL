@@ -47,10 +47,12 @@ warnings.filterwarnings("ignore")
 sys.path.insert(0, os.path.abspath(os.path.join(os.getcwd(), "../")))
 
 # 导入自定义模块
-from model.resnet import EnhancedServerModel, TierAwareClientModel,ImprovedGlobalClassifier
+from model.resnet import ImprovedGlobalClassifier,OptimizedClientModel, AdaptiveServerModel, align_shared_layers
 from utils.tierhfl_aggregator import StabilizedAggregator
 from utils.tierhfl_client import TierHFLClientManager
 from utils.tierhfl_trainer import ClusterAwareParallelTrainer, AdaptiveTrainingController, ModelFeatureClusterer
+from utils.evaluation import (create_iid_test_dataset, evaluate_global_generalization,
+                                   evaluate_cross_client_generalization, analyze_client_data_distribution)
 
 
 # 导入数据加载和处理模块
@@ -280,96 +282,6 @@ def print_cluster_info(cluster_map, client_resources, logger):
     all_clients = sum(len(clients) for clients in cluster_map.values())
     logger.info(f"总计: {len(cluster_map)}个聚类, {all_clients}个客户端")
 
-def load_global_test_set(args):
-    """创建全局IID测试集用于评估泛化性能"""
-    if args.dataset == "cifar10":
-        transform_test = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize([0.49139968, 0.48215827, 0.44653124], 
-                                [0.24703233, 0.24348505, 0.26158768])
-        ])
-        
-        testset = torchvision.datasets.CIFAR10(
-            root=args.data_dir, train=False, download=True, transform=transform_test)
-        test_loader = torch.utils.data.DataLoader(
-            testset, batch_size=args.batch_size, shuffle=False, num_workers=2)
-        
-        return test_loader
-    elif args.dataset == "cifar100":
-        transform_test = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize([0.5071, 0.4867, 0.4408],
-                                [0.2675, 0.2565, 0.2761])
-        ])
-        
-        testset = torchvision.datasets.CIFAR100(
-            root=args.data_dir, train=False, download=True, transform=transform_test)
-        test_loader = torch.utils.data.DataLoader(
-            testset, batch_size=args.batch_size, shuffle=False, num_workers=2)
-        
-        return test_loader
-    elif args.dataset == "cinic10":
-        transform_test = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize([0.47889522, 0.47227842, 0.43047404],
-                                [0.24205776, 0.23828046, 0.25874835])
-        ])
-        
-        # 使用存储在args.data_dir/cinic10/test目录下的CINIC10测试集
-        testset = torchvision.datasets.ImageFolder(
-            root=os.path.join(args.data_dir, 'cinic10', 'test'),
-            transform=transform_test)
-        test_loader = torch.utils.data.DataLoader(
-            testset, batch_size=args.batch_size, shuffle=False, num_workers=2)
-        
-        return test_loader
-    else:
-        # 默认返回CIFAR10
-        return load_global_test_set_cifar10(args)
-def evaluate_global_model(client_model, server_model, global_classifier, global_test_loader, device, tier=1):
-    """评估全局模型在全局测试集上的性能"""
-    # 确保所有模型都移到同一设备
-    client_model = client_model.to(device)
-    server_model = server_model.to(device)
-    global_classifier = global_classifier.to(device)
-    # 打印设备信息以验证
-    print(f"评估设备检查 - 数据将移至: {device}")
-    print(f"客户端模型设备: {next(client_model.parameters()).device}")
-    print(f"服务器模型设备: {next(server_model.parameters()).device}")
-    print(f"全局分类器设备: {next(global_classifier.parameters()).device}")
-    # 设置为评估模式
-    client_model.eval()
-    server_model.eval()
-    global_classifier.eval()
-    
-    correct = 0
-    total = 0
-    
-    with torch.no_grad():
-        for data, target in global_test_loader:
-            # 确保数据也在同一设备上
-            data, target = data.to(device), target.to(device)
-            
-            try:
-                # 完整的前向传播
-                _, features = client_model(data)
-                server_features = server_model(features, tier=tier)
-                logits = global_classifier(server_features)
-                
-                _, predicted = logits.max(1)
-                total += target.size(0)
-                correct += predicted.eq(target).sum().item()
-            except Exception as e:
-                print(f"评估中出现错误: {str(e)}")
-                # 打印设备信息以便调试
-                print(f"数据设备: {data.device}, 客户端模型设备: {next(client_model.parameters()).device}")
-                print(f"服务器模型设备: {next(server_model.parameters()).device}")
-                print(f"全局分类器设备: {next(global_classifier.parameters()).device}")
-                # 遇到错误继续处理下一批数据
-                continue
-    
-    accuracy = 100.0 * correct / max(1, total)
-    return accuracy
 
 # 主函数
 def main():
@@ -394,12 +306,14 @@ def main():
     # 获取数据集信息
     if args.dataset != "cinic10":
         train_data_num, test_data_num, _, _, train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num = dataset
+        # 添加数据分布分析
+        client_distribution = analyze_client_data_distribution(train_data_local_dict, args.dataset)
     else:
         train_data_num, test_data_num, _, _, train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num, _ = dataset
     
-    # 加载全局测试集
-    logger.info("加载全局IID测试集用于评估泛化性能...")
-    global_test_loader = load_global_test_set(args)
+    # # 加载全局测试集
+    # logger.info("加载全局IID测试集用于评估泛化性能...")
+    # global_test_loader = load_global_test_set(args)
     
     # 分配客户端资源
     logger.info(f"为 {args.client_number} 个客户端分配异构资源...")
@@ -439,19 +353,32 @@ def main():
         else:
             client.update_lambda_feature(args.init_lambda)
     
-    # 创建客户端模型
-    logger.info(f"创建 {args.model} 客户端模型...")
+    # 创建客户端模型部分的修改 - 保留4个tier级别
+    logger.info(f"创建优化的客户端模型...")
     client_models = {}
-    
-    # 使用TierAwareClientModel替代简单ResNet模型
+
+    # 重新映射客户端tier，保留4个tier级别
     for client_id, resource in client_resources.items():
-        tier = resource["tier"]
-        client_models[client_id] = TierAwareClientModel(num_classes=class_num, tier=tier)
-    
+        old_tier = resource["tier"]
+        
+        # 重新映射tier (将7映射到4, 5-6映射到3, 3-4映射到2, 1-2映射到1)
+        if old_tier >= 7:
+            new_tier = 4
+        elif old_tier >= 5:
+            new_tier = 3
+        elif old_tier >= 3:
+            new_tier = 2
+        else:
+            new_tier = 1
+            
+        # 更新客户端资源信息
+        resource["tier"] = new_tier
+        client_models[client_id] = OptimizedClientModel(num_classes=class_num, tier=new_tier)
+
     # 创建服务器特征提取模型
-    logger.info("创建服务器特征提取模型...")
-    server_model = EnhancedServerModel().to(device)
-    
+    logger.info("创建自适应服务器特征处理模型...")
+    server_model = AdaptiveServerModel(in_channels_list=[16, 32, 64, 128], feature_dim=128).to(device)
+
     # 创建全局分类器
     logger.info("创建全局分类器...")
     global_classifier = ImprovedGlobalClassifier(feature_dim=128, num_classes=class_num).to(device)
@@ -470,7 +397,37 @@ def main():
         initial_alpha=args.init_alpha,
         initial_lambda=args.init_lambda
     )
-    
+
+    # 为客户端设置差异化参数
+    for client_id in range(args.client_number):
+        client = client_manager.get_client(client_id)
+        if client:
+            tier = client.tier
+            
+            # 根据tier设置学习率
+            if tier == 1:  # 最复杂模型
+                client.lr = args.lr * 1.2
+            elif tier == 2:
+                client.lr = args.lr * 1.1
+            elif tier == 3:
+                client.lr = args.lr * 0.9
+            else:  # tier 4 - 最简单模型
+                client.lr = args.lr * 0.8
+                
+            # 设置alpha和lambda (本地和全局平衡)
+            if tier == 1:
+                client.update_alpha(args.init_alpha - 0.1)  # 更倾向于全局
+                client.update_lambda_feature(args.init_lambda * 1.2)  # 更强特征对齐
+            elif tier == 2:
+                client.update_alpha(args.init_alpha)
+                client.update_lambda_feature(args.init_lambda * 1.1)
+            elif tier == 3:
+                client.update_alpha(args.init_alpha + 0.1)  # 更倾向于本地
+                client.update_lambda_feature(args.init_lambda)
+            else:  # tier 4
+                client.update_alpha(args.init_alpha + 0.2)  # 最倾向于本地
+                client.update_lambda_feature(args.init_lambda * 0.8)  # 较弱特征对齐
+        
     # 对客户端进行初始聚类
     logger.info("执行初始客户端聚类...")
     client_ids = list(range(args.client_number))
@@ -497,6 +454,10 @@ def main():
     
     # 设置训练环境
     trainer.setup_training(cluster_map=cluster_map)
+    
+    # 在训练循环开始前创建IID测试集
+    print("创建独立IID测试集用于泛化性评估...")
+    iid_test_loader = create_iid_test_dataset(args, class_num)
     
     # 开始训练循环
     logger.info(f"开始联邦学习训练 ({args.rounds} 轮)...")
@@ -751,18 +712,12 @@ def main():
         server_model = server_model.to(device)
         global_classifier = global_classifier.to(device)
 
-        global_model_accuracy = evaluate_global_model(
-            sample_client_model, server_model, global_classifier, 
-            global_test_loader, device, tier=sample_client_tier)
-
-        # 记录设备信息
-        logger.info(f"评估设备: {device}")
-        logger.info(f"使用客户端 {sample_client_id}（Tier {sample_client_tier}）进行全局评估")
-        logger.info(f"客户端模型设备: {next(sample_client_model.parameters()).device}")
-        logger.info(f"服务器模型设备: {next(server_model.parameters()).device}")
-        logger.info(f"全局分类器设备: {next(global_classifier.parameters()).device}")
+        # global_model_accuracy = evaluate_global_model(
+        #     sample_client_model, server_model, global_classifier, 
+        #     global_test_loader, device, tier=sample_client_tier)
+        # 创建独立IID测试集
         
-        logger.info(f"全局模型在独立测试集上的准确率: {global_model_accuracy:.2f}%")
+        # logger.info(f"全局模型在独立测试集上的准确率: {global_model_accuracy:.2f}%")
         
         # 计算平均值
         if total_samples > 0:
@@ -854,7 +809,7 @@ def main():
         # 输出统计信息
         logger.info(f"轮次 {round_idx+1} 统计:")
         logger.info(f"全局准确率: {global_acc:.2f}%, 最佳: {best_accuracy:.2f}%")
-        logger.info(f"全局模型在独立测试集上的准确率: {global_model_accuracy:.2f}%")
+        # logger.info(f"全局模型在独立测试集上的准确率: {global_model_accuracy:.2f}%")
         logger.info(f"拆分学习阶段全局分类器平均准确率: {avg_split_learning_accuracy:.2f}%")
         logger.info(f"平均本地准确率: {avg_local_acc:.2f}%, 平均全局准确率: {avg_global_acc:.2f}%")
         logger.info(f"客户端精度标准差: {client_acc_std:.2f}, 最低: {client_acc_min:.2f}%, 最高: {client_acc_max:.2f}%")
@@ -874,7 +829,7 @@ def main():
                 "global/best_accuracy": best_accuracy,
                 "global/is_best_model": 1 if is_best else 0,
                 "global/class_balance": class_balance,
-                "global/independent_test_accuracy": global_model_accuracy,
+                # "global/independent_test_accuracy": global_model_accuracy,
                 "global/split_learning_accuracy": avg_split_learning_accuracy,
                 
                 # 客户端性能
@@ -942,7 +897,77 @@ def main():
             wandb.log(metrics)
         except Exception as e:
             logger.error(f"记录wandb指标失败: {str(e)}")
+
+        # 执行客户端特征对齐 - 每5轮
+        if round_idx > 0 and round_idx % 5 == 0:
+            logger.info("执行客户端底层特征对齐...")
+            
+            # 基于客户端性能计算权重
+            if eval_results:
+                client_weights = {}
+                # 考虑tier差异的权重计算
+                for client_id, result in eval_results.items():
+                    client = client_manager.get_client(client_id)
+                    if 'global_accuracy' in result and client:
+                        # 低tier的客户端获得更高权重
+                        tier_factor = 1.0 + (0.1 * (5 - client.tier))  # tier 4获得1.1倍权重，tier 1获得1.4倍权重
+                        client_weights[client_id] = result['global_accuracy'] / 100.0 * tier_factor
+                        
+                # 对齐共享层
+                shared_params = align_shared_layers(client_models, client_weights, device)
+                logger.info(f"完成客户端底层特征对齐，共 {len(shared_params) if shared_params else 0} 个参数")
         
+        # 每轮评估泛化性
+        print(f"\n===== 轮次 {round_idx+1} 泛化性评估 =====")
+        generalization_results = evaluate_global_generalization(
+            client_models=client_models,
+            server_model=server_model,
+            global_classifier=global_classifier,
+            iid_test_loader=iid_test_loader,
+            client_manager=client_manager,
+            device=device
+        )
+        
+        # 记录泛化性结果
+        iid_avg_acc = sum(r["accuracy"] for r in generalization_results.values()) / max(1, len(generalization_results))
+        print(f"全局模型在IID测试集上的平均准确率: {iid_avg_acc:.2f}%")
+        
+        # 每5轮执行一次跨客户端评估（计算成本较高）
+        if (round_idx + 1) % 5 == 0 or round_idx == args.rounds - 1:
+            print(f"\n===== 轮次 {round_idx+1} 跨客户端泛化性评估 =====")
+            cross_client_matrix, cross_client_avg = evaluate_cross_client_generalization(
+                client_models=client_models,
+                server_model=server_model,
+                global_classifier=global_classifier,
+                client_manager=client_manager,
+                device=device
+            )
+            
+            # 记录跨客户端结果
+            if cross_client_avg:
+                cross_avg_acc = sum(acc for _, acc in cross_client_avg) / len(cross_client_avg)
+                print(f"跨客户端平均准确率: {cross_avg_acc:.2f}%")
+                wandb.log({"global/cross_client_accuracy": cross_avg_acc, "round": round_idx+1})
+        
+        # 按tier分组记录结果
+        tier_accuracies = {i: [] for i in range(1, 5)}
+        for client_id, result in generalization_results.items():
+            tier = result["tier"]
+            if 1 <= tier <= 4:
+                tier_accuracies[tier].append(result["accuracy"])
+        
+        # 计算并记录每个tier的平均准确率
+        for tier, accs in tier_accuracies.items():
+            if accs:
+                tier_avg_acc = sum(accs) / len(accs)
+                wandb.log({f"tier_{tier}/iid_test_accuracy": tier_avg_acc, "round": round_idx+1})
+        
+        # 记录IID测试结果到wandb
+        wandb.log({
+            "global/iid_test_accuracy": iid_avg_acc,
+            "round": round_idx+1
+        })
+
         # 特别针对客户端6进行诊断分析
         if round_idx <= 5:  # 只在前几轮执行诊断，避免过多信息
             logger.info("执行客户端6诊断...")
