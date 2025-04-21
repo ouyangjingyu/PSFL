@@ -89,22 +89,32 @@ class TierHFLClient:
         
         return similarity
     
-    def train_epoch(self, server_model, global_classifier, loss_fn, gradient_guide, round_idx):
-        """训练一个epoch - 修复梯度计算冲突"""
+    def train_epoch(self, server_model, global_classifier, loss_fn, gradient_guide, round_idx, total_rounds=100):
+        """修复梯度计算冲突的训练方法"""
         self.model.train()
-        server_model.eval()
-        global_classifier.eval()
+        server_model.train()
+        global_classifier.train()
         
-        # 获取参数组，分离共享层和个性化层
-        shared_params = [p for n, p in self.model.named_parameters() 
-                        if 'shared_base' in n or 'conv1' in n or 'bn1' in n or 
-                        'layer1' in n or 'layer2' in n or 'global_adapter' in n]
-        local_params = [p for n, p in self.model.named_parameters() 
-                    if 'local_path' in n or 'local_classifier' in n]
+        # 使用固定值代替动态查询，避免潜在的内存访问问题
+        clients_in_group = 3  # 默认值
         
         # 创建优化器
-        shared_optimizer = torch.optim.Adam(shared_params, lr=self.lr, weight_decay=1e-4)
-        local_optimizer = torch.optim.Adam(local_params, lr=self.lr*1.2, weight_decay=1e-4)
+        local_optimizer = torch.optim.Adam(
+            [p for n, p in self.model.named_parameters() if 'local_path' in n or 'local_classifier' in n],
+            lr=self.lr * 1.2
+        )
+        shared_optimizer = torch.optim.Adam(
+            [p for n, p in self.model.named_parameters() if 'conv1' in n or 'bn1' in n or 'layer1' in n or 'layer2' in n or 'global_adapter' in n],
+            lr=self.lr
+        )
+        server_optimizer = torch.optim.Adam(
+            server_model.parameters(),
+            lr=self.lr * 0.8
+        )
+        classifier_optimizer = torch.optim.Adam(
+            global_classifier.parameters(),
+            lr=self.lr
+        )
         
         # 训练统计初始化
         epoch_loss = 0
@@ -117,14 +127,24 @@ class TierHFLClient:
         # 记录训练开始时间
         start_time = time.time()
         
+        # 梯度更新计数器
+        update_counter = 0
+        
         # 训练循环
         for data, target in self.train_data:
             data, target = data.to(self.device), target.to(self.device)
             
-            # 步骤1: 训练个性化路径 - 完全独立的前向传播
+            # ===== 步骤1: 只训练个性化路径 =====
+            # 确保只有本地路径的参数需要梯度
+            for name, param in self.model.named_parameters():
+                if 'local_path' in name or 'local_classifier' in name:
+                    param.requires_grad = True
+                else:
+                    param.requires_grad = False
+                    
             local_optimizer.zero_grad()
             
-            # 前向传播
+            # 前向传播 - 本地路径
             local_logits, _, _ = self.model(data)
             local_loss = F.cross_entropy(local_logits, target)
             
@@ -132,52 +152,67 @@ class TierHFLClient:
             local_loss.backward()
             local_optimizer.step()
             
-            # 步骤2: 训练共享层 - 新的前向传播
+            # ===== 步骤2: 训练共享层和服务器模型 =====
+            # 重置参数的requires_grad状态
+            for name, param in self.model.named_parameters():
+                if 'local_path' in name or 'local_classifier' in name:
+                    param.requires_grad = False
+                elif any(layer in name for layer in ['conv1', 'bn1', 'layer1', 'layer2', 'global_adapter']):
+                    param.requires_grad = True
+            
+            # 清除梯度
             shared_optimizer.zero_grad()
+            server_optimizer.zero_grad()
+            classifier_optimizer.zero_grad()
             
-            # 前向传播
+            # 前向传播 - 共享路径和服务器
             _, global_features, local_features = self.model(data)
-            with torch.no_grad():
-                server_features = server_model(global_features)
-                global_logits = global_classifier(server_features)
+            server_features = server_model(global_features)
+            global_logits = global_classifier(server_features)
             
-            # 计算全局损失和特征对齐损失
+            # 计算损失
             global_loss = F.cross_entropy(global_logits, target)
-            
-            # 简化特征对齐损失计算
-            if hasattr(loss_fn, '_feature_alignment'):
-                feature_loss = loss_fn._feature_alignment(local_features, server_features)
-            else:
-                # 简单的余弦相似度损失
-                local_feat_flat = F.adaptive_avg_pool2d(local_features, (1, 1)).view(local_features.size(0), -1)
-                server_feat_flat = server_features
-                
-                local_feat_norm = F.normalize(local_feat_flat, dim=1)
-                server_feat_norm = F.normalize(server_feat_flat, dim=1)
-                
-                feature_loss = torch.mean(1.0 - torch.sum(local_feat_norm * server_feat_norm, dim=1))
+            feature_loss = loss_fn._feature_alignment(local_features, server_features)
             
             # 动态权重
-            alpha = max(0.3, min(0.7, 0.3 + 0.4 * (round_idx / 100)))
+            progress = float(round_idx) / float(total_rounds)
+            alpha = max(0.3, min(0.7, 0.3 + 0.4 * progress))
             beta = 1.0 - alpha
             
             # 全局损失
             shared_loss = alpha * global_loss + beta * feature_loss
+            
+            # 反向传播
             shared_loss.backward()
+            
+            # 更新参数
             shared_optimizer.step()
             
-            # 累计统计
-            loss = local_loss + shared_loss
-            epoch_loss += loss.item()
+            # 控制服务器更新频率
+            update_counter += 1
+            update_interval = max(1, int(clients_in_group * 0.5))
+            
+            if update_counter >= update_interval:
+                server_optimizer.step()
+                classifier_optimizer.step()
+                update_counter = 0
+            
+            # 重置所有参数的requires_grad状态为True（为下一轮做准备）
+            for param in self.model.parameters():
+                param.requires_grad = True
+            
+            # 计算准确率
+            with torch.no_grad():
+                _, predicted = local_logits.max(1)
+                correct = predicted.eq(target).sum().item()
+            
+            # 统计累计
+            total_loss = local_loss.item() + shared_loss.item()
+            epoch_loss += total_loss
             epoch_local_loss += local_loss.item()
             epoch_global_loss += global_loss.item()
             epoch_feature_loss += feature_loss.item()
-            
-            # 计算准确率
-            _, predicted = local_logits.max(1)
-            correct = predicted.eq(target).sum().item()
             epoch_acc += correct / target.size(0)
-            
             num_batches += 1
         
         # 计算平均值
@@ -205,21 +240,9 @@ class TierHFLClient:
             'accuracy': epoch_acc * 100,
             'training_time': training_time
         }
-    
-    def train(self, server_model, global_classifier, loss_fn, 
-             gradient_guide, round_idx):
-        """训练多个epoch
-        
-        Args:
-            server_model: 服务器模型
-            global_classifier: 全局分类器
-            loss_fn: 损失函数
-            gradient_guide: 梯度引导模块
-            round_idx: 当前训练轮次
-            
-        Returns:
-            训练结果统计和模型状态
-        """
+
+    def train(self, server_model, global_classifier, loss_fn, gradient_guide, round_idx, total_rounds=100):
+        """训练多个epoch，包含对服务器模型的引用"""
         # 确保模型在正确的设备上
         self.model = self.model.to(self.device)
         server_model = server_model.to(self.device)
@@ -230,14 +253,14 @@ class TierHFLClient:
         for epoch in range(self.local_epochs):
             epoch_result = self.train_epoch(
                 server_model, global_classifier, loss_fn, 
-                gradient_guide, round_idx)
+                gradient_guide, round_idx, total_rounds)
             results.append(epoch_result)
             
             # 输出训练信息
             print(f"Client {self.client_id} (Tier {self.tier}) - "
-                 f"Epoch {epoch+1}/{self.local_epochs}, "
-                 f"Loss: {epoch_result['loss']:.4f}, "
-                 f"Acc: {epoch_result['accuracy']:.2f}%")
+                f"Epoch {epoch+1}/{self.local_epochs}, "
+                f"Loss: {epoch_result['loss']:.4f}, "
+                f"Acc: {epoch_result['accuracy']:.2f}%")
         
         # 计算平均结果
         avg_result = {

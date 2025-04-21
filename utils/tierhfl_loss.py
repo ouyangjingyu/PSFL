@@ -60,14 +60,14 @@ class TierHFLLoss(nn.Module):
             # 选择较小的维度作为共同维度
             common_dim = min(local_feat.size(1), global_feat.size(1))
             
-            # 随机投影矩阵
-            if not hasattr(self, 'projection_matrix'):
-                # 首次创建投影矩阵
-                self.register_buffer(
-                    'projection_matrix',
-                    torch.randn(max(local_feat.size(1), global_feat.size(1)), common_dim, 
-                                device=local_feat.device)
-                )
+            # 关键修改：确保投影矩阵在正确的设备上
+            # 不再使用注册的buffer，而是在每次调用时创建
+            current_device = local_feat.device
+            projection_matrix = torch.randn(
+                max(local_feat.size(1), global_feat.size(1)), 
+                common_dim, 
+                device=current_device
+            )
             
             # 应用投影
             if local_feat.size(1) > common_dim:
@@ -114,6 +114,14 @@ class TierHFLLoss(nn.Module):
         else:
             # 中期使用基础值
             return base_lambda
+    # 在现有代码中添加to方法
+    def to(self, device):
+        """将损失函数移动到指定设备"""
+        super().to(device)
+        # 如果有projection_matrix，也将其移到对应设备
+        if hasattr(self, 'projection_matrix'):
+            self.projection_matrix = self.projection_matrix.to(device)
+        return self
 
 class GradientGuideModule:
     """梯度引导模块，平衡本地和服务器梯度"""

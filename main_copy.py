@@ -184,7 +184,7 @@ def create_models(client_resources, args, device='cuda'):
     return client_models, server_models, global_classifiers
 
 def main():
-    """主函数"""
+    """主函数修改，集成新功能"""
     # 解析命令行参数
     parser = argparse.ArgumentParser()
     args = add_args(parser)
@@ -202,6 +202,8 @@ def main():
     # 设置设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"使用设备: {device}")
+    if torch.cuda.is_available():
+        logger.info(f"可用GPU数量: {torch.cuda.device_count()}")
     
     # 加载数据集
     logger.info(f"加载数据集: {args.dataset}")
@@ -235,7 +237,7 @@ def main():
     for client_id in range(args.client_number):
         resource = client_resources[client_id]
         
-        # 创建客户端
+        # 创建客户端 - 移除基于tier调整学习率
         client = client_manager.add_client(
             client_id=client_id,
             tier=resource["tier"],
@@ -246,12 +248,6 @@ def main():
             lr=args.lr,
             local_epochs=args.client_epoch
         )
-        
-        # 根据tier调整学习率
-        if resource["tier"] == 1:  # 高性能设备
-            client.lr = args.lr * 1.1
-        elif resource["tier"] == 4:  # 低性能设备
-            client.lr = args.lr * 0.8
     
     # 创建中央服务器
     logger.info("创建中央服务器")
@@ -271,7 +267,7 @@ def main():
     loss_fn = TierHFLLoss(alpha=args.init_alpha, lambda_feature=args.init_lambda)
     gradient_guide = GradientGuideModule(beta=args.init_beta)
     
-    # 创建训练器
+    # 创建训练器 - 传递总轮数
     logger.info("创建训练器")
     trainer = TierHFLTrainer(
         client_manager=client_manager,
@@ -281,6 +277,7 @@ def main():
         gradient_guide=gradient_guide,
         max_workers=args.max_workers
     )
+    trainer.rounds = args.rounds  # 添加总轮数属性
     
     # 创建评估器
     logger.info("创建评估器")
@@ -390,15 +387,6 @@ def main():
         
         # 计算轮次时间
         round_time = time.time() - round_start_time
-        
-        # 输出统计信息
-        logger.info(f"轮次 {round_idx} 统计:")
-        logger.info(f"全局准确率: {global_accuracy:.2f}%, 最佳: {best_accuracy:.2f}%")
-        logger.info(f"平均本地准确率: {avg_local_acc:.2f}%, 平均全局准确率: {avg_global_acc:.2f}%")
-        logger.info(f"轮次总时间: {round_time:.2f}秒, 训练: {training_time:.2f}秒")
-        
-        if cross_client_accuracy > 0:
-            logger.info(f"跨客户端平均准确率: {cross_client_accuracy:.2f}%")
         
         # 记录到wandb
         wandb_metrics = {
