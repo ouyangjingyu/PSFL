@@ -5,12 +5,17 @@ import numpy as np
 
 class TierHFLLoss(nn.Module):
     """TierHFL损失函数，包含本地和全局损失平衡"""
-    def __init__(self, alpha=0.5, lambda_feature=0.1, temperature=0.07):
+    def __init__(self, alpha=0.5, lambda_feature=0.1, temperature=0.07, max_cache_size=10):
         super(TierHFLLoss, self).__init__()
         self.alpha = alpha  # 本地损失权重
         self.lambda_feature = lambda_feature  # 特征对齐权重
         self.temperature = temperature  # 对比学习温度参数
         self.ce = nn.CrossEntropyLoss()
+        # 添加投影矩阵缓存字典
+        self.projection_matrix_cache = {}
+        self.max_cache_size = max_cache_size  # 添加缓存大小限制
+        self.cache_hits = 0
+        self.cache_misses = 0
     
     def forward(self, local_logits, global_logits, local_features, 
                 global_features, targets, round_idx=0):
@@ -31,7 +36,7 @@ class TierHFLLoss(nn.Module):
         local_loss = self.ce(local_logits, targets)
         global_loss = self.ce(global_logits, targets)
         
-        # 特征对齐损失 - 使用对比学习方法
+        # 特征对齐损失 - 使用简化的方法
         feature_loss = self._feature_alignment(local_features, global_features)
         
         # 根据轮次动态调整权重
@@ -45,7 +50,7 @@ class TierHFLLoss(nn.Module):
         return total_loss, local_loss, global_loss, feature_loss
     
     def _feature_alignment(self, local_feat, global_feat):
-        """改进的特征对齐损失计算"""
+        """改进的特征对齐损失计算，使用缓存的投影矩阵"""
         # 确保特征是二维张量
         if local_feat.dim() > 2:
             local_feat = F.adaptive_avg_pool2d(local_feat, (1, 1))
@@ -55,25 +60,38 @@ class TierHFLLoss(nn.Module):
             global_feat = F.adaptive_avg_pool2d(global_feat, (1, 1))
             global_feat = global_feat.view(global_feat.size(0), -1)
         
-        # 如果维度不匹配，采用投影使它们兼容
+        # 如果维度不匹配，使用或创建对应的投影矩阵
         if local_feat.size(1) != global_feat.size(1):
-            # 选择较小的维度作为共同维度
-            common_dim = min(local_feat.size(1), global_feat.size(1))
+            # 创建维度组合的键
+            dim_key = (local_feat.size(1), global_feat.size(1))
+            device_str = str(local_feat.device)
+            cache_key = f"{dim_key}_{device_str}"
             
-            # 关键修改：确保投影矩阵在正确的设备上
-            # 不再使用注册的buffer，而是在每次调用时创建
-            current_device = local_feat.device
-            projection_matrix = torch.randn(
-                max(local_feat.size(1), global_feat.size(1)), 
-                common_dim, 
-                device=current_device
-            )
+            # 检查缓存中是否已有该维度组合的投影矩阵
+            if cache_key in self.projection_matrix_cache:
+                projection = self.projection_matrix_cache[cache_key]
+                self.cache_hits += 1
+            else:
+                # 选择较小的维度作为共同维度
+                common_dim = min(local_feat.size(1), global_feat.size(1))
+                
+                # 创建新的投影矩阵并添加到缓存
+                projection = torch.randn(
+                    max(local_feat.size(1), global_feat.size(1)), 
+                    common_dim, 
+                    device=local_feat.device
+                )
+                self.projection_matrix_cache[cache_key] = projection
+                self.cache_misses += 1
+                
+                # 限制缓存大小
+                self._clean_cache()
             
             # 应用投影
-            if local_feat.size(1) > common_dim:
-                local_feat = torch.matmul(local_feat, self.projection_matrix[:local_feat.size(1), :])
-            if global_feat.size(1) > common_dim:
-                global_feat = torch.matmul(global_feat, self.projection_matrix[:global_feat.size(1), :])
+            if local_feat.size(1) > global_feat.size(1):
+                local_feat = torch.matmul(local_feat, projection[:local_feat.size(1), :])
+            else:
+                global_feat = torch.matmul(global_feat, projection[:global_feat.size(1), :])
         
         # 特征归一化
         local_norm = F.normalize(local_feat, dim=1)
@@ -84,6 +102,14 @@ class TierHFLLoss(nn.Module):
         
         # 转换为距离损失
         return torch.mean(1.0 - cos_sim)
+    
+    def _clean_cache(self):
+        """清理旧的投影矩阵缓存"""
+        if len(self.projection_matrix_cache) > self.max_cache_size:
+            # 移除最早添加的项
+            keys = list(self.projection_matrix_cache.keys())
+            for key in keys[:len(keys) - self.max_cache_size]:
+                del self.projection_matrix_cache[key]
     
     def _adjust_alpha(self, base_alpha, round_idx):
         """动态调整alpha值

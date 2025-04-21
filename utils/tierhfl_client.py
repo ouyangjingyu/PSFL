@@ -9,7 +9,7 @@ from collections import defaultdict
 class TierHFLClient:
     """TierHFL客户端类"""
     def __init__(self, client_id, tier, train_data, test_data, model, 
-                 device='cuda', lr=0.001, local_epochs=1):
+                 device='cuda', lr=0.001, local_epochs=1, feature_extract_batch=16):
         self.client_id = client_id
         self.tier = tier
         self.train_data = train_data
@@ -18,6 +18,7 @@ class TierHFLClient:
         self.device = device
         self.lr = lr
         self.local_epochs = local_epochs
+        self.feature_extract_batch = feature_extract_batch  # 添加特征提取批次大小
         
         # 创建优化器 -在train-epoch中创建
         
@@ -89,36 +90,122 @@ class TierHFLClient:
         
         return similarity
     
-    def train_epoch(self, server_model, global_classifier, loss_fn, gradient_guide, round_idx, total_rounds=100):
-        """修复梯度计算冲突的训练方法"""
+    # 添加阶段一训练方法 - 仅训练个性化路径
+    def train_phase1(self, round_idx, total_rounds=100):
+        """阶段一：训练个性化路径
+        
+        Args:
+            round_idx: 当前轮次
+            total_rounds: 总轮次
+            
+        Returns:
+            训练结果
+        """
         self.model.train()
-        server_model.train()
-        global_classifier.train()
         
-        # 使用固定值代替动态查询，避免潜在的内存访问问题
-        clients_in_group = 3  # 默认值
+        # 冻结共享层参数
+        for name, param in self.model.named_parameters():
+            if 'local_path' in name or 'local_classifier' in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
         
-        # 创建优化器
+        # 创建优化器 - 只优化个性化路径参数
         local_optimizer = torch.optim.Adam(
             [p for n, p in self.model.named_parameters() if 'local_path' in n or 'local_classifier' in n],
             lr=self.lr * 1.2
         )
-        shared_optimizer = torch.optim.Adam(
-            [p for n, p in self.model.named_parameters() if 'conv1' in n or 'bn1' in n or 'layer1' in n or 'layer2' in n or 'global_adapter' in n],
-            lr=self.lr
-        )
-        server_optimizer = torch.optim.Adam(
-            server_model.parameters(),
-            lr=self.lr * 0.8
-        )
-        classifier_optimizer = torch.optim.Adam(
-            global_classifier.parameters(),
-            lr=self.lr
-        )
         
         # 训练统计初始化
         epoch_loss = 0
-        epoch_local_loss = 0
+        epoch_acc = 0
+        num_batches = 0
+        
+        # 记录训练开始时间
+        start_time = time.time()
+        
+        # 训练循环
+        for data, target in self.train_data:
+            data, target = data.to(self.device), target.to(self.device)
+            
+            # 清除梯度
+            local_optimizer.zero_grad()
+            
+            # 前向传播 - 只需要本地路径
+            local_logits, _, _ = self.model(data)
+            
+            # 计算损失
+            loss = F.cross_entropy(local_logits, target)
+            
+            # 反向传播
+            loss.backward()
+            
+            # 更新参数
+            local_optimizer.step()
+            
+            # 计算准确率
+            with torch.no_grad():
+                _, predicted = local_logits.max(1)
+                correct = predicted.eq(target).sum().item()
+            
+            # 统计累计
+            epoch_loss += loss.item()
+            epoch_acc += correct / target.size(0)
+            num_batches += 1
+        
+        # 计算平均值
+        epoch_loss /= num_batches
+        epoch_acc /= num_batches
+        
+        # 计算训练时间
+        training_time = time.time() - start_time
+        
+        # 更新统计信息
+        self.stats['train_loss'].append(epoch_loss)
+        self.stats['train_acc'].append(epoch_acc)
+        
+        return {
+            'loss': epoch_loss,
+            'accuracy': epoch_acc * 100,
+            'training_time': training_time
+        }
+    
+    # 添加阶段二训练方法 - 仅训练共享层
+    def train_phase2(self, server_model, global_classifier, loss_fn, round_idx, total_rounds=100):
+        """阶段二：训练共享层和服务器模型
+        
+        Args:
+            server_model: 服务器模型
+            global_classifier: 全局分类器
+            loss_fn: 损失函数
+            round_idx: 当前轮次
+            total_rounds: 总轮次
+            
+        Returns:
+            训练结果, 共享层状态
+        """
+        self.model.train()
+        server_model.train()
+        global_classifier.train()
+        
+        # 冻结个性化路径参数，启用共享层参数
+        for name, param in self.model.named_parameters():
+            if 'local_path' in name or 'local_classifier' in name:
+                param.requires_grad = False
+            else:
+                param.requires_grad = True
+        
+        # 创建优化器 - 只优化共享层参数
+        shared_optimizer = torch.optim.Adam(
+            [p for n, p in self.model.named_parameters() if any(
+                layer in n for layer in ['conv1', 'bn1', 'layer1', 'layer2_shared'])],
+            lr=self.lr
+        )
+        
+        # 服务器优化器 - 在服务器端创建和更新
+        
+        # 训练统计初始化
+        epoch_loss = 0
         epoch_global_loss = 0
         epoch_feature_loss = 0
         epoch_acc = 0
@@ -127,45 +214,18 @@ class TierHFLClient:
         # 记录训练开始时间
         start_time = time.time()
         
-        # 梯度更新计数器
-        update_counter = 0
+        # 收集特征和标签，用于经验回放
+        collected_features = []
+        collected_labels = []
         
         # 训练循环
         for data, target in self.train_data:
             data, target = data.to(self.device), target.to(self.device)
             
-            # ===== 步骤1: 只训练个性化路径 =====
-            # 确保只有本地路径的参数需要梯度
-            for name, param in self.model.named_parameters():
-                if 'local_path' in name or 'local_classifier' in name:
-                    param.requires_grad = True
-                else:
-                    param.requires_grad = False
-                    
-            local_optimizer.zero_grad()
-            
-            # 前向传播 - 本地路径
-            local_logits, _, _ = self.model(data)
-            local_loss = F.cross_entropy(local_logits, target)
-            
-            # 反向传播
-            local_loss.backward()
-            local_optimizer.step()
-            
-            # ===== 步骤2: 训练共享层和服务器模型 =====
-            # 重置参数的requires_grad状态
-            for name, param in self.model.named_parameters():
-                if 'local_path' in name or 'local_classifier' in name:
-                    param.requires_grad = False
-                elif any(layer in name for layer in ['conv1', 'bn1', 'layer1', 'layer2', 'global_adapter']):
-                    param.requires_grad = True
-            
             # 清除梯度
             shared_optimizer.zero_grad()
-            server_optimizer.zero_grad()
-            classifier_optimizer.zero_grad()
             
-            # 前向传播 - 共享路径和服务器
+            # 前向传播 - 共享路径到服务器
             _, global_features, local_features = self.model(data)
             server_features = server_model(global_features)
             global_logits = global_classifier(server_features)
@@ -188,28 +248,18 @@ class TierHFLClient:
             # 更新参数
             shared_optimizer.step()
             
-            # 控制服务器更新频率
-            update_counter += 1
-            update_interval = max(1, int(clients_in_group * 0.5))
-            
-            if update_counter >= update_interval:
-                server_optimizer.step()
-                classifier_optimizer.step()
-                update_counter = 0
-            
-            # 重置所有参数的requires_grad状态为True（为下一轮做准备）
-            for param in self.model.parameters():
-                param.requires_grad = True
+            # 收集特征和标签
+            with torch.no_grad():
+                collected_features.append(server_features.detach())
+                collected_labels.append(target.detach())
             
             # 计算准确率
             with torch.no_grad():
-                _, predicted = local_logits.max(1)
+                _, predicted = global_logits.max(1)
                 correct = predicted.eq(target).sum().item()
             
             # 统计累计
-            total_loss = local_loss.item() + shared_loss.item()
-            epoch_loss += total_loss
-            epoch_local_loss += local_loss.item()
+            epoch_loss += shared_loss.item()
             epoch_global_loss += global_loss.item()
             epoch_feature_loss += feature_loss.item()
             epoch_acc += correct / target.size(0)
@@ -217,7 +267,6 @@ class TierHFLClient:
         
         # 计算平均值
         epoch_loss /= num_batches
-        epoch_local_loss /= num_batches
         epoch_global_loss /= num_batches
         epoch_feature_loss /= num_batches
         epoch_acc /= num_batches
@@ -226,54 +275,109 @@ class TierHFLClient:
         training_time = time.time() - start_time
         
         # 更新统计信息
-        self.stats['train_loss'].append(epoch_loss)
-        self.stats['train_acc'].append(epoch_acc)
-        self.stats['local_loss'].append(epoch_local_loss)
         self.stats['global_loss'].append(epoch_global_loss)
         self.stats['feature_loss'].append(epoch_feature_loss)
         
+        # 合并所有收集的特征和标签
+        if collected_features:
+            all_features = torch.cat(collected_features, dim=0)
+            all_labels = torch.cat(collected_labels, dim=0)
+            # 更新全局分类器的经验回放缓冲区
+            global_classifier.update_buffer(all_features, all_labels, self.device)
+        
+        # 为经验回放添加训练步骤
+        self._train_with_replay(server_model, global_classifier)
+        
+        # 获取共享层状态
+        shared_state = {}
+        for name, param in self.model.named_parameters():
+            if any(layer in name for layer in ['conv1', 'bn1', 'layer1', 'layer2_shared']):
+                shared_state[name] = param.data.clone()
+        
         return {
             'loss': epoch_loss,
-            'local_loss': epoch_local_loss,
             'global_loss': epoch_global_loss,
             'feature_loss': epoch_feature_loss,
             'accuracy': epoch_acc * 100,
             'training_time': training_time
-        }
-
-    def train(self, server_model, global_classifier, loss_fn, gradient_guide, round_idx, total_rounds=100):
-        """训练多个epoch，包含对服务器模型的引用"""
-        # 确保模型在正确的设备上
-        self.model = self.model.to(self.device)
-        server_model = server_model.to(self.device)
-        global_classifier = global_classifier.to(self.device)
+        }, shared_state
+    
+    # 添加经验回放训练方法
+    def _train_with_replay(self, server_model, global_classifier, batch_size=64):
+        """使用经验回放训练全局分类器
         
-        # 训练多个epoch
-        results = []
-        for epoch in range(self.local_epochs):
-            epoch_result = self.train_epoch(
-                server_model, global_classifier, loss_fn, 
-                gradient_guide, round_idx, total_rounds)
-            results.append(epoch_result)
-            
-            # 输出训练信息
-            print(f"Client {self.client_id} (Tier {self.tier}) - "
-                f"Epoch {epoch+1}/{self.local_epochs}, "
-                f"Loss: {epoch_result['loss']:.4f}, "
-                f"Acc: {epoch_result['accuracy']:.2f}%")
+        Args:
+            server_model: 服务器模型
+            global_classifier: 全局分类器
+            batch_size: 批次大小
+        """
+        # 从缓冲区采样数据
+        replay_features, replay_labels = global_classifier.sample_from_buffer(batch_size, self.device)
         
-        # 计算平均结果
-        avg_result = {
-            'loss': np.mean([r['loss'] for r in results]),
-            'local_loss': np.mean([r['local_loss'] for r in results]),
-            'global_loss': np.mean([r['global_loss'] for r in results]),
-            'feature_loss': np.mean([r['feature_loss'] for r in results]),
-            'accuracy': np.mean([r['accuracy'] for r in results]),
-            'training_time': sum([r['training_time'] for r in results])
-        }
+        # 如果没有回放数据，跳过
+        if replay_features is None:
+            return
         
-        # 返回训练结果和模型状态
-        return avg_result, self.model.state_dict()
+        # 设置训练模式
+        server_model.train()
+        global_classifier.train()
+        
+        # 创建优化器 - 只优化分类器
+        classifier_optimizer = torch.optim.Adam(global_classifier.parameters(), lr=self.lr * 0.5)
+        
+        # 清除梯度
+        classifier_optimizer.zero_grad()
+        
+        # 前向传播
+        logits = global_classifier(replay_features)
+        
+        # 计算损失
+        loss = F.cross_entropy(logits, replay_labels)
+        
+        # 反向传播
+        loss.backward()
+        
+        # 更新参数
+        classifier_optimizer.step()
+    
+    # 修改extract_features_and_labels方法，分批提取特征
+    def extract_features_and_labels(self):
+        """从训练数据中提取特征和标签，确保维度一致"""
+        self.model.eval()
+        
+        features_list = []
+        labels_list = []
+        
+        batch_size = getattr(self, 'feature_extract_batch', 16)
+        
+        with torch.no_grad():
+            for data, target in self.train_data:
+                try:
+                    # 获取当前批次
+                    batch_data = data.to(self.device)
+                    batch_target = target.to(self.device)
+                    
+                    # 提取全局特征
+                    _, global_features, _ = self.model(batch_data)
+                    
+                    # 不要改变特征的维度结构，保持原始输出结构
+                    # 这很重要，因为服务器模型期望特定维度的输入
+                    
+                    # 收集特征和标签
+                    features_list.append(global_features.cpu())
+                    labels_list.append(batch_target.cpu())
+                    
+                except Exception as e:
+                    print(f"特征提取错误: {str(e)}")
+                    continue
+        
+        # 如果有收集到的特征和标签，合并它们
+        if features_list and labels_list:
+            all_features = torch.cat(features_list, dim=0)
+            all_labels = torch.cat(labels_list, dim=0)
+            return all_features, all_labels
+        
+        return None, None
     
     def evaluate(self, server_model, global_classifier):
         """评估客户端模型
@@ -378,7 +482,7 @@ class TierHFLClientManager:
         self.default_device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     def add_client(self, client_id, tier, train_data, test_data, model, 
-                  device=None, lr=0.001, local_epochs=1):
+                  device=None, lr=0.001, local_epochs=1, feature_extract_batch=16):
         """添加客户端
         
         Args:
@@ -390,6 +494,7 @@ class TierHFLClientManager:
             device: 设备
             lr: 学习率
             local_epochs: 本地训练轮次
+            feature_extract_batch: 特征提取批次大小
             
         Returns:
             创建的客户端
@@ -404,7 +509,8 @@ class TierHFLClientManager:
             model=model,
             device=device,
             lr=lr,
-            local_epochs=local_epochs
+            local_epochs=local_epochs,
+            feature_extract_batch=feature_extract_batch
         )
         
         self.clients[client_id] = client

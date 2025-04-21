@@ -54,6 +54,24 @@ def add_args(parser):
     parser.add_argument('--rounds', default=100, type=int, help='联邦学习轮数')
     parser.add_argument('--n_groups', default=3, type=int, help='服务器组数量')
     parser.add_argument('--max_workers', default=None, type=int, help='最大并行工作线程数')
+    # 添加新参数
+    parser.add_argument('--buffer_size', default=1000, type=int, 
+                       help='全局分类器经验回放缓冲区大小')
+    parser.add_argument('--balance_alpha', default=0.7, type=float, 
+                       help='平衡权重中性能与多样性的因子(更高的值更重视性能)')
+
+    parser.add_argument('--disable_buffer', type=bool, default=True, 
+                   help='是否禁用经验回放缓冲区')
+    
+    # 添加内存优化相关参数
+    parser.add_argument('--batch_size_server', type=int, default=32, 
+                       help='服务器训练批次大小，控制内存使用')
+    parser.add_argument('--accum_steps', type=int, default=4, 
+                       help='梯度累积步骤数')
+    parser.add_argument('--feature_extract_batch', type=int, default=16,
+                       help='特征提取时的批次大小')
+    parser.add_argument('--max_cache_size', type=int, default=10,
+                       help='投影矩阵缓存的最大大小')
     
     # TierHFL特有参数
     parser.add_argument('--init_alpha', default=0.5, type=float, 
@@ -172,13 +190,14 @@ def create_models(client_resources, args, device='cuda'):
     for group_id in range(args.n_groups):
         server_models[group_id] = TierHFLServerModel(
             base_model=args.model,
-            in_channels_list=[16, 32, 64],
+            in_channels=32,  # 客户端共享层的输出通道数，layer2_shared的输出
             feature_dim=128
         ).to(device)
         
         global_classifiers[group_id] = TierHFLGlobalClassifier(
             feature_dim=128,
-            num_classes=10 if args.dataset == 'cifar10' else 100
+            num_classes=10 if args.dataset == 'cifar10' else 100,
+            buffer_size=args.buffer_size
         ).to(device)
     
     return client_models, server_models, global_classifiers
@@ -233,11 +252,11 @@ def main():
     logger.info("创建客户端管理器")
     client_manager = TierHFLClientManager()
     
-    # 注册客户端
+    # 注册客户端 - 传递特征提取批次大小
     for client_id in range(args.client_number):
         resource = client_resources[client_id]
         
-        # 创建客户端 - 移除基于tier调整学习率
+        # 创建客户端
         client = client_manager.add_client(
             client_id=client_id,
             tier=resource["tier"],
@@ -246,7 +265,8 @@ def main():
             model=client_models[client_id],
             device=device,
             lr=args.lr,
-            local_epochs=args.client_epoch
+            local_epochs=args.client_epoch,
+            feature_extract_batch=args.feature_extract_batch  # 传递新参数
         )
     
     # 创建中央服务器
@@ -262,23 +282,28 @@ def main():
     logger.info(f"创建分组策略，组数: {args.n_groups}")
     grouping_strategy = TierHFLGroupingStrategy(num_groups=args.n_groups)
     
-    # 创建损失函数和梯度引导模块
-    logger.info("创建损失函数和梯度引导模块")
-    loss_fn = TierHFLLoss(alpha=args.init_alpha, lambda_feature=args.init_lambda)
-    gradient_guide = GradientGuideModule(beta=args.init_beta)
+    # 创建损失函数 - 传递缓存大小限制
+    logger.info("创建损失函数")
+    loss_fn = TierHFLLoss(
+        alpha=args.init_alpha, 
+        lambda_feature=args.init_lambda,
+        max_cache_size=args.max_cache_size
+    )
     
-    # 创建训练器 - 传递总轮数
+    # 创建训练器 - 传递批处理和梯度累积参数
     logger.info("创建训练器")
     trainer = TierHFLTrainer(
         client_manager=client_manager,
         central_server=central_server,
         grouping_strategy=grouping_strategy,
         loss_fn=loss_fn,
-        gradient_guide=gradient_guide,
+        gradient_guide=None,  # 不再使用梯度引导
         max_workers=args.max_workers
     )
     trainer.rounds = args.rounds  # 添加总轮数属性
-    
+    trainer.batch_size_server = args.batch_size_server  # 添加服务器批次大小
+    trainer.accum_steps = args.accum_steps  # 添加梯度累积步骤数
+    trainer.disable_buffer = args.disable_buffer  # 添加禁用缓冲区标志
     # 创建评估器
     logger.info("创建评估器")
     evaluator = TierHFLEvaluator(
@@ -323,7 +348,7 @@ def main():
         logger.info(f"===== 轮次 {round_idx}/{args.rounds} =====")
         round_start_time = time.time()
         
-        # 执行并行训练
+        # 执行并行训练 - 使用优化的并行训练方法
         train_result = trainer.execute_parallel_training(
             client_models=client_models, round_idx=round_idx)
         
