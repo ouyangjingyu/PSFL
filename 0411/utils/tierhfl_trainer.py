@@ -12,12 +12,13 @@ import math
 
 # 簇感知并行训练器 - 支持聚类并行训练
 class ClusterAwareParallelTrainer:
-    def __init__(self, client_manager, server_model, global_classifier=None, device="cuda", max_workers=None):
+    def __init__(self, client_manager, server_model, global_classifier=None, device="cuda", max_workers=None, loss_fn=None):
         """初始化训练器"""
         self.client_manager = client_manager
         self.server_model = server_model
         self.global_classifier = global_classifier
         self.default_device = device
+        self.loss_fn = loss_fn  # 保存损失函数
         
         # 设置最大并行工作线程数
         if max_workers is None:
@@ -76,229 +77,175 @@ class ClusterAwareParallelTrainer:
             self.logger.info(f"聚类 {cluster_id}: {len(clients)} 个客户端，设备: {device_map.get(cluster_id, 'default')}")
     
     def _train_cluster(self, cluster_id, client_ids, round_idx, results_queue):
-        """训练单个聚类的工作函数"""
+        """训练单个聚类的工作函数 - 支持双阶段训练"""
         try:
             # 获取当前聚类的设备
             device = self.device_map.get(cluster_id, self.default_device)
             self.logger.info(f"聚类 {cluster_id} 开始训练，设备: {device}")
             
-            # 计时 - 增加模型加载时间记录
+            # 计时
             model_load_start = time.time()
             
             # 将服务器模型和全局分类器移到正确设备
             server_model = copy.deepcopy(self.server_model).to(device)
             global_classifier = copy.deepcopy(self.global_classifier).to(device) if self.global_classifier else None
             
+            # 创建损失函数
+            loss_fn = None
+            if hasattr(self, 'loss_fn'):
+                loss_fn = copy.deepcopy(self.loss_fn).to(device)
+            
             model_load_time = time.time() - model_load_start
-            # 新增：针对全局分类器的预热训练
-            if round_idx < 5 and global_classifier is not None:
-                self.logger.info(f"聚类 {cluster_id} 开始全局分类器预热训练")
-                
-                # 为全局分类器创建专用优化器
-                classifier_optimizer = torch.optim.Adam(
-                    global_classifier.parameters(),
-                    lr=0.001,
-                    weight_decay=0.0001  # 增加正则化
-                )
-                
-                # 从客户端收集训练批次
-                warmup_batches = []
-                for client_id in client_ids:
-                    client = self.client_manager.get_client(client_id)
-                    if client is None or client_id not in self.client_models:
-                        continue
-                    
-                    client_model = copy.deepcopy(self.client_models[client_id]).to(device)
-                    
-                    # 收集少量批次用于预热训练
-                    batch_count = 0
-                    for data, target in client.train_data:
-                        if batch_count >= 5:  # 每个客户端最多5个批次
-                            break
-                        warmup_batches.append((client_id, data, target))
-                        batch_count += 1
-                
-                # 预热训练全局分类器
-                if warmup_batches:
-                    for _ in range(3):  # 多次遍历预热数据
-                        random.shuffle(warmup_batches)
-                        
-                        for client_id, data, target in warmup_batches:
-                            data, target = data.to(device), target.to(device)
-                            client = self.client_manager.get_client(client_id)
-                            client_model = copy.deepcopy(self.client_models[client_id]).to(device)
-                            
-                            with torch.no_grad():  # 不计算客户端模型梯度
-                                _, features = client_model(data)
-                                server_features = server_model(features, tier=client.tier)
-                            
-                            # 只训练全局分类器
-                            classifier_optimizer.zero_grad()
-                            global_logits = global_classifier(server_features)
-                            loss = F.cross_entropy(global_logits, target)
-                            loss.backward()
-                            torch.nn.utils.clip_grad_norm_(global_classifier.parameters(), max_norm=1.0)
-                            classifier_optimizer.step()
-                            
-            # 保存训练结果
+            
+            # 记录结果
             cluster_results = {}
+            phase1_results = {}
+            phase2_results = {}
+            shared_states = {}
             cluster_eval_results = {}
-            cluster_time_stats = {}  # 新增时间统计
+            cluster_time_stats = {}
             
-            if round_idx == 0:
-                self.logger.info(f"聚类 {cluster_id} 开始特征维度检查")
-                # 创建一个样本输入
-                sample_input = torch.randn(1, 3, 32, 32).to(device)
-                
-                for client_id in client_ids:
-                    client = self.client_manager.get_client(client_id)
-                    if client is None or client_id not in self.client_models:
-                        continue
-                        
-                    tier = client.tier
-                    try:
-                        client_model = copy.deepcopy(self.client_models[client_id]).to(device)
-                        self.logger.info(f"检查客户端 {client_id} (Tier {tier}) 的特征维度")
-                        
-                        # 执行前向传播
-                        local_logits, features = client_model(sample_input)
-                        self.logger.info(f"客户端 {client_id} 特征输出维度: {features.shape}, 本地分类器输出维度: {local_logits.shape}")
-                        
-                        # 检查服务器模型处理
-                        server_features = server_model(features, tier=tier)
-                        self.logger.info(f"服务器处理后特征维度: {server_features.shape}")
-                        
-                        # 检查全局分类器
-                        if global_classifier:
-                            global_logits = global_classifier(server_features)
-                            self.logger.info(f"全局分类器输出维度: {global_logits.shape}")
-                        
-                        # 客户端模型移回CPU
-                        client_model = client_model.cpu()
-                    except Exception as e:
-                        self.logger.error(f"客户端 {client_id} 维度检查失败: {str(e)}")
-                        import traceback
-                        self.logger.error(traceback.format_exc())
-                
-                self.logger.info(f"聚类 {cluster_id} 完成特征维度检查")
-
-            # 检查聚类中是否包含客户端6
-            has_client6 = 6 in client_ids
-            if has_client6:
-                print(f"\n[CLUSTER TRAINER] 聚类 {cluster_id} 包含客户端6")
-                print(f"[CLUSTER TRAINER] 聚类 {cluster_id} 所有客户端: {client_ids}")
-                
-                # 设置调试标志
-                if hasattr(server_model, '_debug_client_id'):
-                    server_model._debug_client_id = 6
-                if global_classifier and hasattr(global_classifier, '_debug_client_id'):
-                    global_classifier._debug_client_id = 6
-
+            total_rounds = getattr(self, 'rounds', 100)
             
-
-            # 训练每个客户端
+            # 阶段一: 每个客户端独立训练个性化路径
             for client_id in client_ids:
-                client_start_time = time.time()  # 客户端总时间开始
-                
-                # 获取客户端和模型
                 client = self.client_manager.get_client(client_id)
                 if client is None or client_id not in self.client_models:
                     self.logger.warning(f"客户端 {client_id} 不存在或没有模型，跳过")
                     continue
                 
-                # 特殊监控客户端6
-                is_client6 = client_id == 6
-                if is_client6:
-                    print(f"\n[TRAINER] 开始处理客户端6，所属聚类: {cluster_id}, 轮次: {round_idx}")
-                    print(f"[TRAINER] 客户端6 Tier: {client.tier}, 学习率: {client.lr}")
-                    
-                    # 检查模型参数统计
-                    client_model = self.client_models[client_id]
-                    n_params = sum(p.numel() for p in client_model.parameters())
-                    print(f"[TRAINER] 客户端6模型参数数量: {n_params}")
-                    
-                    # 为客户端模型添加调试标志
-                    if hasattr(client_model, 'client_id'):
-                        client_model.client_id = 6
-                    
-                    # 为损失函数添加调试标志
-                    if hasattr(client.feature_alignment_loss, '_debug_client_id'):
-                        client.feature_alignment_loss._debug_client_id = 6
-
-                # 计时 - 模型复制
-                copy_start_time = time.time()
-                try:
-                    client_model = copy.deepcopy(self.client_models[client_id]).to(device)
-                except Exception as e:
-                    self.logger.error(f"客户端 {client_id} 模型复制到设备 {device} 失败: {str(e)}")
-                    continue
-                copy_time = time.time() - copy_start_time
+                # 将客户端模型移到正确的设备
+                client_model = copy.deepcopy(self.client_models[client_id]).to(device)
                 
-                # 执行训练 - 传入全局分类器
+                # 临时设置客户端设备
+                original_device = client.device
+                client.device = device
+                client.model = client_model
+                
+                # 执行阶段一训练
                 try:
-                    # 修改client.train方法以支持全局分类器
-                    train_result = client.train(client_model, server_model, global_classifier, round_idx)
-                    cluster_results[client_id] = train_result
-                    
-                    # 更新客户端模型
-                    model_transfer_start = time.time()
-                    self.client_models[client_id] = client_model.cpu()
-                    model_transfer_time = time.time() - model_transfer_start
-                    
+                    phase1_result = client.train_phase1(round_idx, total_rounds)
+                    phase1_results[client_id] = phase1_result
                 except Exception as e:
-                    self.logger.error(f"客户端 {client_id} 训练失败: {str(e)}")
+                    self.logger.error(f"客户端 {client_id} 阶段一训练失败: {str(e)}")
                     import traceback
                     self.logger.error(traceback.format_exc())
+                    
+                # 恢复客户端设备
+                client.device = original_device
+                
+                # 更新本地模型
+                self.client_models[client_id] = client_model.cpu()
+                
+                # 释放内存
+                torch.cuda.empty_cache()
+            
+            # 阶段二: 执行共享层和服务器训练
+            for client_id in client_ids:
+                client = self.client_manager.get_client(client_id)
+                if client is None or client_id not in self.client_models:
                     continue
                 
-                # 执行评估 - 针对客户端6添加更详细日志
-                if is_client6:
-                    print(f"[TRAINER] 开始评估客户端6...")
-                    
-                eval_start_time = time.time()
-
+                # 将客户端模型移到正确的设备
+                client_model = copy.deepcopy(self.client_models[client_id]).to(device)
+                
+                # 临时设置客户端设备
+                original_device = client.device
+                client.device = device
+                client.model = client_model
+                
+                # 执行阶段二训练
                 try:
-                    eval_result = client.evaluate(client_model, server_model, global_classifier)
-                    cluster_eval_results[client_id] = eval_result
+                    phase2_result, shared_state = client.train_phase2(
+                        server_model, global_classifier, loss_fn, round_idx, total_rounds)
+                    phase2_results[client_id] = phase2_result
+                    shared_states[client_id] = shared_state
+                except Exception as e:
+                    self.logger.error(f"客户端 {client_id} 阶段二训练失败: {str(e)}")
+                    import traceback
+                    self.logger.error(traceback.format_exc())
                     
-                    if is_client6:
-                        print(f"[TRAINER] 客户端6评估结果:")
-                        print(f"  - 本地准确率: {eval_result.get('local_accuracy', 0):.2f}%")
-                        print(f"  - 全局准确率: {eval_result.get('global_accuracy', 0):.2f}%")
-                        print(f"  - 测试损失: {eval_result.get('test_loss', 0):.4f}")
+                # 恢复客户端设备
+                client.device = original_device
+                
+                # 更新本地模型
+                self.client_models[client_id] = client_model.cpu()
+                
+                # 释放内存
+                torch.cuda.empty_cache()
+            
+            # 评估每个客户端
+            eval_results = {}
+            for client_id in client_ids:
+                client = self.client_manager.get_client(client_id)
+                if client is None or client_id not in self.client_models:
+                    continue
+                
+                # 将客户端模型移到正确的设备
+                client_model = copy.deepcopy(self.client_models[client_id]).to(device)
+                
+                # 临时设置客户端设备
+                original_device = client.device
+                client.device = device
+                client.model = client_model
+                
+                # 执行评估
+                try:
+                    # 标准评估
+                    eval_result = client.evaluate(client_model, server_model, global_classifier)  # 添加global_classifier参数
+                    eval_results[client_id] = eval_result
+                    
+                    # 添加跨客户端评估
+                    if hasattr(self, '_evaluate_cross_client'):
+                        cross_result = self._evaluate_cross_client(
+                            client_id, client_model, server_model, global_classifier)
                         
-                        # 检查每个类别的准确率
-                        if 'global_per_class_acc' in eval_result:
-                            print(f"  - 全局每类准确率: {[f'{acc:.1f}%' for acc in eval_result['global_per_class_acc']]}")
+                        if cross_result:
+                            eval_result['cross_client_accuracy'] = cross_result.get('accuracy', 0)
+                            eval_result['cross_client_loss'] = cross_result.get('loss', 0)
+                    
+                    eval_results[client_id] = eval_result
                 except Exception as e:
                     self.logger.error(f"客户端 {client_id} 评估失败: {str(e)}")
-                    if is_client6:
-                        print(f"[TRAINER] 客户端6评估出错: {str(e)}")
-                        import traceback
-                        traceback.print_exc()
-                    continue
-
-                eval_time = time.time() - eval_start_time
+                    
+                # 恢复客户端设备
+                client.device = original_device
                 
-                # 记录时间开销
-                client_total_time = time.time() - client_start_time
-                cluster_time_stats[client_id] = {
-                    "copy_time": copy_time,
-                    "training_time": train_result.get('training_time', 0),
-                    "model_transfer_time": model_transfer_time,
-                    "evaluation_time": eval_time,
-                    "total_time": client_total_time
-                }
-                
-            # 将聚类结果添加到队列
+                # 释放内存
+                torch.cuda.empty_cache()
+            
+            # 合并结果
+            for client_id in client_ids:
+                if client_id in phase1_results and client_id in phase2_results and client_id in eval_results:
+                    # 合并阶段一和阶段二结果
+                    train_result = {
+                        'phase1_loss': phase1_results[client_id].get('loss', 0),
+                        'phase2_loss': phase2_results[client_id].get('loss', 0),
+                        'global_loss': phase2_results[client_id].get('global_loss', 0),
+                        'feature_loss': phase2_results[client_id].get('feature_loss', 0),
+                        'phase1_accuracy': phase1_results[client_id].get('accuracy', 0),
+                        'phase2_accuracy': phase2_results[client_id].get('accuracy', 0),
+                        'training_time': phase1_results[client_id].get('training_time', 0) + 
+                                    phase2_results[client_id].get('training_time', 0)
+                    }
+                    
+                    cluster_results[client_id] = train_result
+                    cluster_eval_results[client_id] = eval_results[client_id]
+                    cluster_time_stats[client_id] = {
+                        "training_time": train_result['training_time'],
+                        "total_time": train_result['training_time'] + 0.1  # 加0.1秒作为其他开销
+                    }
+            
+            # 将结果添加到队列
             results_queue.put({
                 'cluster_id': cluster_id,
                 'server_model': server_model.cpu().state_dict(),
                 'global_classifier': global_classifier.cpu().state_dict() if global_classifier else None,
                 'train_results': cluster_results,
                 'eval_results': cluster_eval_results,
-                'time_stats': cluster_time_stats,  # 新增时间统计
-                'model_load_time': model_load_time  # 记录模型加载时间
+                'shared_states': shared_states,  # 添加共享层状态
+                'time_stats': cluster_time_stats,
+                'model_load_time': model_load_time
             })
             
             self.logger.info(f"聚类 {cluster_id} 训练完成")
@@ -313,6 +260,120 @@ class ClusterAwareParallelTrainer:
                 'cluster_id': cluster_id,
                 'error': error_msg
             })
+
+    # 添加跨客户端评估方法
+    def _evaluate_cross_client(self, client_id, client_model, server_model, global_classifier):
+        """评估客户端模型在其他客户端数据上的表现"""
+        # 确保使用同一个设备 - 使用固定设备cuda:0或者默认设备
+        # 获取当前可用的第一个设备，避免设备混合使用
+        if torch.cuda.is_available():
+            device = torch.device('cuda:0')  # 固定使用第一个GPU
+        else:
+            device = torch.device('cpu')
+        
+        # 确保所有模型都在同一设备上
+        client_model = client_model.to(device)
+        server_model = server_model.to(device)
+        global_classifier = global_classifier.to(device)
+        
+        # 设置为评估模式
+        client_model.eval()
+        server_model.eval()
+        global_classifier.eval()
+        
+        all_results = []
+        
+        # 获取当前客户端
+        current_client = self.client_manager.get_client(client_id)
+        if current_client is None:
+            return None
+        
+        # 获取其他客户端(最多取3个)
+        other_clients = []
+        for other_id, client in self.client_manager.clients.items():
+            if other_id != client_id:
+                other_clients.append(client)
+                if len(other_clients) >= 3:
+                    break
+        
+        if not other_clients:
+            return None
+        
+        # 评估每个其他客户端的数据
+        for other_client in other_clients:
+            test_data = other_client.test_data
+            
+            # 准备统计
+            correct = 0
+            total = 0
+            loss_sum = 0.0
+            batch_count = 0
+            
+            with torch.no_grad():
+                for data, target in test_data:
+                    # 确保数据在正确的设备上
+                    data, target = data.to(device), target.to(device)
+                    
+                    # 前向传播
+                    try:
+                        # 使用新的模型接口，处理三个返回值
+                        local_logits, shared_features, _ = client_model(data)
+                        
+                        # 确保特征在正确设备上
+                        shared_features = shared_features.to(device)
+                        
+                        # 服务器处理
+                        server_features = server_model(shared_features)
+                        
+                        # 确保特征在正确设备上
+                        server_features = server_features.to(device)
+                        
+                        # 全局分类
+                        global_logits = global_classifier(server_features)
+                        
+                        # 计算损失
+                        loss = F.cross_entropy(global_logits, target)
+                        loss_sum += loss.item()
+                        batch_count += 1
+                        
+                        # 计算准确率
+                        _, predicted = global_logits.max(1)
+                        total += target.size(0)
+                        correct += predicted.eq(target).sum().item()
+                    except Exception as e:
+                        self.logger.error(f"跨客户端评估错误: {str(e)}")
+                        # 打印更多调试信息
+                        if torch.cuda.is_available():
+                            self.logger.error(f"当前设备: {device}, 模型设备: client={next(client_model.parameters()).device}, server={next(server_model.parameters()).device}, classifier={next(global_classifier.parameters()).device}")
+                        continue
+                    
+                    # 限制评估批次数量，节省时间
+                    if batch_count >= 5:
+                        break
+            
+            # 计算该客户端数据的结果
+            if total > 0:
+                accuracy = 100.0 * correct / total
+                avg_loss = loss_sum / max(1, batch_count)
+                
+                all_results.append({
+                    'other_client_id': other_client.client_id,
+                    'accuracy': accuracy,
+                    'loss': avg_loss
+                })
+        
+        # 计算平均结果
+        if all_results:
+            avg_accuracy = sum(r['accuracy'] for r in all_results) / len(all_results)
+            avg_loss = sum(r['loss'] for r in all_results) / len(all_results)
+            
+            return {
+                'accuracy': avg_accuracy,
+                'loss': avg_loss,
+                'details': all_results
+            }
+        
+        return None
     
     def execute_parallel_training(self, round_idx=0):
         """执行并行训练"""
@@ -668,137 +729,30 @@ class AdaptiveTrainingController:
             'alpha': self.alpha,
             'lambda_feature': self.lambda_feature
         }
-
-# 数据分布聚类器 - 基于数据特性进行聚类
-class DataDistributionClusterer:
-    def __init__(self, num_clusters=3):
-        """初始化聚类器"""
-        self.num_clusters = num_clusters
-    
-    def cluster_clients(self, client_models, client_ids, eval_dataset=None, device='cuda'):
-        """基于客户端评估性能和模型参数聚类"""
-        # 防止客户端数小于聚类数
-        if len(client_ids) <= self.num_clusters:
-            clusters = {i: [client_id] for i, client_id in enumerate(client_ids[:self.num_clusters])}
-            self.clustering_history.append({
-                'timestamp': time.time(),
-                'clusters': copy.deepcopy(clusters),
-                'num_clients': len(client_ids)
-            })
-            return clusters
-        
-        # 收集客户端模型参数
-        client_features = {}
-        for client_id in client_ids:
-            if client_id in client_models:
-                model = client_models[client_id]
-                params_vec = []
-                # 只提取共享参数
-                for name, param in model.named_parameters():
-                    if not any(x in name for x in ['fc', 'linear', 'classifier']):
-                        params_vec.append(param.detach().cpu().view(-1))
-                
-                if params_vec:
-                    # 连接所有参数
-                    client_features[client_id] = torch.cat(params_vec).numpy()
-        
-        # 如果没有足够的特征数据，使用简单分配
-        if len(client_features) < self.num_clusters:
-            clusters = {}
-            for i in range(self.num_clusters):
-                clusters[i] = []
-            
-            for i, client_id in enumerate(client_ids):
-                cluster_idx = i % self.num_clusters
-                clusters[cluster_idx].append(client_id)
-                
-            self.clustering_history.append({
-                'timestamp': time.time(),
-                'clusters': copy.deepcopy(clusters),
-                'num_clients': len(client_ids)
-            })
-            return clusters
-        
-        # 使用K-means算法聚类
-        try:
-            from sklearn.cluster import KMeans
-            
-            # 准备特征矩阵
-            feature_matrix = np.array(list(client_features.values()))
-            
-            # 标准化特征
-            feature_mean = np.mean(feature_matrix, axis=0)
-            feature_std = np.std(feature_matrix, axis=0) + 1e-5
-            feature_matrix = (feature_matrix - feature_mean) / feature_std
-            
-            # 执行K-means聚类
-            kmeans = KMeans(n_clusters=self.num_clusters, random_state=0).fit(feature_matrix)
-            
-            # 获取聚类标签
-            cluster_labels = kmeans.labels_
-            
-            # 构建聚类映射
-            clusters = {i: [] for i in range(self.num_clusters)}
-            
-            # 分配客户端到聚类
-            for i, client_id in enumerate(client_features.keys()):
-                cluster_idx = cluster_labels[i]
-                clusters[cluster_idx].append(client_id)
-            
-            # 分配没有特征的客户端
-            for client_id in client_ids:
-                if client_id not in client_features:
-                    # 找到最小的聚类
-                    min_cluster = min(clusters.items(), key=lambda x: len(x[1]))[0]
-                    clusters[min_cluster].append(client_id)
-        except:
-            # 如果K-means失败，回退到简单分配
-            clusters = {}
-            for i in range(self.num_clusters):
-                clusters[i] = []
-            
-            for i, client_id in enumerate(client_ids):
-                cluster_idx = i % self.num_clusters
-                clusters[cluster_idx].append(client_id)
-        
-        # 记录聚类结果
-        self.clustering_history.append({
-            'timestamp': time.time(),
-            'clusters': copy.deepcopy(clusters),
-            'num_clients': len(client_ids)
-        })
-        
-        return clusters
         
 class ModelFeatureClusterer:
     def __init__(self, num_clusters=3):
         self.num_clusters = num_clusters
         self.clustering_history = []
     
+    # 在ModelFeatureClusterer类中，优化cluster_clients方法，考虑无法获取原始数据的情况
     def cluster_clients(self, client_models, client_ids, eval_dataset=None, device='cuda'):
-        """基于模型特征的聚类方法"""
+        """基于模型特征的聚类方法，考虑服务器不能获取原始数据的限制"""
         clusters = {i: [] for i in range(self.num_clusters)}
         
-        print("\n[CLUSTERING] 开始客户端聚类...")
-    
-        # 检查客户端6是否在列表中
-        has_client6 = 6 in client_ids
-        if has_client6:
-            print("[CLUSTERING] 客户端6将参与聚类")
-        
-        # 提取模型特征
+        # 提取模型特征 - 使用共享层参数而非原始数据
         client_features = {}
-        feature_dims = []  # 记录所有特征向量的维度
+        feature_dims = []
         
-        # 第一步：提取特征并记录维度
+        # 第一步：提取特征
         for client_id in client_ids:
             if client_id in client_models:
                 model = client_models[client_id]
                 features = []
                 
-                # 只提取卷积层和归一化层统计特征
+                # 只提取共享层参数作为特征
                 for name, param in model.named_parameters():
-                    if ('conv' in name or 'norm' in name) and 'weight' in name:
+                    if 'shared_base' in name and 'weight' in name:
                         # 提取统计信息而非原始参数
                         param_data = param.detach().cpu()
                         # 只收集标量特征，避免形状不一致
@@ -814,15 +768,6 @@ class ModelFeatureClusterer:
                     features_array = np.array(features, dtype=np.float32)
                     client_features[client_id] = features_array
                     feature_dims.append(len(features_array))
-
-                    # 特别检查客户端6的特征
-                    if client_id == 6:
-                        print(f"[CLUSTERING] 客户端6特征维度: {len(features_array)}")
-                        print(f"[CLUSTERING] 客户端6特征统计: min={features_array.min():.4f}, max={features_array.max():.4f}, mean={features_array.mean():.4f}, std={features_array.std():.4f}")
-                        # 检查是否有异常值
-                        nan_count = np.isnan(features_array).sum()
-                        inf_count = np.isinf(features_array).sum()
-                        print(f"[CLUSTERING] 客户端6特征异常值: NaN={nan_count}, Inf={inf_count}")
         
         # 检查所有特征向量的维度是否一致
         if feature_dims and len(set(feature_dims)) > 1:
@@ -833,12 +778,12 @@ class ModelFeatureClusterer:
             
             print(f"发现不同维度的特征向量: {dict(dim_counter)}，使用最常见维度: {common_dim}")
             
-            # 填充或裁剪特征向量到相同维度
+            # 处理维度不一致的特征向量
             for client_id in list(client_features.keys()):
                 feat = client_features[client_id]
                 if len(feat) != common_dim:
                     if len(feat) < common_dim:
-                        # 如果特征太短，使用填充（用0填充）
+                        # 如果特征太短，使用填充
                         client_features[client_id] = np.pad(feat, (0, common_dim - len(feat)), 'constant')
                     else:
                         # 如果特征太长，进行裁剪
@@ -851,12 +796,6 @@ class ModelFeatureClusterer:
                 # 转换为矩阵
                 feature_client_ids = list(client_features.keys())
                 features_matrix = np.vstack([client_features[cid] for cid in feature_client_ids])
-                
-                # 打印形状信息以调试
-                print(f"特征矩阵形状: {features_matrix.shape}")
-                
-                # 确保特征矩阵是浮点型
-                features_matrix = features_matrix.astype(np.float32)
                 
                 # 标准化特征
                 mean = np.mean(features_matrix, axis=0)
@@ -872,64 +811,24 @@ class ModelFeatureClusterer:
                     client_id = feature_client_ids[i]
                     clusters[label].append(client_id)
                 
-                # 处理没有特征的客户端
-                for client_id in client_ids:
-                    if client_id not in client_features:
-                        # 分配到最小聚类
-                        min_cluster = min(clusters.items(), key=lambda x: len(x[1]))[0]
-                        clusters[min_cluster].append(client_id)
-                        
+                # 处理没有特征的客户端 - 平均分配
+                remaining_clients = [cid for cid in client_ids if cid not in client_features]
+                for i, client_id in enumerate(remaining_clients):
+                    target_cluster = i % self.num_clusters
+                    clusters[target_cluster].append(client_id)
+                    
             except Exception as e:
                 print(f"K-means聚类失败: {str(e)}，使用备选方案")
-                import traceback
-                traceback.print_exc()
-                # 回退到备选方案 - 基于tier分组
-                tier_groups = {}
-                for client_id in client_ids:
-                    client = self.client_manager.get_client(client_id) if hasattr(self, 'client_manager') else None
-                    tier = getattr(client, 'tier', client_id % 7 + 1)  # 如果无法获取tier，使用client_id模拟
-                    
-                    if tier not in tier_groups:
-                        tier_groups[tier] = []
-                    tier_groups[tier].append(client_id)
-                
-                # 将tier组分配到聚类中
-                cluster_idx = 0
-                for tier, clients in tier_groups.items():
-                    for client_id in clients:
-                        clusters[cluster_idx % self.num_clusters].append(client_id)
-                        cluster_idx += 1
+                # 备用方案 - 均匀分配
+                for i, client_id in enumerate(client_ids):
+                    cluster_idx = i % self.num_clusters
+                    clusters[cluster_idx].append(client_id)
         else:
-            # 备选方案：均匀分配
+            # 备用方案：均匀分配
             for i, client_id in enumerate(client_ids):
                 cluster_idx = i % self.num_clusters
                 clusters[cluster_idx].append(client_id)
         
-
-        # 执行聚类后检查客户端6的分配
-        for cluster_id, clients in clusters.items():
-            if 6 in clients:
-                print(f"[CLUSTERING] 客户端6被分配到聚类 {cluster_id}")
-                print(f"[CLUSTERING] 聚类 {cluster_id} 中的所有客户端: {clients}")
-                
-                # 计算该聚类与其他聚类的差异
-                if len(client_features) > 0 and 6 in client_features:
-                    client6_feature = client_features[6]
-                    for other_id, other_feature in client_features.items():
-                        if other_id == 6 or other_id not in client_ids:
-                            continue
-                        
-                        # 计算特征向量余弦相似度
-                        try:
-                            # 确保长度一致
-                            min_len = min(len(client6_feature), len(other_feature))
-                            sim = np.dot(client6_feature[:min_len], other_feature[:min_len]) / (
-                                np.linalg.norm(client6_feature[:min_len]) * np.linalg.norm(other_feature[:min_len])
-                            )
-                            print(f"[CLUSTERING] 客户端6与客户端{other_id}的特征相似度: {sim:.4f}")
-                        except Exception as e:
-                            print(f"[CLUSTERING] 计算相似度出错: {str(e)}")
-
         # 记录聚类结果
         self.clustering_history.append({
             'timestamp': time.time(),

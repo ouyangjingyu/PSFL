@@ -132,192 +132,385 @@ class TierHFLClient:
             return True
         return False
         
-    def train(self, client_model, server_model, global_classifier, round_idx=0):
-        """客户端训练过程-- 拆分学习模式"""
-        # 确保模型在正确的设备上
-        client_model = client_model.to(self.device)
-        server_model = server_model.to(self.device)
-        global_classifier = global_classifier.to(self.device)
+    # def train(self, client_model, server_model, global_classifier, round_idx=0):
+    #     """客户端训练过程-- 拆分学习模式"""
+    #     # 确保模型在正确的设备上
+    #     client_model = client_model.to(self.device)
+    #     server_model = server_model.to(self.device)
+    #     global_classifier = global_classifier.to(self.device)
         
-        # 设置为训练模式
-        client_model.train()
+    #     # 设置为训练模式
+    #     client_model.train()
+    #     server_model.train()
+    #     global_classifier.train()
+        
+    #      # 优化器设置
+    #     if hasattr(client_model, 'get_shared_params') and hasattr(client_model, 'get_personalized_params'):
+    #         shared_params = list(client_model.get_shared_params().values())
+    #         personalized_params = list(client_model.get_personalized_params().values())
+            
+    #         # 共享参数使用Adam
+    #         optimizer_shared = torch.optim.Adam(shared_params, lr=self.lr)
+    #         # 个性化参数使用更高学习率的SGD+动量
+    #         optimizer_personal = torch.optim.SGD(personalized_params, 
+    #                                         lr=self.lr * 1.5,
+    #                                         momentum=0.9,
+    #                                         weight_decay=1e-4)
+    #     else:
+    #         # 后备方案
+    #         optimizer_shared = torch.optim.Adam(client_model.parameters(), lr=self.lr)
+    #         optimizer_personal = None
+        
+    #     # 开始计时
+    #     start_time = time.time()
+        
+    #     # 记录详细训练指标
+    #     batch_times = []
+    #     epoch_losses = []
+    #     epoch_local_losses = []
+    #     epoch_global_losses = []
+    #     epoch_feature_losses = []
+        
+    #     # 收集训练统计信息
+    #     epoch_stats = {
+    #         'total_loss': 0.0,
+    #         'local_loss': 0.0,
+    #         'global_loss': 0.0,
+    #         'feature_loss': 0.0,
+    #         'correct': 0,
+    #         'total': 0,
+    #         'batch_count': 0
+    #     }
+    #     # 添加早停相关变量
+    #     early_stop_patience = 10
+    #     best_loss = float('inf')
+    #     patience_counter = 0
+    #     # 训练循环
+    #     for epoch in range(self.local_epochs):
+    #         epoch_loss = 0.0
+    #         num_batches = 0
+    #         for batch_idx, (data, target) in enumerate(self.train_data):
+    #             batch_start = time.time()
+                
+    #             # 将数据移到设备上
+    #             data, target = data.to(self.device), target.to(self.device)
+                
+    #             # 清除梯度
+    #             optimizer_shared.zero_grad()
+    #             if optimizer_personal:
+    #                 optimizer_personal.zero_grad()
+                
+    #             # 客户端前向传播
+    #             try:
+    #                 local_logits, features = client_model(data)
+    #             except Exception as e:
+    #                 print(f"客户端模型前向传播失败: {str(e)}")
+    #                 continue
+                
+    #             # 服务器前向传播 - 只得到特征
+    #             try:
+    #                 server_features = server_model(features, tier=self.tier)
+                    
+    #                 # 全局分类器前向传播
+    #                 global_logits = global_classifier(server_features)
+    #             except Exception as e:
+    #                 print(f"服务器特征提取或全局分类器前向传播失败: {str(e)}, 特征形状: {features.shape}")
+    #                 # 使用local_logits作为备用
+    #                 global_logits = local_logits
+    #                 server_features = features.view(features.size(0), -1)  # 确保是2D张量
+                
+    #             # 计算混合损失
+    #             loss, local_loss, global_loss = self.hybrid_loss(local_logits, global_logits, target)
+                
+    #             # 计算特征对齐损失
+    #             try:
+    #                 # 本地特征与服务器特征对齐
+    #                 # 需要确保特征维度匹配，可能需要调整
+    #                 feature_loss = self.feature_alignment_loss(features, server_features, round_idx)
+    #                 total_loss = loss + self.lambda_feature * feature_loss
+    #             except Exception as e:
+    #                 print(f"特征对齐损失计算失败: {str(e)}")
+    #                 total_loss = loss
+    #                 feature_loss = torch.tensor(0.0, device=self.device)
+                
+    #             epoch_loss += total_loss.item()
+    #             num_batches += 1
+
+    #             # 反向传播
+    #             total_loss.backward()
+                
+    #             # 梯度裁剪
+    #             torch.nn.utils.clip_grad_norm_(client_model.parameters(), max_norm=1.0)
+                
+    #             # 更新参数
+    #             optimizer_shared.step()
+    #             if optimizer_personal:
+    #                 optimizer_personal.step()
+                
+    #             # 更新统计信息
+    #             epoch_stats['total_loss'] += total_loss.item()
+    #             epoch_stats['local_loss'] += local_loss.item()
+    #             epoch_stats['global_loss'] += global_loss.item()
+    #             epoch_stats['feature_loss'] += feature_loss.item()
+    #             epoch_stats['batch_count'] += 1
+                
+    #             # 计算全局分类准确率
+    #             _, predicted = global_logits.max(1)
+    #             epoch_stats['total'] += target.size(0)
+    #             epoch_stats['correct'] += predicted.eq(target).sum().item()
+                
+    #             # 记录批次处理时间
+    #             batch_times.append(time.time() - batch_start)
+            
+    #         # 计算每轮平均损失
+    #         if num_batches > 0:
+    #             epoch_loss = epoch_loss / num_batches
+    #             print(f"客户端 {self.client_id} - 轮次 {epoch+1}/{self.local_epochs}, 损失: {epoch_loss:.4f}")
+    
+    #         # 记录每个epoch的损失
+    #         epoch_losses.append(epoch_stats['total_loss'] / epoch_stats['batch_count'])
+    #         epoch_local_losses.append(epoch_stats['local_loss'] / epoch_stats['batch_count'])
+    #         epoch_global_losses.append(epoch_stats['global_loss'] / epoch_stats['batch_count'])
+    #         epoch_feature_losses.append(epoch_stats['feature_loss'] / epoch_stats['batch_count'])
+
+    #         # 检查早停条件
+    #         if num_batches > 0:
+    #             avg_epoch_loss = epoch_loss / num_batches
+    #             if avg_epoch_loss < best_loss * 0.995:  # 至少需要0.5%的改进
+    #                 best_loss = avg_epoch_loss
+    #                 patience_counter = 0
+    #             else:
+    #                 patience_counter += 1
+                    
+    #             if patience_counter >= early_stop_patience:
+    #                 print(f"客户端 {self.client_id} 早停于第 {epoch+1}/{self.local_epochs} 轮")
+    #                 break
+        
+    #     # 计算平均损失和准确率
+    #     num_batches = epoch_stats['batch_count']
+    #     avg_loss = epoch_stats['total_loss'] / max(1, num_batches)
+    #     avg_local_loss = epoch_stats['local_loss'] / max(1, num_batches)
+    #     avg_global_loss = epoch_stats['global_loss'] / max(1, num_batches)
+    #     avg_feature_loss = epoch_stats['feature_loss'] / max(1, num_batches)
+    #     accuracy = 100.0 * epoch_stats['correct'] / max(1, epoch_stats['total'])
+        
+    #     # 记录训练时间
+    #     training_time = time.time() - start_time
+    #     avg_batch_time = sum(batch_times) / max(1, len(batch_times))
+        
+    #     # 保存统计信息
+    #     self.stats['train_loss'].append(avg_loss)
+    #     self.stats['train_acc'].append(accuracy)
+    #     self.stats['local_loss'].append(avg_local_loss)
+    #     self.stats['global_loss'].append(avg_global_loss)
+    #     self.stats['feature_loss'].append(avg_feature_loss)
+        
+    #     # 返回更详细的结果
+    #     return {
+    #         'model_state': client_model.state_dict(),
+    #         'avg_loss': avg_loss,
+    #         'avg_local_loss': avg_local_loss,
+    #         'avg_global_loss': avg_global_loss,
+    #         'avg_feature_loss': avg_feature_loss,
+    #         'epoch_losses': epoch_losses,
+    #         'accuracy': accuracy,
+    #         'training_time': training_time,
+    #         'avg_batch_time': avg_batch_time,
+    #         'total_batches': num_batches
+    #     }
+
+    # 在TierHFLClient类中添加两阶段训练方法
+    def train_phase1(self, round_idx=0, total_rounds=100):
+        """阶段一：训练个性化路径，冻结共享层"""
+        # 将模型设为训练模式
+        self.model.train()
+        
+        # 冻结共享层参数
+        for name, param in self.model.named_parameters():
+            if 'shared_base' in name:
+                param.requires_grad = False
+            else:
+                param.requires_grad = True
+        
+        # 获取个性化参数
+        personalized_params = self.model.get_personalized_params()
+        
+        # 创建优化器 - 只优化个性化参数
+        optimizer = torch.optim.Adam(personalized_params.values(), lr=self.lr)
+        
+        # 统计信息
+        epoch_stats = {
+            'total_loss': 0.0,
+            'correct': 0,
+            'total': 0,
+            'batch_count': 0
+        }
+        
+        # 记录开始时间
+        start_time = time.time()
+        
+        # 训练循环
+        for epoch in range(self.local_epochs):
+            for batch_idx, (data, target) in enumerate(self.train_data):
+                # 移到设备
+                data, target = data.to(self.device), target.to(self.device)
+                
+                # 清除梯度
+                optimizer.zero_grad()
+                
+                # 前向传播 - 只关注本地分类结果
+                local_logits, _, _ = self.model(data)
+                
+                # 计算损失
+                loss = F.cross_entropy(local_logits, target)
+                
+                # 反向传播
+                loss.backward()
+                
+                # 更新参数
+                optimizer.step()
+                
+                # 统计
+                epoch_stats['total_loss'] += loss.item()
+                epoch_stats['batch_count'] += 1
+                
+                # 计算准确率
+                _, predicted = local_logits.max(1)
+                epoch_stats['total'] += target.size(0)
+                epoch_stats['correct'] += predicted.eq(target).sum().item()
+        
+        # 计算平均损失和准确率
+        avg_loss = epoch_stats['total_loss'] / max(1, epoch_stats['batch_count'])
+        accuracy = 100.0 * epoch_stats['correct'] / max(1, epoch_stats['total'])
+        
+        # 计算训练时间
+        training_time = time.time() - start_time
+        
+        # 更新统计
+        self.stats['train_loss'].append(avg_loss)
+        self.stats['train_acc'].append(accuracy)
+        
+        return {
+            'loss': avg_loss,
+            'accuracy': accuracy,
+            'training_time': training_time
+        }
+
+    def train_phase2(self, server_model, global_classifier, loss_fn, round_idx=0, total_rounds=100):
+        """阶段二：训练共享层和服务器，冻结个性化路径"""
+        # 将模型设为训练模式
+        self.model.train()
         server_model.train()
         global_classifier.train()
         
-         # 优化器设置
-        if hasattr(client_model, 'get_shared_params') and hasattr(client_model, 'get_personalized_params'):
-            shared_params = list(client_model.get_shared_params().values())
-            personalized_params = list(client_model.get_personalized_params().values())
-            
-            # 共享参数使用Adam
-            optimizer_shared = torch.optim.Adam(shared_params, lr=self.lr)
-            # 个性化参数使用更高学习率的SGD+动量
-            optimizer_personal = torch.optim.SGD(personalized_params, 
-                                            lr=self.lr * 1.5,
-                                            momentum=0.9,
-                                            weight_decay=1e-4)
-        else:
-            # 后备方案
-            optimizer_shared = torch.optim.Adam(client_model.parameters(), lr=self.lr)
-            optimizer_personal = None
+        # 冻结个性化路径参数，启用共享层参数
+        for name, param in self.model.named_parameters():
+            if 'shared_base' in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
         
-        # 开始计时
-        start_time = time.time()
+        # 获取共享层参数
+        shared_params = self.model.get_shared_params()
         
-        # 记录详细训练指标
-        batch_times = []
-        epoch_losses = []
-        epoch_local_losses = []
-        epoch_global_losses = []
-        epoch_feature_losses = []
+        # 创建优化器
+        shared_optimizer = torch.optim.Adam(shared_params.values(), lr=self.lr)
+        server_optimizer = torch.optim.Adam(server_model.parameters(), lr=self.lr)
+        classifier_optimizer = torch.optim.Adam(global_classifier.parameters(), lr=self.lr)
         
-        # 收集训练统计信息
+        # 统计信息
         epoch_stats = {
             'total_loss': 0.0,
-            'local_loss': 0.0,
             'global_loss': 0.0,
             'feature_loss': 0.0,
             'correct': 0,
             'total': 0,
             'batch_count': 0
         }
-        # 添加早停相关变量
-        early_stop_patience = 10
-        best_loss = float('inf')
-        patience_counter = 0
+        
+        # 记录开始时间
+        start_time = time.time()
+        
         # 训练循环
         for epoch in range(self.local_epochs):
-            epoch_loss = 0.0
-            num_batches = 0
             for batch_idx, (data, target) in enumerate(self.train_data):
-                batch_start = time.time()
-                
-                # 将数据移到设备上
+                # 移到设备
                 data, target = data.to(self.device), target.to(self.device)
                 
                 # 清除梯度
-                optimizer_shared.zero_grad()
-                if optimizer_personal:
-                    optimizer_personal.zero_grad()
+                shared_optimizer.zero_grad()
+                server_optimizer.zero_grad()
+                classifier_optimizer.zero_grad()
                 
-                # 客户端前向传播
-                try:
-                    local_logits, features = client_model(data)
-                except Exception as e:
-                    print(f"客户端模型前向传播失败: {str(e)}")
-                    continue
+                # 前向传播
+                _, shared_features, personal_features = self.model(data)
+                server_features = server_model(shared_features)
+                global_logits = global_classifier(server_features)
                 
-                # 服务器前向传播 - 只得到特征
-                try:
-                    server_features = server_model(features, tier=self.tier)
-                    
-                    # 全局分类器前向传播
-                    global_logits = global_classifier(server_features)
-                except Exception as e:
-                    print(f"服务器特征提取或全局分类器前向传播失败: {str(e)}, 特征形状: {features.shape}")
-                    # 使用local_logits作为备用
-                    global_logits = local_logits
-                    server_features = features.view(features.size(0), -1)  # 确保是2D张量
+                # 计算损失
+                global_loss = F.cross_entropy(global_logits, target)
                 
-                # 计算混合损失
-                loss, local_loss, global_loss = self.hybrid_loss(local_logits, global_logits, target)
+                # 特征对齐损失 - 使用轻量级实现
+                # 根据轮次动态调整权重
+                lambda_factor = max(0.05, 0.2 - round_idx / total_rounds * 0.15)
                 
-                # 计算特征对齐损失
-                try:
-                    # 本地特征与服务器特征对齐
-                    # 需要确保特征维度匹配，可能需要调整
-                    feature_loss = self.feature_alignment_loss(features, server_features, round_idx)
-                    total_loss = loss + self.lambda_feature * feature_loss
-                except Exception as e:
-                    print(f"特征对齐损失计算失败: {str(e)}")
-                    total_loss = loss
-                    feature_loss = torch.tensor(0.0, device=self.device)
+                # 简化的特征对齐损失
+                if hasattr(loss_fn, '_feature_alignment'):
+                    feature_loss = loss_fn._feature_alignment(personal_features, server_features)
+                    total_loss = global_loss + lambda_factor * feature_loss
+                else:
+                    # 备用方案：余弦相似度损失
+                    personal_flat = F.adaptive_avg_pool2d(personal_features, (1, 1)).view(personal_features.size(0), -1)
+                    personal_norm = F.normalize(personal_flat, dim=1)
+                    server_norm = F.normalize(server_features, dim=1)
+                    feature_loss = 1.0 - torch.mean(torch.sum(personal_norm * server_norm, dim=1))
+                    total_loss = global_loss + lambda_factor * feature_loss
                 
-                epoch_loss += total_loss.item()
-                num_batches += 1
-
                 # 反向传播
                 total_loss.backward()
                 
-                # 梯度裁剪
-                torch.nn.utils.clip_grad_norm_(client_model.parameters(), max_norm=1.0)
-                
                 # 更新参数
-                optimizer_shared.step()
-                if optimizer_personal:
-                    optimizer_personal.step()
+                shared_optimizer.step()
+                server_optimizer.step()
+                classifier_optimizer.step()
                 
-                # 更新统计信息
+                # 统计
                 epoch_stats['total_loss'] += total_loss.item()
-                epoch_stats['local_loss'] += local_loss.item()
                 epoch_stats['global_loss'] += global_loss.item()
                 epoch_stats['feature_loss'] += feature_loss.item()
                 epoch_stats['batch_count'] += 1
                 
-                # 计算全局分类准确率
+                # 计算准确率
                 _, predicted = global_logits.max(1)
                 epoch_stats['total'] += target.size(0)
                 epoch_stats['correct'] += predicted.eq(target).sum().item()
-                
-                # 记录批次处理时间
-                batch_times.append(time.time() - batch_start)
-            
-            # 计算每轮平均损失
-            if num_batches > 0:
-                epoch_loss = epoch_loss / num_batches
-                print(f"客户端 {self.client_id} - 轮次 {epoch+1}/{self.local_epochs}, 损失: {epoch_loss:.4f}")
-    
-            # 记录每个epoch的损失
-            epoch_losses.append(epoch_stats['total_loss'] / epoch_stats['batch_count'])
-            epoch_local_losses.append(epoch_stats['local_loss'] / epoch_stats['batch_count'])
-            epoch_global_losses.append(epoch_stats['global_loss'] / epoch_stats['batch_count'])
-            epoch_feature_losses.append(epoch_stats['feature_loss'] / epoch_stats['batch_count'])
-
-            # 检查早停条件
-            if num_batches > 0:
-                avg_epoch_loss = epoch_loss / num_batches
-                if avg_epoch_loss < best_loss * 0.995:  # 至少需要0.5%的改进
-                    best_loss = avg_epoch_loss
-                    patience_counter = 0
-                else:
-                    patience_counter += 1
-                    
-                if patience_counter >= early_stop_patience:
-                    print(f"客户端 {self.client_id} 早停于第 {epoch+1}/{self.local_epochs} 轮")
-                    break
         
         # 计算平均损失和准确率
-        num_batches = epoch_stats['batch_count']
-        avg_loss = epoch_stats['total_loss'] / max(1, num_batches)
-        avg_local_loss = epoch_stats['local_loss'] / max(1, num_batches)
-        avg_global_loss = epoch_stats['global_loss'] / max(1, num_batches)
-        avg_feature_loss = epoch_stats['feature_loss'] / max(1, num_batches)
+        avg_loss = epoch_stats['total_loss'] / max(1, epoch_stats['batch_count'])
+        avg_global_loss = epoch_stats['global_loss'] / max(1, epoch_stats['batch_count'])
+        avg_feature_loss = epoch_stats['feature_loss'] / max(1, epoch_stats['batch_count'])
         accuracy = 100.0 * epoch_stats['correct'] / max(1, epoch_stats['total'])
         
-        # 记录训练时间
+        # 计算训练时间
         training_time = time.time() - start_time
-        avg_batch_time = sum(batch_times) / max(1, len(batch_times))
         
-        # 保存统计信息
-        self.stats['train_loss'].append(avg_loss)
-        self.stats['train_acc'].append(accuracy)
-        self.stats['local_loss'].append(avg_local_loss)
+        # 更新统计
         self.stats['global_loss'].append(avg_global_loss)
         self.stats['feature_loss'].append(avg_feature_loss)
         
-        # 返回更详细的结果
+        # 获取共享层状态
+        shared_state = {}
+        for name, param in self.model.named_parameters():
+            if 'shared_base' in name:
+                shared_state[name] = param.data.clone()
+        
         return {
-            'model_state': client_model.state_dict(),
-            'avg_loss': avg_loss,
-            'avg_local_loss': avg_local_loss,
-            'avg_global_loss': avg_global_loss,
-            'avg_feature_loss': avg_feature_loss,
-            'epoch_losses': epoch_losses,
+            'loss': avg_loss,
+            'global_loss': avg_global_loss,
+            'feature_loss': avg_feature_loss,
             'accuracy': accuracy,
-            'training_time': training_time,
-            'avg_batch_time': avg_batch_time,
-            'total_batches': num_batches
-        }
+            'training_time': training_time
+        }, shared_state
         
     def evaluate(self, client_model, server_model, global_classifier):
         """客户端评估过程"""
@@ -359,24 +552,24 @@ class TierHFLClient:
                 data, target = data.to(self.device), target.to(self.device)
                 
                 # 客户端前向传播
-                local_logits, features = client_model(data)
+                local_logits, shared_features, personal_features = client_model(data)
 
                 # 只对前几个批次进行详细调试，避免信息过多
                 do_debug = is_client6 and batch_count < 3
                 
                 if do_debug:
                     print(f"\n[Client6 Debug] 批次 {batch_count} 客户端特征:")
-                    print(f"- 形状: {features.shape}")
-                    print(f"- 范围: {features.min().item():.4f} 到 {features.max().item():.4f}")
+                    print(f"- 形状: {shared_features.shape}")
+                    print(f"- 范围: {shared_features.min().item():.4f} 到 {shared_features.max().item():.4f}")
                     
                     # 检查特征是否有异常值
-                    has_nan = torch.isnan(features).any().item()
-                    has_inf = torch.isinf(features).any().item()
+                    has_nan = torch.isnan(shared_features).any().item()
+                    has_inf = torch.isinf(shared_features).any().item()
                     print(f"- 特征有NaN: {has_nan}, 有Inf: {has_inf}")
                 
                 # 服务器前向传播
                 try:
-                    server_features = server_model(features, tier=self.tier)
+                    server_features = server_model(shared_features)
 
                     if do_debug:
                         print(f"[Client6 Debug] 服务器处理后特征:")

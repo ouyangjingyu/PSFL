@@ -15,18 +15,53 @@ class StabilizedAggregator:
         self.accuracy_history = []  # 准确率历史记录
     
     # 聚合客户端模型
-    def aggregate_clients(self, client_states, client_weights=None, client_clusters=None):
-        """聚合客户端状态"""
+    # 修改StabilizedAggregator的aggregate_clients方法
+    def aggregate_clients(self, client_states, client_performance=None, client_clusters=None):
+        """聚合客户端状态，使用自适应权重基于性能"""
         # 没有客户端状态时直接返回空字典
         if not client_states:
             return {}
+        
+        # 过滤只保留共享层参数
+        filtered_states = {}
+        for client_id, state in client_states.items():
+            filtered_state = {}
+            for k, v in state.items():
+                if 'shared_base' in k:
+                    filtered_state[k] = v
             
-        # 如果已提供聚类信息，使用聚类聚合
-        if client_clusters:
-            aggregated_model = self._clustered_aggregation(client_states, client_weights, client_clusters)
+            if filtered_state:  # 确保有共享层参数
+                filtered_states[client_id] = filtered_state
+        
+        # 计算权重
+        if client_performance is None:
+            # 如果没有性能信息，使用均等权重
+            weights = {client_id: 1.0 / len(filtered_states) for client_id in filtered_states}
         else:
-            # 否则使用直接加权平均聚合
-            aggregated_model = self._weighted_average_aggregation(client_states, client_weights)
+            # 自适应权重计算
+            total_weight = 0.0
+            weights = {}
+            
+            for client_id in filtered_states:
+                # 结合本地性能和跨客户端性能
+                local_perf = client_performance.get(client_id, {}).get('local_accuracy', 50.0)
+                cross_perf = client_performance.get(client_id, {}).get('cross_client_accuracy', 50.0)
+                
+                # 平衡权重 - 早期侧重本地性能，后期侧重跨客户端性能
+                alpha = max(0.2, min(0.8, 0.8 - self.round_progress * 0.6))
+                weight = alpha * (local_perf / 100.0) + (1 - alpha) * (cross_perf / 100.0)
+                
+                # 确保权重为正
+                weight = max(0.1, weight)
+                weights[client_id] = weight
+                total_weight += weight
+            
+            # 归一化
+            for client_id in weights:
+                weights[client_id] /= total_weight
+        
+        # 加权平均聚合
+        aggregated_model = self._weighted_average(filtered_states, weights)
         
         # 应用动量
         if self.previous_client_model is not None:
