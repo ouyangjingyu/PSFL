@@ -3,6 +3,29 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
+
+def get_resnet_config(model_type='resnet56'):
+    """根据模型类型获取ResNet配置"""
+    if model_type == 'resnet56':
+        # ResNet-56: 每层9个块，总共27个块
+        num_blocks = [9, 9, 9]  # 三层的块数
+        # 客户端和服务器分配
+        client_blocks = [9, 4]  # 客户端使用第一层全部(9)和第二层部分(4)
+        server_blocks = [5, 9]  # 服务器使用第二层剩余(5)和第三层全部(9)
+    elif model_type == 'resnet110':
+        # ResNet-110: 每层18个块，总共54个块
+        num_blocks = [18, 18, 18]
+        # 客户端和服务器分配
+        client_blocks = [18, 8]  # 客户端使用第一层全部和第二层部分
+        server_blocks = [10, 18]  # 服务器使用第二层剩余和第三层全部
+    else:
+        # 默认使用较小的配置
+        num_blocks = [9, 9, 9]
+        client_blocks = [9, 4]
+        server_blocks = [5, 9]
+    
+    return num_blocks, client_blocks, server_blocks
+
 # 替代BatchNorm的LayerNorm实现 - 适用于CNN
 class LayerNormCNN(nn.Module):
     def __init__(self, num_channels, eps=1e-5):
@@ -118,9 +141,13 @@ class LocalClassifier(nn.Module):
 
 # 修改TierAwareClientModel类
 class TierAwareClientModel(nn.Module):
-    def __init__(self, num_classes=10, tier=1):
+    def __init__(self, num_classes=10, tier=1, model_type='resnet56'):
         super(TierAwareClientModel, self).__init__()
         self.tier = tier
+        self.model_type = model_type
+        
+        # 获取模型配置
+        _, client_blocks, _ = get_resnet_config(model_type)
         
         # 基础层(共享层) - 所有客户端完全一致
         self.shared_base = nn.Sequential(
@@ -129,9 +156,9 @@ class TierAwareClientModel(nn.Module):
             nn.BatchNorm2d(16),
             nn.ReLU(inplace=True),
             # Layer1
-            self._make_layer(BasicBlock, 16, 16, 2),
-            # Layer2前1/3
-            self._make_layer(BasicBlock, 16, 32, 1, stride=2)
+            self._make_layer(BasicBlock, 16, 16, client_blocks[0]),
+            # Layer2前部分
+            self._make_layer(BasicBlock, 16, 32, client_blocks[1], stride=2)
         )
         
         # 共享层输出通道数固定为32
@@ -166,21 +193,25 @@ class TierAwareClientModel(nn.Module):
         return nn.Sequential(*layers)
     
     def _create_personalized_path(self):
-        # 个性化路径 - 根据tier调整
-        if self.tier <= 2:  # 高性能设备
+        """根据tier创建个性化路径"""
+        # 将tier级别统一为4级
+        if self.tier == 1:  # 高性能设备
             # 更深的个性化路径
             self.personalized_path = nn.Sequential(
                 self._make_layer(BasicBlock, 32, 32, 2),
                 self._make_layer(BasicBlock, 32, 64, 2, stride=2)
             )
-        elif self.tier <= 4:  # 中等性能设备
-            # 中等深度个性化路径
+        elif self.tier == 2:  # 中高性能设备
+            self.personalized_path = nn.Sequential(
+                self._make_layer(BasicBlock, 32, 32, 2),
+                self._make_layer(BasicBlock, 32, 64, 1, stride=2)
+            )
+        elif self.tier == 3:  # 中低性能设备
             self.personalized_path = nn.Sequential(
                 self._make_layer(BasicBlock, 32, 32, 1),
                 self._make_layer(BasicBlock, 32, 64, 1, stride=2)
             )
-        else:  # 低性能设备
-            # 浅层个性化路径
+        else:  # tier 4, 低性能设备
             self.personalized_path = nn.Sequential(
                 self._make_layer(BasicBlock, 32, 64, 1, stride=2)
             )
@@ -215,23 +246,28 @@ class TierAwareClientModel(nn.Module):
 
 # 修改EnhancedServerModel类
 class EnhancedServerModel(nn.Module):
-    def __init__(self, feature_dim=128):
+    def __init__(self, model_type='resnet56', feature_dim=128):
         super(EnhancedServerModel, self).__init__()
+        
+        # 获取模型配置
+        _, _, server_blocks = get_resnet_config(model_type)
         
         # 直接继续ResNet结构，从Layer2剩余部分开始
         self.server_layers = nn.Sequential(
             # Layer2剩余部分
-            self._make_layer(BasicBlock, 32, 32, 2),
+            self._make_layer(BasicBlock, 32, 32, server_blocks[0]),
             # Layer3
-            self._make_layer(BasicBlock, 32, 64, 2, stride=2)
+            self._make_layer(BasicBlock, 32, 64, server_blocks[1], stride=2)
         )
         
-        # 特征转换，保持输出维度一致
+        # 优化后的特征转换，保留更多信息
         self.feature_transform = nn.Sequential(
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
             nn.Linear(64, feature_dim),
-            nn.LayerNorm(feature_dim)
+            nn.ReLU(inplace=True),
+            nn.LayerNorm(feature_dim),
+            nn.Dropout(0.1)
         )
         
     def _make_layer(self, block, in_planes, out_planes, blocks, stride=1):

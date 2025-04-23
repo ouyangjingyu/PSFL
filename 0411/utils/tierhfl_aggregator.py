@@ -14,10 +14,28 @@ class StabilizedAggregator:
         self.cluster_weights = None  # 聚类权重
         self.accuracy_history = []  # 准确率历史记录
     
-    # 聚合客户端模型
-    # 修改StabilizedAggregator的aggregate_clients方法
+    # 添加自适应动量方法
+    def adjust_momentum(self, global_acc, prev_global_acc=None):
+        """基于性能动态调整动量因子"""
+        if prev_global_acc is None:
+            return
+            
+        # 性能差异
+        acc_diff = global_acc - prev_global_acc
+        
+        # 性能停滞或下降时减小动量，加快适应新信息
+        if acc_diff < 0.2:
+            self.beta = max(0.1, self.beta * 0.9)
+        # 性能显著提升时增大动量，提高稳定性
+        elif acc_diff > 1.0:
+            self.beta = min(0.7, self.beta * 1.05)
+        # 训练前期使用较小动量促进探索
+        elif hasattr(self, 'round_progress') and self.round_progress < 0.2:
+            self.beta = max(0.3, 0.5 - self.round_progress * 0.5)
+
+    # 修改aggregate_clients方法，实现层级差异化聚合
     def aggregate_clients(self, client_states, client_performance=None, client_clusters=None):
-        """聚合客户端状态，使用自适应权重基于性能"""
+        """聚合客户端状态，使用自适应权重和层级差异化聚合"""
         # 没有客户端状态时直接返回空字典
         if not client_states:
             return {}
@@ -29,11 +47,11 @@ class StabilizedAggregator:
             for k, v in state.items():
                 if 'shared_base' in k:
                     filtered_state[k] = v
-            
+                
             if filtered_state:  # 确保有共享层参数
                 filtered_states[client_id] = filtered_state
         
-        # 计算权重
+        # 计算权重 - 根据性能
         if client_performance is None:
             # 如果没有性能信息，使用均等权重
             weights = {client_id: 1.0 / len(filtered_states) for client_id in filtered_states}
@@ -46,10 +64,20 @@ class StabilizedAggregator:
                 # 结合本地性能和跨客户端性能
                 local_perf = client_performance.get(client_id, {}).get('local_accuracy', 50.0)
                 cross_perf = client_performance.get(client_id, {}).get('cross_client_accuracy', 50.0)
+                global_perf = client_performance.get(client_id, {}).get('global_accuracy', 50.0)
                 
-                # 平衡权重 - 早期侧重本地性能，后期侧重跨客户端性能
-                alpha = max(0.2, min(0.8, 0.8 - self.round_progress * 0.6))
-                weight = alpha * (local_perf / 100.0) + (1 - alpha) * (cross_perf / 100.0)
+                # 综合考虑三种性能，训练进展中增加跨客户端和全局权重
+                if hasattr(self, 'round_progress'):
+                    progress = self.round_progress
+                    local_weight = max(0.2, 0.6 - progress * 0.4)
+                    cross_weight = min(0.5, 0.2 + progress * 0.3)
+                    global_weight = min(0.3, 0.2 + progress * 0.1)
+                else:
+                    local_weight, cross_weight, global_weight = 0.5, 0.3, 0.2
+                    
+                weight = (local_weight * (local_perf / 100.0) + 
+                        cross_weight * (cross_perf / 100.0) + 
+                        global_weight * (global_perf / 100.0))
                 
                 # 确保权重为正
                 weight = max(0.1, weight)
@@ -60,19 +88,48 @@ class StabilizedAggregator:
             for client_id in weights:
                 weights[client_id] /= total_weight
         
-        # 加权平均聚合
-        aggregated_model = self._weighted_average(filtered_states, weights)
+        # 层级差异化聚合
+        aggregated_model = {}
         
-        # 应用动量
-        if self.previous_client_model is not None:
-            stabilized_model = {}
-            for k in aggregated_model:
-                if k in self.previous_client_model:
-                    stabilized_model[k] = self.beta * self.previous_client_model[k] + (1 - self.beta) * aggregated_model[k]
-                else:
-                    stabilized_model[k] = aggregated_model[k]
+        for key in next(iter(filtered_states.values())).keys():
+            # 确定层的类型和位置
+            is_early_layer = 'layer1' in key or 'conv1' in key
+            is_bn_layer = 'bn' in key or 'norm' in key
             
-            aggregated_model = stabilized_model
+            # 适应层级的动量因子
+            layer_beta = self.beta
+            
+            # 早期层使用较大动量保持稳定性
+            if is_early_layer:
+                layer_beta = min(0.7, self.beta + 0.1)
+            
+            # BN层使用较小动量更好适应分布变化
+            if is_bn_layer:
+                layer_beta = max(0.2, self.beta - 0.2)
+            
+            # 计算加权和
+            weighted_sum = None
+            total_weight = 0.0
+            
+            for client_id, state in filtered_states.items():
+                if key in state:
+                    weight = weights.get(client_id, 0.0)
+                    total_weight += weight
+                    
+                    # 累加
+                    if weighted_sum is None:
+                        weighted_sum = weight * state[key].clone().to(self.device)
+                    else:
+                        weighted_sum += weight * state[key].clone().to(self.device)
+            
+            # 应用动量
+            if weighted_sum is not None and total_weight > 0:
+                weighted_avg = weighted_sum / total_weight
+                
+                if self.previous_client_model is not None and key in self.previous_client_model:
+                    aggregated_model[key] = layer_beta * self.previous_client_model[key] + (1 - layer_beta) * weighted_avg
+                else:
+                    aggregated_model[key] = weighted_avg
         
         # 保存当前模型作为下一轮的历史
         self.previous_client_model = copy.deepcopy(aggregated_model)
