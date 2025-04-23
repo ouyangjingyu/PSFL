@@ -512,7 +512,7 @@ def main():
         logger.info(f"===== 轮次 {round_idx+1}/{args.rounds} =====")
 
         # 执行并行训练
-        train_results, eval_results, server_models, global_classifier_states, time_stats, training_time = trainer.execute_parallel_training(round_idx=round_idx)
+        train_results, eval_results, server_models, global_classifier_states, shared_states, time_stats, training_time = trainer.execute_parallel_training(round_idx=round_idx)
 
         # 防止空结果
         if not train_results or not eval_results:
@@ -539,6 +539,7 @@ def main():
         
         # 聚合服务器模型
         logger.info("聚合服务器模型和客户端共享层...")
+        logger.info(f"开始聚合客户端共享层，收集到 {len(shared_states)} 个客户端状态")
         aggregation_start_time = time.time()
         
         # 聚合客户端共享层

@@ -420,6 +420,7 @@ class ClusterAwareParallelTrainer:
         eval_results = {}
         server_models = {}
         global_classifier_states = {}  # 全局分类器状态
+        shared_states = {}  # 新增：用于收集共享状态
         time_stats = {}  # 新增时间统计收集
         
         while not results_queue.empty():
@@ -435,6 +436,11 @@ class ClusterAwareParallelTrainer:
             server_models[cluster_id] = result['server_model']
             if 'global_classifier' in result and result['global_classifier']:
                 global_classifier_states[cluster_id] = result['global_classifier']
+
+            # 新增：收集共享层状态
+            if 'shared_states' in result:
+                for client_id, shared_state in result['shared_states'].items():
+                    shared_states[client_id] = shared_state
             
             # 合并训练结果
             for client_id, client_result in result['train_results'].items():
@@ -457,7 +463,7 @@ class ClusterAwareParallelTrainer:
         training_time = time.time() - start_time
         self.logger.info(f"并行训练完成，耗时: {training_time:.2f}秒")
         
-        return train_results, eval_results, server_models, global_classifier_states, time_stats, training_time
+        return train_results, eval_results, server_models, global_classifier_states, shared_states, time_stats, training_time
         
     def _aggregate_classifiers(self, classifier_states, weights):
         """聚合多个全局分类器状态"""
