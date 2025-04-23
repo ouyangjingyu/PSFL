@@ -6,19 +6,17 @@ import copy
 import numpy as np
 from collections import defaultdict
 import logging
-import random
 import torch.nn.functional as F
-import math
 
-# 簇感知并行训练器 - 支持聚类并行训练
-class ClusterAwareParallelTrainer:
-    def __init__(self, client_manager, server_model, global_classifier=None, device="cuda", max_workers=None, loss_fn=None):
-        """初始化训练器"""
+class TierHFLTrainer:
+    """TierHFL并行训练框架"""
+    def __init__(self, client_manager, central_server, grouping_strategy, 
+                 loss_fn, gradient_guide, max_workers=None):
         self.client_manager = client_manager
-        self.server_model = server_model
-        self.global_classifier = global_classifier
-        self.default_device = device
-        self.loss_fn = loss_fn  # 保存损失函数
+        self.central_server = central_server
+        self.grouping_strategy = grouping_strategy
+        self.loss_fn = loss_fn
+        self.gradient_guide = gradient_guide
         
         # 设置最大并行工作线程数
         if max_workers is None:
@@ -28,148 +26,284 @@ class ClusterAwareParallelTrainer:
                 import multiprocessing
                 max_workers = max(1, multiprocessing.cpu_count() // 2)
         
-        self.max_workers = max(1, max_workers)  # 至少1个工作线程
+        self.max_workers = max(1, max_workers)
         
         # 初始化日志
-        self.logger = logging.getLogger("ClusterAwareParallelTrainer")
+        self.logger = logging.getLogger("TierHFLTrainer")
         self.logger.setLevel(logging.INFO)
         
-        # 客户端模型字典
-        self.client_models = {}
+        # 训练统计
+        self.stats = defaultdict(list)
+    
+    # 添加计算平衡权重的方法
+    def calculate_balanced_weights(self, client_performances, client_distributions, alpha=0.7):
+        """计算平衡性能和多样性的权重
         
-        # 聚类和设备映射
-        self.cluster_map = {}
-        self.device_map = {}
-    
-    def register_client_model(self, client_id, model):
-        """注册客户端模型"""
-        self.client_models[client_id] = model
-    
-    def register_client_models(self, client_models_dict):
-        """批量注册客户端模型"""
-        self.client_models.update(client_models_dict)
-    
-    def setup_training(self, cluster_map, device_map=None):
-        """设置训练环境"""
-        self.cluster_map = cluster_map
-        
-        # 如果没有设备映射，创建一个简单的映射
-        if device_map is None:
-            device_map = {}
+        Args:
+            client_performances: 客户端性能字典 {client_id: 性能值}
+            client_distributions: 客户端数据分布字典 {client_id: 分布信息}
+            alpha: 平衡因子，控制性能和多样性的权重
             
-            # 检查可用的GPU数量
-            if torch.cuda.is_available():
-                gpu_count = torch.cuda.device_count()
-                for i, cluster_id in enumerate(cluster_map.keys()):
-                    # 循环分配GPU
-                    if gpu_count > 0:
-                        device_map[cluster_id] = f"cuda:{i % gpu_count}"
-                    else:
-                        device_map[cluster_id] = "cpu"
-            else:
-                # 如果没有GPU，所有聚类都用CPU
-                for cluster_id in cluster_map.keys():
-                    device_map[cluster_id] = "cpu"
+        Returns:
+            权重字典 {client_id: 权重值}
+        """
+        # 性能权重计算
+        performance_weights = {}
+        if client_performances:
+            min_perf = min(client_performances.values())
+            max_perf = max(client_performances.values())
+            perf_range = max(0.1, max_perf - min_perf)
+            
+            for client_id, perf in client_performances.items():
+                performance_weights[client_id] = 0.2 + 0.8 * (perf - min_perf) / perf_range
+        else:
+            # 如果没有性能数据，使用平均权重
+            for client_id in client_distributions.keys():
+                performance_weights[client_id] = 1.0
         
-        self.device_map = device_map
-        self.logger.info(f"训练设置完成，聚类数量: {len(cluster_map)}")
-        for cluster_id, clients in cluster_map.items():
-            self.logger.info(f"聚类 {cluster_id}: {len(clients)} 个客户端，设备: {device_map.get(cluster_id, 'default')}")
+        # 多样性权重计算 - 给予低代表性数据分布更高权重
+        diversity_weights = {}
+        distribution_counts = {}
+        
+        # 统计各类分布出现次数
+        for client_id, dist in client_distributions.items():
+            # 将分布转换为可哈希形式
+            dist_key = tuple(sorted([(k, v) for k, v in dist.items()]))
+            distribution_counts[dist_key] = distribution_counts.get(dist_key, 0) + 1
+        
+        # 计算多样性权重 - 稀有分布获得更高权重
+        for client_id, dist in client_distributions.items():
+            dist_key = tuple(sorted([(k, v) for k, v in dist.items()]))
+            count = distribution_counts[dist_key]
+            diversity_weights[client_id] = 1.0 / count
+        
+        # 归一化多样性权重
+        total_div = sum(diversity_weights.values())
+        if total_div > 0:
+            diversity_weights = {k: v/total_div for k, v in diversity_weights.items()}
+        else:
+            diversity_weights = {k: 1.0/len(diversity_weights) for k in diversity_weights.keys()}
+        
+        # 综合权重 - alpha控制性能和多样性的平衡
+        final_weights = {}
+        for client_id in client_distributions.keys():
+            final_weights[client_id] = alpha * performance_weights.get(client_id, 1.0) + \
+                                     (1-alpha) * diversity_weights.get(client_id, 1.0)
+        
+        # 归一化最终权重
+        total = sum(final_weights.values())
+        if total > 0:
+            return {k: v/total for k, v in final_weights.items()}
+        else:
+            return {k: 1.0/len(final_weights) for k in final_weights.keys()}
     
-    def _train_cluster(self, cluster_id, client_ids, round_idx, results_queue):
-        """训练单个聚类的工作函数 - 支持双阶段训练"""
+    # 修改执行并行训练的方法
+    def execute_parallel_training(self, client_models, round_idx):
+        """优化的并行训练方法
+        
+        Args:
+            client_models: 客户端模型字典
+            round_idx: 当前轮次
+            
+        Returns:
+            训练结果
+        """
+        start_time = time.time()
+        
+        # 获取可用GPU数量
+        num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        self.logger.info(f"使用 {num_gpus} 个GPU进行训练")
+        
+        # 客户端分组
+        client_groups = self.grouping_strategy.group_clients(
+            self.client_manager, client_models, round_idx)
+        
+        # 重置中央服务器中的所有客户端分组
+        for group_id in range(len(self.central_server.server_groups)):
+            self.central_server.server_groups[group_id].client_ids = []
+        
+        # 记录分组之前所有客户端的组映射
+        old_client_groups = {cid: self.central_server.client_to_group.get(cid) 
+                            for cid in client_models.keys()}
+        
+        # 清空所有现有映射
+        self.central_server.client_to_group = {}
+        
+        # 更新中央服务器中的客户端分组
+        for group_id, client_ids in client_groups.items():
+            for client_id in client_ids:
+                self.central_server.assign_client_to_group(client_id, group_id)
+        
+        # 打印分组信息
+        self.logger.info(f"轮次 {round_idx} 客户端分组:")
+        for group_id, client_ids in client_groups.items():
+            self.logger.info(f"组 {group_id}: {client_ids}")
+        
+        # 验证每个客户端都被正确分配
+        for client_id in client_models.keys():
+            group = self.central_server.get_client_group(client_id)
+            if group is None:
+                self.logger.warning(f"客户端 {client_id} 未正确分配到服务器组，正在修复...")
+                # 使用旧分组或默认分配到第一个组
+                old_group_id = old_client_groups.get(client_id, 0)
+                self.central_server.assign_client_to_group(client_id, old_group_id)
+        
+        # 分配GPU给每个组
+        group_to_gpu = {}
+        for i, group_id in enumerate(self.central_server.server_groups.keys()):
+            group_to_gpu[group_id] = i % num_gpus
+            self.logger.info(f"组 {group_id} 分配到GPU {group_to_gpu[group_id]}")
+        
+        total_rounds = getattr(self, 'rounds', 100)
+        all_results = {}
+        
+        # 每个组创建单独的线程处理
+        threads = []
+        results_queues = {group_id: queue.Queue() for group_id in client_groups.keys()}
+        
+        for group_id, client_ids in client_groups.items():
+            thread = threading.Thread(
+                target=self._train_group,
+                args=(group_id, client_ids, client_models, round_idx, total_rounds, 
+                     group_to_gpu[group_id], results_queues[group_id])
+            )
+            threads.append(thread)
+        
+        # 启动所有线程
+        for thread in threads:
+            thread.start()
+        
+        # 等待所有线程完成
+        for thread in threads:
+            thread.join()
+        
+        # 收集所有组的结果
+        for group_id, results_queue in results_queues.items():
+            while not results_queue.empty():
+                result = results_queue.get()
+                all_results.update(result)
+        
+        # 整理最终结果
+        train_results = {}
+        eval_results = {}
+        client_states = {}
+        time_stats = {}
+        
+        for client_id, result in all_results.items():
+            train_results[client_id] = result.get('train_result', {})
+            eval_results[client_id] = result.get('eval_result', {})
+            client_states[client_id] = result.get('client_state', {})
+            time_stats[client_id] = {'training_time': result.get('training_time', 0)}
+        
+        # 更新全局分类器 - 无需聚合，已在训练中更新
+        
+        # 记录完成信息
+        training_time = time.time() - start_time
+        self.logger.info(f"轮次 {round_idx} 并行训练完成，耗时: {training_time:.2f}秒")
+        
+        # 统计训练结果
+        if train_results and eval_results:
+            self.log_training_statistics(train_results, eval_results)
+        
+        # 计算平均准确率
+        avg_local_acc = np.mean([r.get('local_accuracy', 0) for r in eval_results.values()]) if eval_results else 0
+        avg_global_acc = np.mean([r.get('global_accuracy', 0) for r in eval_results.values()]) if eval_results else 0
+        
+        # 更新统计信息
+        self.stats['training_time'].append(training_time)
+        self.stats['avg_local_acc'].append(avg_local_acc)
+        self.stats['avg_global_acc'].append(avg_global_acc)
+        
+        # 返回结果
+        return {
+            'train_results': train_results,
+            'eval_results': eval_results,
+            'client_states': client_states,
+            'server_states': {gid: group.server_model.state_dict() 
+                            for gid, group in self.central_server.server_groups.items()},
+            'classifier_states': {gid: group.global_classifier.state_dict() 
+                                for gid, group in self.central_server.server_groups.items()},
+            'time_stats': time_stats,
+            'training_time': training_time,
+            'avg_local_acc': avg_local_acc,
+            'avg_global_acc': avg_global_acc
+        }
+    
+    # 添加组训练方法
+    def _train_group(self, group_id, client_ids, client_models, round_idx, total_rounds, gpu_id, results_queue):
+        """训练一个组的客户端 - 优化版，分离两个阶段，串行处理"""
         try:
-            # 获取当前聚类的设备
-            device = self.device_map.get(cluster_id, self.default_device)
-            self.logger.info(f"聚类 {cluster_id} 开始训练，设备: {device}")
+            # 设置设备
+            device = torch.device(f'cuda:{gpu_id}' if torch.cuda.is_available() else 'cpu')
             
-            # 计时
-            model_load_start = time.time()
+            # 获取服务器组
+            server_group = self.central_server.get_server_group(group_id)
+            if not server_group:
+                self.logger.error(f"找不到组 {group_id} 的服务器组")
+                return
             
-            # 将服务器模型和全局分类器移到正确设备
-            server_model = copy.deepcopy(self.server_model).to(device)
-            global_classifier = copy.deepcopy(self.global_classifier).to(device) if self.global_classifier else None
-            
-            # 创建损失函数
-            loss_fn = None
-            if hasattr(self, 'loss_fn'):
-                loss_fn = copy.deepcopy(self.loss_fn).to(device)
-            
-            model_load_time = time.time() - model_load_start
-            
-            # 记录结果
-            cluster_results = {}
-            phase1_results = {}
-            phase2_results = {}
-            shared_states = {}
-            cluster_eval_results = {}
-            cluster_time_stats = {}
-            
-            total_rounds = getattr(self, 'rounds', 100)
+            # 将服务器模型和全局分类器移动到正确的设备
+            server_model = server_group.server_model.to(device)
+            global_classifier = server_group.global_classifier.to(device)
             
             # 阶段一: 每个客户端独立训练个性化路径
+            phase1_results = {}
             for client_id in client_ids:
                 client = self.client_manager.get_client(client_id)
-                if client is None or client_id not in self.client_models:
-                    self.logger.warning(f"客户端 {client_id} 不存在或没有模型，跳过")
+                if not client:
                     continue
                 
                 # 将客户端模型移到正确的设备
-                client_model = copy.deepcopy(self.client_models[client_id]).to(device)
+                client_model = client_models[client_id].to(device)
                 
                 # 临时设置客户端设备
                 original_device = client.device
                 client.device = device
                 client.model = client_model
                 
-                # 执行阶段一训练
-                try:
+                # 执行阶段一训练 - 共执行client_epoch轮
+                for i in range(client.local_epochs):
                     phase1_result = client.train_phase1(round_idx, total_rounds)
                     phase1_results[client_id] = phase1_result
-                except Exception as e:
-                    self.logger.error(f"客户端 {client_id} 阶段一训练失败: {str(e)}")
-                    import traceback
-                    self.logger.error(traceback.format_exc())
-                    
+                
                 # 恢复客户端设备
                 client.device = original_device
-                
-                # 更新本地模型
-                self.client_models[client_id] = client_model.cpu()
                 
                 # 释放内存
                 torch.cuda.empty_cache()
             
-            # 阶段二: 执行共享层和服务器训练
+            # 创建服务器优化器
+            server_optimizer = torch.optim.Adam(server_model.parameters(), lr=0.0005)
+            classifier_optimizer = torch.optim.Adam(global_classifier.parameters(), lr=0.001)
+            
+            # 阶段二: 串行处理每个客户端，进行拆分学习
+            phase2_results = {}
+            shared_states = {}
+            
             for client_id in client_ids:
                 client = self.client_manager.get_client(client_id)
-                if client is None or client_id not in self.client_models:
+                if not client:
                     continue
                 
                 # 将客户端模型移到正确的设备
-                client_model = copy.deepcopy(self.client_models[client_id]).to(device)
+                client_model = client_models[client_id].to(device)
                 
                 # 临时设置客户端设备
                 original_device = client.device
                 client.device = device
                 client.model = client_model
                 
-                # 执行阶段二训练
+                # 执行阶段二训练 - 一次拆分学习
                 try:
                     phase2_result, shared_state = client.train_phase2(
-                        server_model, global_classifier, loss_fn, round_idx, total_rounds)
+                        server_model, global_classifier, round_idx, total_rounds)
                     phase2_results[client_id] = phase2_result
                     shared_states[client_id] = shared_state
                 except Exception as e:
-                    self.logger.error(f"客户端 {client_id} 阶段二训练失败: {str(e)}")
-                    import traceback
-                    self.logger.error(traceback.format_exc())
-                    
+                    self.logger.error(f"客户端 {client_id} 阶段二训练错误: {str(e)}")
+                
                 # 恢复客户端设备
                 client.device = original_device
-                
-                # 更新本地模型
-                self.client_models[client_id] = client_model.cpu()
                 
                 # 释放内存
                 torch.cuda.empty_cache()
@@ -178,11 +312,11 @@ class ClusterAwareParallelTrainer:
             eval_results = {}
             for client_id in client_ids:
                 client = self.client_manager.get_client(client_id)
-                if client is None or client_id not in self.client_models:
+                if not client:
                     continue
                 
                 # 将客户端模型移到正确的设备
-                client_model = copy.deepcopy(self.client_models[client_id]).to(device)
+                client_model = client_models[client_id].to(device)
                 
                 # 临时设置客户端设备
                 original_device = client.device
@@ -191,655 +325,261 @@ class ClusterAwareParallelTrainer:
                 
                 # 执行评估
                 try:
-                    # 标准评估
-                    eval_result = client.evaluate(client_model, server_model, global_classifier)  # 添加global_classifier参数
-                    eval_results[client_id] = eval_result
-                    
-                    # 添加跨客户端评估
-                    if hasattr(self, '_evaluate_cross_client'):
-                        cross_result = self._evaluate_cross_client(
-                            client_id, client_model, server_model, global_classifier)
-                        
-                        if cross_result:
-                            eval_result['cross_client_accuracy'] = cross_result.get('accuracy', 0)
-                            eval_result['cross_client_loss'] = cross_result.get('loss', 0)
-                    
+                    eval_result = client.evaluate(server_model, global_classifier)
                     eval_results[client_id] = eval_result
                 except Exception as e:
-                    self.logger.error(f"客户端 {client_id} 评估失败: {str(e)}")
-                    
+                    self.logger.error(f"客户端 {client_id} 评估错误: {str(e)}")
+                
                 # 恢复客户端设备
                 client.device = original_device
                 
                 # 释放内存
                 torch.cuda.empty_cache()
             
-            # 合并结果
+            # 计算权重 - 基于评估性能和数据分布
+            client_performances = {cid: res.get('global_accuracy', 0) 
+                                for cid, res in eval_results.items()}
+            
+            client_distributions = {}
+            for client_id in client_ids:
+                client = self.client_manager.get_client(client_id)
+                if client:
+                    client_distributions[client_id] = client.data_distribution.get('percentage', {})
+            
+            weights = self.calculate_balanced_weights(client_performances, client_distributions)
+            
+            # 聚合共享层 - 严格过滤只聚合真正的共享层参数
+            if shared_states:
+                # 聚合共享层参数
+                aggregated_shared = {}
+                
+                # 严格限制哪些参数应该被聚合
+                shared_layer_prefixes = ['conv1', 'bn1', 'layer1', 'layer2_shared']
+                
+                for client_id, state in shared_states.items():
+                    # 获取客户端权重
+                    client_weight = weights.get(client_id, 1.0 / len(shared_states))
+                    
+                    for name, param in state.items():
+                        # 严格确保只有共享层参数被包含
+                        if any(name.startswith(prefix) for prefix in shared_layer_prefixes):
+                            if name not in aggregated_shared:
+                                # 初始化累计参数
+                                aggregated_shared[name] = {
+                                    'sum': client_weight * param.clone(),
+                                    'weight_sum': client_weight,
+                                    'shape': param.shape
+                                }
+                            else:
+                                # 确保形状匹配
+                                if aggregated_shared[name]['shape'] == param.shape:
+                                    aggregated_shared[name]['sum'] += client_weight * param
+                                    aggregated_shared[name]['weight_sum'] += client_weight
+                
+                # 计算最终加权平均值
+                final_params = {}
+                for name in aggregated_shared:
+                    if aggregated_shared[name]['weight_sum'] > 0:
+                        final_params[name] = aggregated_shared[name]['sum'] / aggregated_shared[name]['weight_sum']
+                
+                # 更新每个客户端的共享层
+                for client_id in client_ids:
+                    if client_id in client_models:
+                        client_model = client_models[client_id]
+                        client_dict = client_model.state_dict()
+                        
+                        for name, param in final_params.items():
+                            if name in client_dict and client_dict[name].shape == param.shape:
+                                client_dict[name].copy_(param)
+            
+            # 将结果加入队列
+            client_results = {}
             for client_id in client_ids:
                 if client_id in phase1_results and client_id in phase2_results and client_id in eval_results:
-                    # 合并阶段一和阶段二结果
+                    # 合并阶段一和阶段二的结果
                     train_result = {
-                        'phase1_loss': phase1_results[client_id].get('loss', 0),
-                        'phase2_loss': phase2_results[client_id].get('loss', 0),
+                        'loss': phase1_results[client_id].get('loss', 0) + phase2_results[client_id].get('loss', 0),
+                        'local_loss': phase1_results[client_id].get('loss', 0),
                         'global_loss': phase2_results[client_id].get('global_loss', 0),
-                        'feature_loss': phase2_results[client_id].get('feature_loss', 0),
-                        'phase1_accuracy': phase1_results[client_id].get('accuracy', 0),
-                        'phase2_accuracy': phase2_results[client_id].get('accuracy', 0),
+                        'accuracy': phase1_results[client_id].get('accuracy', 0),
                         'training_time': phase1_results[client_id].get('training_time', 0) + 
                                     phase2_results[client_id].get('training_time', 0)
                     }
                     
-                    cluster_results[client_id] = train_result
-                    cluster_eval_results[client_id] = eval_results[client_id]
-                    cluster_time_stats[client_id] = {
-                        "training_time": train_result['training_time'],
-                        "total_time": train_result['training_time'] + 0.1  # 加0.1秒作为其他开销
+                    client_results[client_id] = {
+                        'train_result': train_result,
+                        'eval_result': eval_results[client_id],
+                        'client_state': client_models[client_id].state_dict(),
+                        'training_time': train_result['training_time']
                     }
             
             # 将结果添加到队列
-            results_queue.put({
-                'cluster_id': cluster_id,
-                'server_model': server_model.cpu().state_dict(),
-                'global_classifier': global_classifier.cpu().state_dict() if global_classifier else None,
-                'train_results': cluster_results,
-                'eval_results': cluster_eval_results,
-                'shared_states': shared_states,  # 添加共享层状态
-                'time_stats': cluster_time_stats,
-                'model_load_time': model_load_time
-            })
-            
-            self.logger.info(f"聚类 {cluster_id} 训练完成")
+            results_queue.put(client_results)
             
         except Exception as e:
+            self.logger.error(f"组 {group_id} 训练失败: {str(e)}")
             import traceback
-            error_msg = f"聚类 {cluster_id} 训练失败: {str(e)}\n{traceback.format_exc()}"
-            self.logger.error(error_msg)
-            
-            # 报告错误
-            results_queue.put({
-                'cluster_id': cluster_id,
-                'error': error_msg
-            })
+            self.logger.error(traceback.format_exc())
 
-    # 添加跨客户端评估方法
-    def _evaluate_cross_client(self, client_id, client_model, server_model, global_classifier):
-        """评估客户端模型在其他客户端数据上的表现"""
-        # 确保使用同一个设备 - 使用固定设备cuda:0或者默认设备
-        # 获取当前可用的第一个设备，避免设备混合使用
-        if torch.cuda.is_available():
-            device = torch.device('cuda:0')  # 固定使用第一个GPU
-        else:
-            device = torch.device('cpu')
+    # 修改批处理函数中的特征处理
+    def _train_server_with_batches(self, server_model, global_classifier, 
+                                features, labels, server_optimizer, classifier_optimizer,
+                                batch_size=32, accum_steps=4, device=None):
+        """使用批处理和梯度累积训练服务器模型，确保特征维度正确"""
+        # 设置训练模式
+        server_model.train()
+        global_classifier.train()
         
-        # 确保所有模型都在同一设备上
-        client_model = client_model.to(device)
-        server_model = server_model.to(device)
-        global_classifier = global_classifier.to(device)
+        # 检查特征维度
+        expected_dim = global_classifier.feature_dim
         
-        # 设置为评估模式
-        client_model.eval()
-        server_model.eval()
-        global_classifier.eval()
+        # 计算批次数
+        num_samples = features.size(0)
+        num_batches = (num_samples + batch_size - 1) // batch_size
         
-        all_results = []
+        # 初始化统计
+        total_loss = 0.0
+        total_correct = 0
         
-        # 获取当前客户端
-        current_client = self.client_manager.get_client(client_id)
-        if current_client is None:
-            return None
+        # 清除梯度
+        server_optimizer.zero_grad()
+        classifier_optimizer.zero_grad()
         
-        # 获取其他客户端(最多取3个)
-        other_clients = []
-        for other_id, client in self.client_manager.clients.items():
-            if other_id != client_id:
-                other_clients.append(client)
-                if len(other_clients) >= 3:
-                    break
-        
-        if not other_clients:
-            return None
-        
-        # 评估每个其他客户端的数据
-        for other_client in other_clients:
-            test_data = other_client.test_data
+        # 批处理循环
+        for i in range(num_batches):
+            # 确定批次范围
+            start_idx = i * batch_size
+            end_idx = min(start_idx + batch_size, num_samples)
+            batch_size_actual = end_idx - start_idx
             
-            # 准备统计
-            correct = 0
-            total = 0
-            loss_sum = 0.0
-            batch_count = 0
+            # 获取当前批次
+            batch_features = features[start_idx:end_idx]
+            batch_labels = labels[start_idx:end_idx]
             
-            with torch.no_grad():
-                for data, target in test_data:
-                    # 确保数据在正确的设备上
-                    data, target = data.to(device), target.to(device)
-                    
-                    # 前向传播
-                    try:
-                        # 使用新的模型接口，处理三个返回值
-                        local_logits, shared_features, _ = client_model(data)
-                        
-                        # 确保特征在正确设备上
-                        shared_features = shared_features.to(device)
-                        
-                        # 服务器处理
-                        server_features = server_model(shared_features)
-                        
-                        # 确保特征在正确设备上
-                        server_features = server_features.to(device)
-                        
-                        # 全局分类
-                        global_logits = global_classifier(server_features)
-                        
-                        # 计算损失
-                        loss = F.cross_entropy(global_logits, target)
-                        loss_sum += loss.item()
-                        batch_count += 1
-                        
-                        # 计算准确率
-                        _, predicted = global_logits.max(1)
-                        total += target.size(0)
-                        correct += predicted.eq(target).sum().item()
-                    except Exception as e:
-                        self.logger.error(f"跨客户端评估错误: {str(e)}")
-                        # 打印更多调试信息
-                        if torch.cuda.is_available():
-                            self.logger.error(f"当前设备: {device}, 模型设备: client={next(client_model.parameters()).device}, server={next(server_model.parameters()).device}, classifier={next(global_classifier.parameters()).device}")
-                        continue
-                    
-                    # 限制评估批次数量，节省时间
-                    if batch_count >= 5:
-                        break
+            # 确保数据在正确的设备上
+            if device is not None:
+                batch_features = batch_features.to(device)
+                batch_labels = batch_labels.to(device)
             
-            # 计算该客户端数据的结果
-            if total > 0:
-                accuracy = 100.0 * correct / total
-                avg_loss = loss_sum / max(1, batch_count)
-                
-                all_results.append({
-                    'other_client_id': other_client.client_id,
-                    'accuracy': accuracy,
-                    'loss': avg_loss
-                })
-        
-        # 计算平均结果
-        if all_results:
-            avg_accuracy = sum(r['accuracy'] for r in all_results) / len(all_results)
-            avg_loss = sum(r['loss'] for r in all_results) / len(all_results)
-            
-            return {
-                'accuracy': avg_accuracy,
-                'loss': avg_loss,
-                'details': all_results
-            }
-        
-        return None
-    
-    def execute_parallel_training(self, round_idx=0):
-        """执行并行训练"""
-        start_time = time.time()
-        
-        # 没有聚类映射时返回空结果
-        if not self.cluster_map:
-            self.logger.warning("没有设置聚类映射，无法执行训练")
-            return {}, {}, {}, {}, {}, 0
-        
-        # 创建结果队列
-        results_queue = queue.Queue()
-        
-        # 创建线程
-        threads = []
-        for cluster_id, client_ids in self.cluster_map.items():
-            thread = threading.Thread(
-                target=self._train_cluster,
-                args=(cluster_id, client_ids, round_idx, results_queue)
-            )
-            threads.append(thread)
-        
-        # 控制并行度
-        active_threads = []
-        
-        for thread in threads:
-            # 等待有可用线程槽
-            while len(active_threads) >= self.max_workers:
-                # 检查已完成的线程
-                active_threads = [t for t in active_threads if t.is_alive()]
-                if len(active_threads) >= self.max_workers:
-                    time.sleep(0.1)
-            
-            # 启动新线程
-            thread.start()
-            active_threads.append(thread)
-        
-        # 等待所有线程完成
-        for thread in threads:
-            thread.join()
-        
-        # 收集结果
-        train_results = {}
-        eval_results = {}
-        server_models = {}
-        global_classifier_states = {}  # 全局分类器状态
-        shared_states = {}  # 新增：用于收集共享状态
-        time_stats = {}  # 新增时间统计收集
-        
-        while not results_queue.empty():
-            result = results_queue.get()
-            
-            # 检查是否有错误
-            if 'error' in result:
-                self.logger.error(f"聚类 {result['cluster_id']} 返回错误: {result['error']}")
-                continue
-            
-            # 保存结果
-            cluster_id = result['cluster_id']
-            server_models[cluster_id] = result['server_model']
-            if 'global_classifier' in result and result['global_classifier']:
-                global_classifier_states[cluster_id] = result['global_classifier']
-
-            # 新增：收集共享层状态
-            if 'shared_states' in result:
-                for client_id, shared_state in result['shared_states'].items():
-                    shared_states[client_id] = shared_state
-            
-            # 合并训练结果
-            for client_id, client_result in result['train_results'].items():
-                train_results[client_id] = client_result
-            
-            # 合并评估结果
-            for client_id, eval_result in result['eval_results'].items():
-                eval_results[client_id] = eval_result
-                
-            # 合并时间统计
-            if 'time_stats' in result:
-                for client_id, client_time in result['time_stats'].items():
-                    time_stats[client_id] = client_time
-                
-                # 添加模型加载时间
-                if 'model_load_time' in result:
-                    for client_id in result['time_stats'].keys():
-                        time_stats[client_id]['model_load_time'] = result['model_load_time']
-        
-        training_time = time.time() - start_time
-        self.logger.info(f"并行训练完成，耗时: {training_time:.2f}秒")
-        
-        return train_results, eval_results, server_models, global_classifier_states, shared_states, time_stats, training_time
-        
-    def _aggregate_classifiers(self, classifier_states, weights):
-        """聚合多个全局分类器状态"""
-        if not classifier_states:
-            return {}
-        
-        # 获取第一个状态的键
-        keys = next(iter(classifier_states.values())).keys()
-        
-        # 初始化结果
-        result = {}
-        
-        # 对每个参数进行加权平均
-        for key in keys:
-            # 初始化累加器
-            weighted_sum = None
-            total_weight = 0.0
-            
-            # 加权累加
-            for cluster_id, state in classifier_states.items():
-                if key in state:
-                    weight = weights.get(cluster_id, 0.0)
-                    total_weight += weight
-                    
-                    # 累加
-                    if weighted_sum is None:
-                        weighted_sum = weight * state[key].clone().to(self.default_device)
-                    else:
-                        weighted_sum += weight * state[key].clone().to(self.default_device)
-            
-            # 计算平均值
-            if weighted_sum is not None and total_weight > 0:
-                result[key] = weighted_sum / total_weight
-        
-        return result
-
-    def diagnose_client6_features(self, round_idx=0):
-        """针对客户端6提取并保存中间特征，用于问题诊断"""
-        # 只有在客户端6存在于集群中时才进行诊断
-        client6_exists = False
-        for cluster_id, clients in self.cluster_map.items():
-            if 6 in clients:
-                client6_exists = True
-                client6_cluster = cluster_id
-                break
-        
-        if not client6_exists:
-            self.logger.warning("客户端6不存在，无法诊断")
-            return
-        
-        self.logger.info(f"开始诊断客户端6 (聚类 {client6_cluster})...")
-        
-        # 获取客户端6和其模型
-        client6 = self.client_manager.get_client(6)
-        if client6 is None or 6 not in self.client_models:
-            self.logger.warning("无法获取客户端6或其模型")
-            return
-            
-        client6_model = copy.deepcopy(self.client_models[6]).to(self.default_device)
-        server_model = copy.deepcopy(self.server_model).to(self.default_device)
-        global_classifier = copy.deepcopy(self.global_classifier).to(self.default_device)
-        
-        # 设置为评估模式
-        client6_model.eval()
-        server_model.eval()
-        global_classifier.eval()
-        
-        # 创建一个特征提取函数
-        def extract_features(data_loader, n_batches=5):
-            features_dict = {
-                'client_inputs': [],
-                'client_features': [],
-                'server_features': [],
-                'global_logits': [],
-                'targets': []
-            }
-            
-            with torch.no_grad():
-                for i, (inputs, targets) in enumerate(data_loader):
-                    if i >= n_batches:
-                        break
-                        
-                    inputs = inputs.to(self.default_device)
-                    targets = targets.to(self.default_device)
-                    
-                    # 客户端前向传播
-                    local_logits, client_features = client6_model(inputs)
-                    
-                    # 服务器前向传播
-                    try:
-                        server_features = server_model(client_features, tier=client6.tier)
-                        global_logits = global_classifier(server_features)
-                    except Exception as e:
-                        self.logger.error(f"特征提取错误: {str(e)}")
-                        continue
-                    
-                    # 保存特征
-                    features_dict['client_inputs'].append(inputs.cpu().numpy())
-                    features_dict['client_features'].append(client_features.cpu().numpy())
-                    features_dict['server_features'].append(server_features.cpu().numpy())
-                    features_dict['global_logits'].append(global_logits.cpu().numpy())
-                    features_dict['targets'].append(targets.cpu().numpy())
-            
-            # 合并批次数据
-            for k in features_dict:
-                if features_dict[k]:
-                    features_dict[k] = np.concatenate(features_dict[k], axis=0)
-            
-            return features_dict
-        
-        # 提取训练和测试集特征
-        try:
-            import numpy as np
-            
-            self.logger.info("提取客户端6测试集特征...")
-            test_features = extract_features(client6.test_data)
-            
-            # 保存诊断信息
-            import os
-            os.makedirs('diagnostics', exist_ok=True)
-            
-            # 保存特征到numpy文件
-            np.savez_compressed(
-                f'diagnostics/client6_features_round{round_idx}.npz',
-                **test_features
-            )
-            
-            self.logger.info(f"客户端6特征已保存到 diagnostics/client6_features_round{round_idx}.npz")
-            
-            # 打印一些统计信息
-            if len(test_features['global_logits']) > 0:
-                preds = np.argmax(test_features['global_logits'], axis=1)
-                unique_preds = np.unique(preds)
-                
-                self.logger.info(f"全局分类器预测统计:")
-                self.logger.info(f"- 样本数量: {len(preds)}")
-                self.logger.info(f"- 不同类别数量: {len(unique_preds)}")
-                self.logger.info(f"- 预测的类别: {unique_preds}")
-                
-                if len(unique_preds) == 1:
-                    self.logger.warning(f"警告: 全局分类器对所有样本预测相同类别 ({unique_preds[0]})")
-                    
-                    # 分析服务器特征
-                    server_feat = test_features['server_features']
-                    self.logger.info(f"服务器特征统计:")
-                    self.logger.info(f"- 均值: {np.mean(server_feat):.4f}")
-                    self.logger.info(f"- 标准差: {np.std(server_feat):.4f}")
-                    self.logger.info(f"- 最小值: {np.min(server_feat):.4f}")
-                    self.logger.info(f"- 最大值: {np.max(server_feat):.4f}")
-                    self.logger.info(f"- 零值比例: {np.mean(np.abs(server_feat) < 1e-5)*100:.2f}%")
-        except Exception as e:
-            self.logger.error(f"诊断过程出错: {str(e)}")
-            import traceback
-            traceback.print_exc()
-
-# 自适应训练控制器 - 动态调整训练参数
-class AdaptiveTrainingController:
-    def __init__(self, initial_alpha=0.5, initial_lambda=0.1):
-        """初始化控制器"""
-        self.alpha = initial_alpha  # 个性化与全局平衡因子
-        self.lambda_feature = initial_lambda  # 特征对齐损失权重
-        
-        # 历史性能记录
-        self.history = {
-            'local_accuracy': [],
-            'global_accuracy': [],
-            'global_imbalance': []
-        }
-    
-    def update_history(self, eval_results):
-        """更新历史记录"""
-        if not eval_results:
-            return
-            
-        local_accs = []
-        global_accs = []
-        imbalances = []
-        
-        for result in eval_results.values():
-            if 'local_accuracy' in result:
-                local_accs.append(result['local_accuracy'])
-            if 'global_accuracy' in result:
-                global_accs.append(result['global_accuracy'])
-            if 'global_imbalance' in result:
-                imbalances.append(result['global_imbalance'])
-        
-        # 计算平均值
-        if local_accs:
-            self.history['local_accuracy'].append(sum(local_accs) / len(local_accs))
-        if global_accs:
-            self.history['global_accuracy'].append(sum(global_accs) / len(global_accs))
-        if imbalances:
-            # 过滤掉infinity
-            valid_imbalances = [i for i in imbalances if i != float('inf')]
-            if valid_imbalances:
-                self.history['global_imbalance'].append(sum(valid_imbalances) / len(valid_imbalances))
-    
-    def adjust_parameters(self):
-        """调整训练参数，更加动态的策略"""
-        if len(self.history['local_accuracy']) < 3:
-            return {'alpha': self.alpha, 'lambda_feature': self.lambda_feature}
-        
-        # 获取最近几轮的性能指标
-        window_size = min(5, len(self.history['local_accuracy']))
-        recent_local_acc = self.history['local_accuracy'][-window_size:]
-        recent_global_acc = self.history['global_accuracy'][-window_size:]
-        
-        # 计算趋势
-        local_trend = recent_local_acc[-1] - recent_local_acc[-3]
-        global_trend = recent_global_acc[-1] - recent_global_acc[-3]
-        
-        # 当前性能
-        current_local_acc = recent_local_acc[-1]
-        current_global_acc = recent_global_acc[-1]
-        
-        # 计算不平衡度趋势
-        if len(self.history['global_imbalance']) >= 3:
-            recent_imbalance = self.history['global_imbalance'][-3:]
-            imbalance_trend = recent_imbalance[-1] - recent_imbalance[0]
-        else:
-            imbalance_trend = 0
-        
-        # 新策略：根据性能差距和趋势调整alpha
-        acc_gap = current_local_acc - current_global_acc
-        
-        # # 调整alpha - 个性化与全局平衡
-        # if acc_gap > 5.0:
-        #     # 本地模型明显更好，增加个性化权重
-        #     self.alpha = min(0.9, self.alpha + 0.1)
-        # elif acc_gap < -5.0:
-        #     # 全局模型明显更好，增加全局权重
-        #     self.alpha = max(0.1, self.alpha - 0.1)
-        # elif global_trend < -1.0 and local_trend > 0:
-        #     # 全局性能下降但本地性能上升，适当增加个性化权重
-        #     self.alpha = min(0.6, self.alpha + 0.03)
-        # elif global_trend > 0.5 and local_trend < 0:
-        #     # 全局性能上升但本地性能下降，适当增加全局权重
-        #     self.alpha = max(0.2, self.alpha - 0.05)
-
-        # # 调整lambda_feature - 特征对齐
-        # if imbalance_trend > 0.5 or current_global_acc < 40:
-        #     # 不平衡度增加或全局性能差，更强力增强特征对齐
-        #     self.lambda_feature = min(0.5, self.lambda_feature + 0.1)
-        # elif global_trend < -1.0:
-        #     # 全局性能下降，增强特征对齐
-        #     self.lambda_feature = min(0.5, self.lambda_feature + 0.05)
-        # elif global_trend > 1.0 and imbalance_trend < 0:
-        #     # 全局性能上升且不平衡度下降，适当减弱特征对齐
-        #     self.lambda_feature = max(0.05, self.lambda_feature - 0.03)
-
-        # 调整alpha - 个性化与全局平衡，更加倾向全局性能
-        if global_trend < -1.0 and local_trend > 0:
-            # 全局性能下降但本地性能上升，适度增加个性化权重
-            self.alpha = min(0.6, self.alpha + 0.03)  # 限制最大值并减小增量
-        elif global_trend > 0.5 or (global_trend > 0 and local_trend < 0):
-            # 更积极地降低alpha以促进全局学习
-            self.alpha = max(0.1, self.alpha - 0.05)
-
-        # 增强特征对齐的调整
-        if global_trend < 0 or imbalance_trend > 0.2:
-            # 当全局性能下降或不平衡度增加时，增强特征对齐
-            self.lambda_feature = min(0.8, self.lambda_feature + 0.1)
-        elif global_trend > 2.0 and imbalance_trend < 0:
-            # 全局性能显著上升且不平衡度下降，适当减弱特征对齐
-            self.lambda_feature = max(0.2, self.lambda_feature - 0.05)
-        
-        
-        return {
-            'alpha': self.alpha,
-            'lambda_feature': self.lambda_feature
-        }
-        
-class ModelFeatureClusterer:
-    def __init__(self, num_clusters=3):
-        self.num_clusters = num_clusters
-        self.clustering_history = []
-    
-    # 在ModelFeatureClusterer类中，优化cluster_clients方法，考虑无法获取原始数据的情况
-    def cluster_clients(self, client_models, client_ids, eval_dataset=None, device='cuda'):
-        """基于模型特征的聚类方法，考虑服务器不能获取原始数据的限制"""
-        clusters = {i: [] for i in range(self.num_clusters)}
-        
-        # 提取模型特征 - 使用共享层参数而非原始数据
-        client_features = {}
-        feature_dims = []
-        
-        # 第一步：提取特征
-        for client_id in client_ids:
-            if client_id in client_models:
-                model = client_models[client_id]
-                features = []
-                
-                # 只提取共享层参数作为特征
-                for name, param in model.named_parameters():
-                    if 'shared_base' in name and 'weight' in name:
-                        # 提取统计信息而非原始参数
-                        param_data = param.detach().cpu()
-                        # 只收集标量特征，避免形状不一致
-                        features.extend([
-                            param_data.mean().item(),
-                            param_data.std().item(),
-                            param_data.abs().max().item(),
-                            (param_data > 0).float().mean().item()  # 正值比例
-                        ])
-                
-                if features:
-                    # 确保features是一维数组
-                    features_array = np.array(features, dtype=np.float32)
-                    client_features[client_id] = features_array
-                    feature_dims.append(len(features_array))
-        
-        # 检查所有特征向量的维度是否一致
-        if feature_dims and len(set(feature_dims)) > 1:
-            # 如果维度不一致，找出最常见的维度
-            from collections import Counter
-            dim_counter = Counter(feature_dims)
-            common_dim = dim_counter.most_common(1)[0][0]
-            
-            print(f"发现不同维度的特征向量: {dict(dim_counter)}，使用最常见维度: {common_dim}")
-            
-            # 处理维度不一致的特征向量
-            for client_id in list(client_features.keys()):
-                feat = client_features[client_id]
-                if len(feat) != common_dim:
-                    if len(feat) < common_dim:
-                        # 如果特征太短，使用填充
-                        client_features[client_id] = np.pad(feat, (0, common_dim - len(feat)), 'constant')
-                    else:
-                        # 如果特征太长，进行裁剪
-                        client_features[client_id] = feat[:common_dim]
-        
-        # 尝试K-means聚类
-        if len(client_features) >= self.num_clusters:
             try:
-                from sklearn.cluster import KMeans
-                # 转换为矩阵
-                feature_client_ids = list(client_features.keys())
-                features_matrix = np.vstack([client_features[cid] for cid in feature_client_ids])
+                # 前向传播
+                server_features = server_model(batch_features)
                 
-                # 标准化特征
-                mean = np.mean(features_matrix, axis=0)
-                std = np.std(features_matrix, axis=0) + 1e-8
-                features_matrix = (features_matrix - mean) / std
+                # 确保特征维度正确
+                if server_features.size(-1) != expected_dim:
+                    self.logger.warning(f"特征维度不匹配: 期望 {expected_dim}, 得到 {server_features.size(-1)}")
+                    # 尝试调整维度
+                    if len(server_features.shape) == 2:
+                        server_features = server_features.view(server_features.size(0), -1)
+                        # 如果新维度仍不匹配，使用线性层调整
+                        if server_features.size(-1) != expected_dim:
+                            # 创建临时调整层
+                            adapter = nn.Linear(server_features.size(-1), expected_dim).to(device)
+                            server_features = adapter(server_features)
                 
-                # 执行K-means
-                kmeans = KMeans(n_clusters=self.num_clusters, random_state=42, n_init=10)
-                kmeans.fit(features_matrix)
+                logits = global_classifier(server_features)
                 
-                # 构建聚类映射
-                for i, label in enumerate(kmeans.labels_):
-                    client_id = feature_client_ids[i]
-                    clusters[label].append(client_id)
+                # 计算损失
+                loss = F.cross_entropy(logits, batch_labels)
                 
-                # 处理没有特征的客户端 - 平均分配
-                remaining_clients = [cid for cid in client_ids if cid not in client_features]
-                for i, client_id in enumerate(remaining_clients):
-                    target_cluster = i % self.num_clusters
-                    clusters[target_cluster].append(client_id)
+                # 缩放损失以适应梯度累积
+                loss = loss / accum_steps
+                
+                # 反向传播
+                loss.backward()
+                
+                # 累计统计
+                total_loss += loss.item() * accum_steps
+                _, predicted = logits.max(1)
+                total_correct += predicted.eq(batch_labels).sum().item()
+                
+                # 累积指定步骤后更新参数
+                if (i + 1) % accum_steps == 0 or (i + 1) == num_batches:
+                    # 更新参数
+                    server_optimizer.step()
+                    classifier_optimizer.step()
+                    
+                    # 清除梯度
+                    server_optimizer.zero_grad()
+                    classifier_optimizer.zero_grad()
+                    
+                    # 临时释放内存
+                    torch.cuda.empty_cache()
                     
             except Exception as e:
-                print(f"K-means聚类失败: {str(e)}，使用备选方案")
-                # 备用方案 - 均匀分配
-                for i, client_id in enumerate(client_ids):
-                    cluster_idx = i % self.num_clusters
-                    clusters[cluster_idx].append(client_id)
-        else:
-            # 备用方案：均匀分配
-            for i, client_id in enumerate(client_ids):
-                cluster_idx = i % self.num_clusters
-                clusters[cluster_idx].append(client_id)
+                self.logger.error(f"批处理训练错误: {str(e)}")
+                # 跳过失败的批次
+                continue
         
-        # 记录聚类结果
-        self.clustering_history.append({
-            'timestamp': time.time(),
-            'clusters': copy.deepcopy(clusters),
-            'num_clients': len(client_ids)
-        })
-            
-        return clusters
+        # 计算平均损失和准确率
+        avg_loss = total_loss / num_batches if num_batches > 0 else 0
+        accuracy = 100.0 * total_correct / num_samples if num_samples > 0 else 0
+        
+        return avg_loss, accuracy       
+    def log_training_statistics(self, train_results, eval_results):
+        """记录详细的训练统计信息"""
+        # 计算全局平均值
+        avg_global_loss = np.mean([r.get('global_loss', 0) for r in train_results.values()])
+        avg_local_loss = np.mean([r.get('local_loss', 0) for r in train_results.values()])
+        avg_feature_loss = np.mean([r.get('feature_loss', 0) for r in train_results.values()])
+        avg_local_acc = np.mean([r.get('local_accuracy', 0) for r in eval_results.values()])
+        avg_global_acc = np.mean([r.get('global_accuracy', 0) for r in eval_results.values()])
+        
+        # 按Tier分组统计
+        tier_stats = defaultdict(lambda: defaultdict(list))
+        for client_id, result in eval_results.items():
+            client = self.client_manager.get_client(client_id)
+            if client:
+                tier = client.tier
+                tier_stats[tier]['local_acc'].append(result.get('local_accuracy', 0))
+                tier_stats[tier]['global_acc'].append(result.get('global_accuracy', 0))
+        
+        # 计算每个Tier的平均值
+        tier_avg = {}
+        for tier, stats in tier_stats.items():
+            tier_avg[tier] = {
+                'local_acc': np.mean(stats['local_acc']),
+                'global_acc': np.mean(stats['global_acc'])
+            }
+        
+        # 详细打印统计信息
+        self.logger.info("-------------- 训练统计 --------------")
+        self.logger.info(f"平均损失 - 全局: {avg_global_loss:.4f}, 本地: {avg_local_loss:.4f}, 特征对齐: {avg_feature_loss:.4f}")
+        self.logger.info(f"平均准确率 - 本地: {avg_local_acc:.2f}%, 全局: {avg_global_acc:.2f}%")
+        
+        # 打印每个Tier的统计
+        for tier, avg in tier_avg.items():
+            self.logger.info(f"Tier {tier} - 本地准确率: {avg['local_acc']:.2f}%, 全局准确率: {avg['global_acc']:.2f}%")
+        self.logger.info("--------------------------------------")
+    
+    def _aggregate_models(self, model_states, weights=None):
+        """聚合模型"""
+        if not model_states:
+            return {}
+        
+        # 如果没有提供权重，使用平均权重
+        if weights is None:
+            weights = [1.0 / len(model_states)] * len(model_states)
+        
+        # 确保权重长度正确
+        assert len(weights) == len(model_states), "权重数量必须等于模型数量"
+        
+        # 初始化聚合结果
+        aggregated = {}
+        for key in model_states[0].keys():
+            aggregated[key] = torch.zeros_like(model_states[0][key])
+        
+        # 加权聚合
+        for w, state in zip(weights, model_states):
+            for key in aggregated.keys():
+                if key in state:
+                    # 检查类型并特殊处理Long类型
+                    if aggregated[key].dtype == torch.long:
+                        # 对于Long类型，先转换为浮点型计算，再四舍五入回Long类型
+                        float_result = aggregated[key].float() + (w * state[key].float())
+                        aggregated[key] = torch.round(float_result).long()
+                    else:
+                        # 其他类型直接计算
+                        aggregated[key] += w * state[key]
+        
+        return aggregated
