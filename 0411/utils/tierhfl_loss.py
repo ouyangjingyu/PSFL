@@ -3,198 +3,143 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-class TierHFLLoss(nn.Module):
-    """TierHFL损失函数，包含本地和全局损失平衡"""
-    def __init__(self, alpha=0.5, lambda_feature=0.1, temperature=0.07, max_cache_size=10):
-        super(TierHFLLoss, self).__init__()
-        self.alpha = alpha  # 本地损失权重
-        self.lambda_feature = lambda_feature  # 特征对齐权重
-        self.temperature = temperature  # 对比学习温度参数
+
+class EnhancedUnifiedLoss(nn.Module):
+    """增强版统一损失函数，整合自适应控制器功能"""
+    def __init__(self, init_alpha=0.5, init_beta=0.1):
+        super(EnhancedUnifiedLoss, self).__init__()
+        self.alpha = init_alpha  # 本地损失权重
+        self.beta = init_beta    # 特征对齐权重
         self.ce = nn.CrossEntropyLoss()
-        # 添加投影矩阵缓存字典
-        self.projection_matrix_cache = {}
-        self.max_cache_size = max_cache_size  # 添加缓存大小限制
-        self.cache_hits = 0
-        self.cache_misses = 0
-    
-    def forward(self, local_logits, global_logits, local_features, 
-                global_features, targets, round_idx=0):
-        """计算总损失
         
-        Args:
-            local_logits: 本地分类器输出
-            global_logits: 全局分类器输出
-            local_features: 本地特征
-            global_features: 全局特征
-            targets: 目标标签
-            round_idx: 当前训练轮次
+        # 历史性能记录
+        self.history = {
+            'local_accuracy': [],
+            'global_accuracy': [],
+            'global_imbalance': []
+        }
+    
+    def update_history(self, eval_results):
+        """更新历史记录 - 从AdaptiveTrainingController借鉴"""
+        if not eval_results:
+            return
             
-        Returns:
-            总损失，本地损失，全局损失，特征对齐损失
-        """
-        # 分类损失
-        local_loss = self.ce(local_logits, targets)
+        local_accs = []
+        global_accs = []
+        imbalances = []
+        
+        for result in eval_results.values():
+            if 'local_accuracy' in result:
+                local_accs.append(result['local_accuracy'])
+            if 'global_accuracy' in result:
+                global_accs.append(result['global_accuracy'])
+            if 'global_imbalance' in result:
+                imbalances.append(result['global_imbalance'])
+        
+        # 计算平均值
+        if local_accs:
+            self.history['local_accuracy'].append(sum(local_accs) / len(local_accs))
+        if global_accs:
+            self.history['global_accuracy'].append(sum(global_accs) / len(global_accs))
+        if imbalances:
+            # 过滤掉infinity
+            valid_imbalances = [i for i in imbalances if i != float('inf')]
+            if valid_imbalances:
+                self.history['global_imbalance'].append(sum(valid_imbalances) / len(valid_imbalances))
+    
+    def forward(self, global_logits, targets, local_loss, 
+                personal_features=None, server_features=None, round_idx=0, total_rounds=100):
+        """计算统一损失"""
+        # 计算全局分类损失
         global_loss = self.ce(global_logits, targets)
         
-        # 特征对齐损失 - 使用简化的方法
-        feature_loss = self._feature_alignment(local_features, global_features)
+        # 计算特征对齐损失
+        feature_loss = torch.tensor(0.0, device=global_logits.device)
+        if personal_features is not None and server_features is not None and self.beta > 0:
+            feature_loss = self.compute_feature_alignment(personal_features, server_features)
         
-        # 根据轮次动态调整权重
-        dynamic_alpha = self._adjust_alpha(self.alpha, round_idx)
-        dynamic_lambda = self._adjust_lambda(self.lambda_feature, round_idx)
+        # 获取自适应权重
+        alpha, beta = self.get_adaptive_weights(round_idx, total_rounds)
         
-        # 总损失计算
-        total_loss = dynamic_alpha * local_loss + (1 - dynamic_alpha) * global_loss + \
-                    dynamic_lambda * feature_loss
-                    
-        return total_loss, local_loss, global_loss, feature_loss
+        # 计算总损失
+        total_loss = (1 - alpha) * global_loss + alpha * local_loss + beta * feature_loss
+        
+        return total_loss, global_loss, feature_loss
     
-    # def _feature_alignment(self, local_feat, global_feat):
-    #     """改进的特征对齐损失计算，使用缓存的投影矩阵"""
-    #     # 确保特征是二维张量
-    #     if local_feat.dim() > 2:
-    #         local_feat = F.adaptive_avg_pool2d(local_feat, (1, 1))
-    #         local_feat = local_feat.view(local_feat.size(0), -1)
-        
-    #     if global_feat.dim() > 2:
-    #         global_feat = F.adaptive_avg_pool2d(global_feat, (1, 1))
-    #         global_feat = global_feat.view(global_feat.size(0), -1)
-        
-    #     # 如果维度不匹配，使用或创建对应的投影矩阵
-    #     if local_feat.size(1) != global_feat.size(1):
-    #         # 创建维度组合的键
-    #         dim_key = (local_feat.size(1), global_feat.size(1))
-    #         device_str = str(local_feat.device)
-    #         cache_key = f"{dim_key}_{device_str}"
-            
-    #         # 检查缓存中是否已有该维度组合的投影矩阵
-    #         if cache_key in self.projection_matrix_cache:
-    #             projection = self.projection_matrix_cache[cache_key]
-    #             self.cache_hits += 1
-    #         else:
-    #             # 选择较小的维度作为共同维度
-    #             common_dim = min(local_feat.size(1), global_feat.size(1))
-                
-    #             # 创建新的投影矩阵并添加到缓存
-    #             projection = torch.randn(
-    #                 max(local_feat.size(1), global_feat.size(1)), 
-    #                 common_dim, 
-    #                 device=local_feat.device
-    #             )
-    #             self.projection_matrix_cache[cache_key] = projection
-    #             self.cache_misses += 1
-                
-    #             # 限制缓存大小
-    #             self._clean_cache()
-            
-    #         # 应用投影
-    #         if local_feat.size(1) > global_feat.size(1):
-    #             local_feat = torch.matmul(local_feat, projection[:local_feat.size(1), :])
-    #         else:
-    #             global_feat = torch.matmul(global_feat, projection[:global_feat.size(1), :])
-        
-    #     # 特征归一化
-    #     local_norm = F.normalize(local_feat, dim=1)
-    #     global_norm = F.normalize(global_feat, dim=1)
-        
-    #     # 计算余弦相似度
-    #     cos_sim = torch.sum(local_norm * global_norm, dim=1)
-        
-    #     # 转换为距离损失
-    #     return torch.mean(1.0 - cos_sim)
-
-    # 在TierHFLLoss类中添加
-    # 修改utils/tierhfl_loss.py中的dynamic_feature_alignment函数
-    def dynamic_feature_alignment(self, local_feat, global_feat, round_idx, total_rounds):
-        """简化的动态特征对齐方法 - 处理不同维度的特征"""
+    def compute_feature_alignment(self, personal_features, server_features):
+        """计算特征对齐损失"""
         # 确保特征是二维
-        if local_feat.dim() > 2:
-            local_feat = F.adaptive_avg_pool2d(local_feat, (1, 1)).flatten(1)
-        if global_feat.dim() > 2:
-            global_feat = F.adaptive_avg_pool2d(global_feat, (1, 1)).flatten(1)
-        
-        # 处理不同维度的特征 - 新增
-        local_dim = local_feat.size(1)
-        global_dim = global_feat.size(1)
-        
-        if local_dim != global_dim:
-            # 创建临时映射层，将维度较小的特征映射到与较大维度相同
-            device = local_feat.device
-            if local_dim < global_dim:
-                # 将本地特征映射到全局维度
-                projection = torch.nn.Linear(local_dim, global_dim, bias=False).to(device)
-                # 初始化为接近单位变换
-                nn.init.normal_(projection.weight, mean=0.0, std=0.01)
-                local_feat = projection(local_feat)
-            else:
-                # 将全局特征映射到本地维度
-                projection = torch.nn.Linear(global_dim, local_dim, bias=False).to(device)
-                nn.init.normal_(projection.weight, mean=0.0, std=0.01)
-                global_feat = projection(global_feat)
+        if personal_features.dim() > 2:
+            personal_features = F.adaptive_avg_pool2d(personal_features, (1, 1)).flatten(1)
+        if server_features.dim() > 2:
+            server_features = F.adaptive_avg_pool2d(server_features, (1, 1)).flatten(1)
         
         # 标准化特征
-        local_norm = F.normalize(local_feat, dim=1)
-        global_norm = F.normalize(global_feat, dim=1)
+        personal_norm = F.normalize(personal_features, dim=1)
+        server_norm = F.normalize(server_features, dim=1)
         
-        # 计算余弦相似度损失
-        alignment_loss = 1.0 - torch.mean(torch.sum(local_norm * global_norm, dim=1))
-        
-        # 动态强度因子 - 训练早期强，中期最强，后期减弱
+        # 计算余弦相似度，转换为损失
+        cos_sim = torch.sum(personal_norm * server_norm, dim=1).mean()
+        return 1.0 - cos_sim
+    
+    def get_adaptive_weights(self, round_idx, total_rounds):
+        """计算自适应权重 - 整合AdaptiveTrainingController逻辑"""
+        # 基本进度因子
         progress = round_idx / max(1, total_rounds)
-        if progress < 0.3:
-            # 前30%轮次，中等强度
-            dynamic_factor = 0.2
-        elif progress < 0.7:
-            # 中期40%轮次，最强强度
-            dynamic_factor = 0.3
-        else:
-            # 后30%轮次，减弱强度
-            dynamic_factor = max(0.05, 0.2 - (progress - 0.7) * 0.5)
         
-        return alignment_loss * dynamic_factor
-    
-    def _clean_cache(self):
-        """清理旧的投影矩阵缓存"""
-        if len(self.projection_matrix_cache) > self.max_cache_size:
-            # 移除最早添加的项
-            keys = list(self.projection_matrix_cache.keys())
-            for key in keys[:len(keys) - self.max_cache_size]:
-                del self.projection_matrix_cache[key]
-    
-    def _adjust_alpha(self, base_alpha, round_idx):
-        """动态调整alpha值
-        
-        随着训练进行，增加本地损失权重(个性化)
-        """
-        if round_idx < 20:
-            # 前20轮更注重全局损失
-            return max(0.2, base_alpha - 0.2)
-        elif round_idx > 80:
-            # 后期更注重本地损失
-            return min(0.8, base_alpha + 0.2)
+        # 检查历史性能
+        if len(self.history['local_accuracy']) >= 3 and len(self.history['global_accuracy']) >= 3:
+            # 获取最近几轮的性能指标
+            window_size = min(5, len(self.history['local_accuracy']))
+            recent_local_acc = self.history['local_accuracy'][-window_size:]
+            recent_global_acc = self.history['global_accuracy'][-window_size:]
+            
+            # 计算趋势
+            local_trend = recent_local_acc[-1] - recent_local_acc[-3]
+            global_trend = recent_global_acc[-1] - recent_global_acc[-3]
+            
+            # 当前性能
+            current_local_acc = recent_local_acc[-1]
+            current_global_acc = recent_global_acc[-1]
+            
+            # 计算不平衡度趋势
+            if len(self.history['global_imbalance']) >= 3:
+                recent_imbalance = self.history['global_imbalance'][-3:]
+                imbalance_trend = recent_imbalance[-1] - recent_imbalance[0]
+            else:
+                imbalance_trend = 0
+            
+            # 根据性能差距和趋势调整alpha
+            acc_gap = current_local_acc - current_global_acc
+            
+            # 高级自适应调整策略
+            if global_trend < -1.0 and local_trend > 0:
+                # 全局性能下降但本地性能上升，适度增加个性化权重
+                alpha = min(0.7, self.alpha + 0.05)
+            elif global_trend > 0.5 or (global_trend > 0 and local_trend < 0):
+                # 更积极地降低alpha以促进全局学习
+                alpha = max(0.2, self.alpha - 0.05)
+            else:
+                # 正常进度调整
+                alpha = 0.3 + 0.4 * progress + 0.1 * np.tanh(acc_gap / 10)
+            
+            # 动态特征对齐权重
+            if global_trend < 0 or imbalance_trend > 0.2:
+                # 全局性能下降或不平衡度增加时，增强特征对齐
+                beta = min(0.3, self.beta + 0.05)
+            elif global_trend > 2.0 and imbalance_trend < 0:
+                # 全局性能显著上升且不平衡度下降，适当减弱特征对齐
+                beta = max(0.05, self.beta - 0.03)
+            else:
+                # 中期强，早期和后期弱
+                beta = self.beta * (1 - abs(2 * progress - 1))
+                
+            # 更新内部状态
+            self.alpha = alpha
+            self.beta = beta
         else:
-            # 中期使用基础值
-            return base_alpha
-    
-    def _adjust_lambda(self, base_lambda, round_idx):
-        """动态调整lambda值
+            # 简单进度调整
+            alpha = 0.3 + 0.4 * progress
+            beta = self.beta * (1 - abs(2 * progress - 1))
         
-        前期保持较高的特征对齐权重，后期逐渐降低
-        """
-        if round_idx < 30:
-            # 前期强调特征对齐
-            return min(0.5, base_lambda * 2.0)
-        elif round_idx > 70:
-            # 后期降低特征对齐约束
-            return max(0.05, base_lambda * 0.5)
-        else:
-            # 中期使用基础值
-            return base_lambda
-    
-    def to(self, device):
-        """将损失函数移动到指定设备"""
-        super().to(device)
-        # 如果有projection_matrix，也将其移到对应设备
-        for key, matrix in self.projection_matrix_cache.items():
-            self.projection_matrix_cache[key] = matrix.to(device)
-        return self
+        return alpha, beta
