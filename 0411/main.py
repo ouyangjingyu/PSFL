@@ -28,6 +28,10 @@ from utils.tierhfl_aggregator import StabilizedAggregator
 from utils.tierhfl_client import TierHFLClientManager
 from utils.tierhfl_loss import EnhancedUnifiedLoss
 
+from analyze.tierhfl_analyze import validate_server_effectiveness
+
+# 导入验证器
+from analyze.tierhfl_analyze import GlobalClassifierVerifier
 
 # 导入数据加载和处理模块
 from api.data_preprocessing.cifar10.data_loader import load_partition_data_cifar10
@@ -1024,6 +1028,17 @@ def main():
     best_accuracy = 0.0
     prev_global_acc = 0.0
     
+    # 在训练开始前进行初始验证
+    initial_validation = validate_server_effectiveness(
+        args, 
+        client_models,  # 传递整个client_models字典
+        server_model, 
+        global_classifier,
+        global_test_loader, 
+        test_data_local_dict
+    )
+
+
     for round_idx in range(args.rounds):
         round_start_time = time.time()
         logger.info(f"===== 轮次 {round_idx+1}/{args.rounds} =====")
@@ -1154,6 +1169,44 @@ def main():
                 if client:
                     client.lr *= args.lr_factor
                     logger.info(f"客户端 {client_id} 学习率更新为: {client.lr:.6f}")
+
+        # 每隔3轮进行一次验证
+        if (round_idx + 1) % 3 == 0:
+            round_validation = validate_server_effectiveness(
+                args, 
+                client_models,  # 传递整个client_models字典
+                server_model, 
+                global_classifier,
+                global_test_loader, 
+                test_data_local_dict
+            )
+
+        # 每隔3轮进行一次全局分类器验证
+        if (round_idx + 1) % 3 == 0:
+            logger.info("验证全局分类器...")
+            try:
+                verifier = GlobalClassifierVerifier(
+                    server_model, 
+                    global_classifier,
+                    client_models,
+                    global_test_loader, 
+                    test_data_local_dict,
+                    device=device
+                )
+                verifier.run_all_tests()
+            except Exception as e:
+                logger.error(f"全局分类器验证失败: {str(e)}")
+            
+            # 记录验证结果
+            try:
+                wandb.log({
+                    "round": round_idx + 1,
+                    "validation/feature_quality": round_validation['feature_quality'],
+                    "validation/heterogeneity_adaptation": round_validation['heterogeneity_adaptation'],
+                    "validation/identity_leakage": round_validation['identity_leakage']
+                })
+            except Exception as e:
+                logger.error(f"记录wandb指标失败: {str(e)}")
     
     # 训练完成
     logger.info(f"TierHFL串行训练完成! 最佳准确率: {best_accuracy:.2f}%")
