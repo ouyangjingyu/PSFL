@@ -60,6 +60,8 @@ class SimpleSerialTrainer:
         # 聚类映射和服务器模型状态
         self.cluster_map = {}
         self.cluster_server_models = {}
+        # 添加全局分类器副本字典
+        self.cluster_global_classifiers = {}
         
     def register_client_models(self, client_models_dict):
         """注册客户端模型"""
@@ -68,10 +70,12 @@ class SimpleSerialTrainer:
     def setup_training(self, cluster_map):
         """设置训练环境"""
         self.cluster_map = cluster_map
-        # 为每个聚类初始化服务器模型
+        # 为每个聚类初始化服务器模型和全局分类器
         self.cluster_server_models = {}
+        self.cluster_global_classifiers = {}
         for cluster_id in cluster_map.keys():
             self.cluster_server_models[cluster_id] = copy.deepcopy(self.server_model.state_dict())
+            self.cluster_global_classifiers[cluster_id] = copy.deepcopy(self.global_classifier.state_dict())
     
     def execute_round(self, round_idx, total_rounds):
         """执行一轮训练 - 修复版"""
@@ -82,16 +86,17 @@ class SimpleSerialTrainer:
         eval_results = {}
         shared_states = {}
         
-        # 确保全局分类器在正确的设备上
-        self.global_classifier = self.global_classifier.to(self.device)
-        
         # 依次处理每个聚类
         for cluster_id, client_ids in self.cluster_map.items():
             logging.info(f"处理聚类 {cluster_id}, 包含 {len(client_ids)} 个客户端")
             
-            # 创建聚类特定的服务器模型
+            # 创建聚类特定的服务器模型和全局分类器
             cluster_server = copy.deepcopy(self.server_model).to(self.device)
             cluster_server.load_state_dict(self.cluster_server_models[cluster_id])
+            
+            # 创建聚类特定的全局分类器
+            cluster_classifier = copy.deepcopy(self.global_classifier).to(self.device)
+            cluster_classifier.load_state_dict(self.cluster_global_classifiers[cluster_id])
             
             # 依次处理聚类中的每个客户端
             for client_id in client_ids:
@@ -109,9 +114,9 @@ class SimpleSerialTrainer:
                 personal_result = self._train_personal_layers(
                     client, client_model, round_idx, total_rounds)
                 
-                # 阶段二：训练服务器模型和共享层 - 使用单一全局分类器
+                # 阶段二：训练服务器模型和共享层 - 使用聚类特定的全局分类器
                 server_result = self._train_server_model(
-                    client, client_model, cluster_server, self.global_classifier, 
+                    client, client_model, cluster_server, cluster_classifier, 
                     personal_result, round_idx, total_rounds)
                 
                 # 保存训练结果
@@ -126,7 +131,7 @@ class SimpleSerialTrainer:
                 
                 # 评估客户端
                 eval_result = self._evaluate_client(
-                    client, client_model, cluster_server, self.global_classifier)
+                    client, client_model, cluster_server, cluster_classifier)
                 eval_results[client_id] = eval_result
                 
                 # 保存共享层状态
@@ -142,14 +147,12 @@ class SimpleSerialTrainer:
                 # 释放GPU内存
                 torch.cuda.empty_cache()
             
-            # 保存聚类服务器模型
+            # 保存聚类服务器模型和全局分类器
             self.cluster_server_models[cluster_id] = cluster_server.cpu().state_dict()
+            self.cluster_global_classifiers[cluster_id] = cluster_classifier.cpu().state_dict()
         
         # 计算总训练时间
         training_time = time.time() - start_time
-        
-        # 将全局分类器移回CPU以节省内存
-        self.global_classifier = self.global_classifier.cpu()
         
         return train_results, eval_results, shared_states, training_time
     
@@ -247,9 +250,17 @@ class SimpleSerialTrainer:
         # 创建针对服务器模型的优化器
         server_optimizer = torch.optim.Adam(server_model.parameters(), lr=0.001)
         
-        # 创建针对全局分类器的优化器
-        classifier_optimizer = torch.optim.Adam(classifier.parameters(), lr=0.001)
-        
+        # 创建针对全局分类器的优化器 - 添加学习率预热
+        base_lr = 0.0005
+        warmup_factor = min(1.0, 0.2 + (round_idx * 0.1))  # 更缓慢的预热
+        classifier_lr = base_lr * warmup_factor
+        # 创建针对全局分类器的优化器 - 添加L2正则化
+        classifier_optimizer = torch.optim.Adam(
+            classifier.parameters(), 
+            lr=classifier_lr,
+            weight_decay=0.01  # 添加L2正则化
+        )
+
         # 统计信息
         stats = {
             'total_loss': 0.0,
@@ -309,6 +320,12 @@ class SimpleSerialTrainer:
             # 反向传播 - 确保梯度流向所有相关参数
             total_loss.backward()
             
+            # 添加梯度裁剪以提高训练稳定性
+            torch.nn.utils.clip_grad_norm_(server_model.parameters(), max_norm=5.0)
+            torch.nn.utils.clip_grad_norm_(classifier.parameters(), max_norm=5.0)
+            shared_params = [p for n, p in client_model.named_parameters() if 'shared_base' in n]
+            torch.nn.utils.clip_grad_norm_(shared_params, max_norm=1.0)
+
             # 更新参数 - 使用标准优化器步骤
             server_optimizer.step()
             classifier_optimizer.step()
@@ -477,6 +494,58 @@ class SimpleSerialTrainer:
                 aggregated_params[name] = weighted_sum / total_weight
         
         return aggregated_params
+
+    def aggregate_global_classifiers(self, eval_results=None):
+        """聚合所有聚类的全局分类器"""
+        if not self.cluster_global_classifiers:
+            return None
+        
+        # 计算聚类权重
+        if eval_results:
+            # 基于性能的权重
+            cluster_weights = {}
+            for cluster_id, client_ids in self.cluster_map.items():
+                accuracies = [eval_results.get(client_id, {}).get('global_accuracy', 0) 
+                            for client_id in client_ids if client_id in eval_results]
+                
+                # 避免极端权重
+                if accuracies:
+                    avg_acc = sum(accuracies) / len(accuracies)
+                    # 线性映射而非二次方，减小权重差异
+                    weight = 0.5 + 0.5 * (avg_acc / 100.0)  # 限制权重范围在[0.5, 1.0]
+                else:
+                    weight = 0.5
+                    
+                cluster_weights[cluster_id] = weight
+        else:
+            # 平均权重
+            cluster_weights = {c_id: 1.0/len(self.cluster_map) for c_id in self.cluster_map}
+        
+        # 创建临时模型用于聚合
+        temp_classifier = copy.deepcopy(self.global_classifier)
+        
+        # 参数字典
+        aggregated_params = {}
+        
+        # 聚合参数
+        for name, param in temp_classifier.named_parameters():
+            weighted_sum = None
+            total_weight = 0.0
+            
+            for cluster_id, weight in cluster_weights.items():
+                if cluster_id in self.cluster_global_classifiers:
+                    cluster_state = self.cluster_global_classifiers[cluster_id]
+                    if name in cluster_state:
+                        total_weight += weight
+                        if weighted_sum is None:
+                            weighted_sum = weight * cluster_state[name].clone()
+                        else:
+                            weighted_sum += weight * cluster_state[name].clone()
+            
+            if weighted_sum is not None and total_weight > 0:
+                aggregated_params[name] = weighted_sum / total_weight
+        
+        return aggregated_params
     
     def update_client_shared_layers(self, aggregated_shared_state):
         """更新所有客户端的共享层参数"""
@@ -490,21 +559,37 @@ class SimpleSerialTrainer:
         
         return True
     
-    def update_server_models(self, aggregated_server_model):
-        """更新所有聚类的服务器模型"""
-        if not aggregated_server_model:
-            return False
+    def update_server_models(self, aggregated_server_model, aggregated_global_classifier=None):
+        """更新所有聚类的服务器模型和全局分类器"""
+        updated = False
         
-        # 更新主服务器模型
-        for name, param in self.server_model.named_parameters():
-            if name in aggregated_server_model:
-                param.data.copy_(aggregated_server_model[name])
+        # 更新服务器模型
+        if aggregated_server_model:
+            # 更新主服务器模型
+            for name, param in self.server_model.named_parameters():
+                if name in aggregated_server_model:
+                    param.data.copy_(aggregated_server_model[name])
+            
+            # 更新所有聚类的服务器模型
+            for cluster_id in self.cluster_server_models:
+                self.cluster_server_models[cluster_id] = copy.deepcopy(self.server_model.state_dict())
+            
+            updated = True
         
-        # 更新所有聚类的服务器模型
-        for cluster_id in self.cluster_server_models:
-            self.cluster_server_models[cluster_id] = copy.deepcopy(self.server_model.state_dict())
+        # 更新全局分类器
+        if aggregated_global_classifier:
+            # 更新主全局分类器
+            for name, param in self.global_classifier.named_parameters():
+                if name in aggregated_global_classifier:
+                    param.data.copy_(aggregated_global_classifier[name])
+            
+            # 更新所有聚类的全局分类器
+            for cluster_id in self.cluster_global_classifiers:
+                self.cluster_global_classifiers[cluster_id] = copy.deepcopy(self.global_classifier.state_dict())
+            
+            updated = True
         
-        return True
+        return updated
 
 # 设置随机种子函数
 def set_seed(seed=42):
@@ -1058,6 +1143,9 @@ def main():
         # 2. 聚合服务器模型
         logger.info("聚合服务器模型...")
         aggregated_server_model = trainer.aggregate_server_models(eval_results)
+
+        logger.info("聚合全局分类器...")
+        aggregated_global_classifier = trainer.aggregate_global_classifiers(eval_results)
         
         # 3. 更新客户端共享层
         logger.info("更新客户端共享层...")
