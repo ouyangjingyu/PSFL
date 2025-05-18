@@ -9,6 +9,12 @@ import logging
 import random
 import torch.nn.functional as F
 import math
+# 替换为：
+import sys
+import os
+# 确保项目根目录在Python路径中
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
+from model.resnet import EnhancedServerModel, ImprovedGlobalClassifier
 
 class UnifiedParallelTrainer:
     """新的统一并行训练器 - 简化并行训练流程"""
@@ -154,13 +160,24 @@ class UnifiedParallelTrainer:
             # 获取设备
             device = self.device_map.get(cluster_id, self.default_device)
             
-            # 创建服务器模型副本
-            server_model = copy.deepcopy(self.server_model).to(device)
-            # 如果存在缓存的服务器模型，加载它
+            # 直接创建新模型实例，传入必要参数但不依赖实例属性
+            server_model = EnhancedServerModel(
+                model_type='resnet56',  # 直接硬编码或从配置中获取
+                feature_dim=128
+            ).to(device)
+            
+            # 加载状态
             if hasattr(self, 'cluster_server_models') and cluster_id in self.cluster_server_models:
                 server_model.load_state_dict(self.cluster_server_models[cluster_id])
+            else:
+                server_model.load_state_dict(self.server_model.state_dict())
             
-            classifier = copy.deepcopy(self.global_classifier).to(device)
+            # 同理处理分类器
+            classifier = ImprovedGlobalClassifier(
+                feature_dim=128,
+                num_classes=10  # 根据您的数据集调整或从全局分类器推断
+            ).to(device)
+            classifier.load_state_dict(self.global_classifier.state_dict())
             
             # 结果容器
             cluster_train_results = {}
@@ -220,7 +237,7 @@ class UnifiedParallelTrainer:
                     
                     # 进行服务器训练，获取共享层梯度
                     shared_grads, train_stats = self._train_server_step(
-                        server_model, classifier, client_model, features, local_loss, client_id, round_idx)
+                        server_model, classifier, client_model, features, local_loss, client_id, round_idx, device)
                     
                     # 应用共享层梯度
                     self._apply_shared_grads(client_model, shared_grads)
@@ -288,9 +305,11 @@ class UnifiedParallelTrainer:
             'time_cost': time_cost
         }
     
-    def _train_server_step(self, server_model, classifier, client_model, features, local_loss, client_id, round_idx):
+    def _train_server_step(self, server_model, classifier, client_model, features, local_loss, client_id, round_idx, device=None):
         """执行服务器训练步骤 - 使用传入的损失函数"""
-        device = server_model.device
+        if device is None:
+            # 回退方案：从参数获取设备
+            device = next(server_model.parameters()).device
         
         # 设置训练模式
         server_model.train()

@@ -309,12 +309,18 @@ class ImprovedGlobalClassifier(nn.Module):
     def __init__(self, feature_dim=128, num_classes=10):
         super(ImprovedGlobalClassifier, self).__init__()
         
+        # 替换为更稳定的LayerNorm而非BatchNorm
         self.classifier = nn.Sequential(
             nn.LayerNorm(feature_dim),
             nn.Linear(feature_dim, 256),
             nn.ReLU(inplace=True),
             nn.LayerNorm(256),
-            nn.Linear(256, num_classes)
+            nn.Dropout(0.3),  # 增加dropout防止过拟合
+            nn.Linear(256, 128),
+            nn.ReLU(inplace=True),
+            nn.LayerNorm(128),
+            nn.Dropout(0.2),
+            nn.Linear(128, num_classes)
         )
     
     def forward(self, x):
