@@ -408,8 +408,8 @@ class GlobalClassifierVerifier:
         self.device = device
         
         # 创建结果目录
-        self.result_dir = f"classifier_verification_{datetime.now().strftime('%m%d_%H%M')}"
-        os.makedirs(self.result_dir, exist_ok=True)
+        # self.result_dir = f"classifier_verification_{datetime.now().strftime('%m%d_%H%M')}"
+        # os.makedirs(self.result_dir, exist_ok=True)
         
     def run_all_tests(self):
         """运行所有验证测试"""

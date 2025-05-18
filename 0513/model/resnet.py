@@ -141,10 +141,11 @@ class LocalClassifier(nn.Module):
 
 # 修改TierAwareClientModel类
 class TierAwareClientModel(nn.Module):
-    def __init__(self, num_classes=10, tier=1, model_type='resnet56'):
+    def __init__(self, num_classes=10, tier=1, model_type='resnet56', input_channels=3):
         super(TierAwareClientModel, self).__init__()
         self.tier = tier
         self.model_type = model_type
+        self.input_channels = input_channels  # 新增参数，支持不同的输入通道数
         
         # 获取模型配置
         _, client_blocks, _ = get_resnet_config(model_type)
@@ -152,7 +153,7 @@ class TierAwareClientModel(nn.Module):
         # 基础层(共享层) - 所有客户端完全一致
         self.shared_base = nn.Sequential(
             # 初始卷积层
-            nn.Conv2d(3, 16, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(input_channels, 16, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(16),
             nn.ReLU(inplace=True),
             # Layer1
@@ -246,8 +247,9 @@ class TierAwareClientModel(nn.Module):
 
 # 修改EnhancedServerModel类
 class EnhancedServerModel(nn.Module):
-    def __init__(self, model_type='resnet56', feature_dim=128):
+    def __init__(self, model_type='resnet56', feature_dim=128, input_channels=3):
         super(EnhancedServerModel, self).__init__()
+        self.input_channels = input_channels  # 添加但不直接使用
         
         # 获取模型配置
         _, _, server_blocks = get_resnet_config(model_type)
