@@ -1200,6 +1200,8 @@ def setup_logging(args):
 def load_dataset(args):
     if args.dataset == "cifar10":
         data_loader = load_partition_data_cifar10
+    elif args.dataset == "fashion_mnist":
+        data_loader = load_partition_data_fashion_mnist
     elif args.dataset == "cifar100":
         data_loader = load_partition_data_cifar100
     elif args.dataset == "cinic10":
@@ -1212,21 +1214,30 @@ def load_dataset(args):
     result = data_loader(args.dataset, args.data_dir, args.partition_method,
                         args.partition_alpha, args.client_number, args.batch_size)
     
-    # 检查返回值数量决定如何处理
-    if len(result) == 9:  # 包含traindata_cls_counts的情况
-        train_data_num, test_data_num, train_data_global, test_data_global, \
-        train_data_local_num_dict, train_data_local_dict, test_data_local_dict, \
-        class_num, traindata_cls_counts = result
+    # # 检查返回值数量决定如何处理
+    # if len(result) == 9:  # 包含traindata_cls_counts的情况
+    #     train_data_num, test_data_num, train_data_global, test_data_global, \
+    #     train_data_local_num_dict, train_data_local_dict, test_data_local_dict, \
+    #     class_num, traindata_cls_counts = result
         
-        dataset = [train_data_num, test_data_num, train_data_global, test_data_global,
-                   train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num, traindata_cls_counts]
-    else:  # 返回8个值的情况
-        train_data_num, test_data_num, train_data_global, test_data_global, \
-        train_data_local_num_dict, train_data_local_dict, test_data_local_dict, \
-        class_num = result
+    #     dataset = [train_data_num, test_data_num, train_data_global, test_data_global,
+    #                train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num, traindata_cls_counts]
+    # else:  # 返回8个值的情况
+    #     train_data_num, test_data_num, train_data_global, test_data_global, \
+    #     train_data_local_num_dict, train_data_local_dict, test_data_local_dict, \
+    #     class_num = result
         
-        dataset = [train_data_num, test_data_num, train_data_global, test_data_global,
-                   train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num]
+    #     dataset = [train_data_num, test_data_num, train_data_global, test_data_global,
+    #                train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num]
+
+    # 调用数据加载器并显式传递数据集参数
+    train_data_num, test_data_num, train_data_global, test_data_global, \
+    train_data_local_num_dict, train_data_local_dict, test_data_local_dict, \
+    class_num = data_loader(args.dataset, args.data_dir, args.partition_method,
+                           args.partition_alpha, args.client_number, args.batch_size)
+    
+    dataset = [train_data_num, test_data_num, train_data_global, test_data_global,
+               train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num]
     
     return dataset
 
@@ -1521,7 +1532,7 @@ class ModelFeatureClusterer:
 
 # 主函数
 def main():
-    """主函数，串行版TierHFL实现"""
+    """主函数，串行版TierHFL实现 - 增强版"""
     # 解析命令行参数
     args = parse_arguments()
     
@@ -1529,12 +1540,13 @@ def main():
     args.initial_phase_rounds = 10  # 初始阶段轮数
     args.alternating_phase_rounds = 70  # 交替训练阶段轮数
     args.fine_tuning_phase_rounds = 20  # 精细调整阶段轮数
+    
     # 设置随机种子
     set_seed(42)
     
     # 设置日志
     logger = setup_logging(args)
-    logger.info("初始化TierHFL: 串行版本")
+    logger.info("初始化TierHFL: 串行版本 - 增强版训练策略")
     
     # 设置默认设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -1544,21 +1556,11 @@ def main():
     logger.info(f"加载数据集: {args.dataset}")
     dataset = load_dataset(args)
     
-    # 检查返回dataset的长度决定如何解包
-    if len(dataset) == 9:
-        train_data_num, test_data_num, train_data_global, test_data_global, \
-        train_data_local_num_dict, train_data_local_dict, test_data_local_dict, \
-        class_num, traindata_cls_counts = dataset
-    else:
-        train_data_num, test_data_num, train_data_global, test_data_global, \
-        train_data_local_num_dict, train_data_local_dict, test_data_local_dict, \
-        class_num = dataset
-        traindata_cls_counts = None  # 未返回该值时设为None
     # 获取数据集信息
-    # if args.dataset != "cinic10":
-    #     train_data_num, test_data_num, _, _, train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num = dataset
-    # else:
-    #     train_data_num, test_data_num, _, _, train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num, _ = dataset
+    if args.dataset != "cinic10":
+        train_data_num, test_data_num, _, _, train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num = dataset
+    else:
+        train_data_num, test_data_num, _, _, train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num, _ = dataset
     
     # 加载全局测试集
     logger.info("加载全局IID测试集用于评估泛化性能...")
@@ -1642,7 +1644,7 @@ def main():
     print_cluster_info(cluster_map, client_resources, logger)
     
     # 创建串行训练器
-    logger.info("创建串行训练器...")
+    logger.info("创建增强版串行训练器...")
     trainer = SimpleSerialTrainer(
         client_manager=client_manager,
         server_model=server_model,
@@ -1665,13 +1667,12 @@ def main():
     # 在训练开始前进行初始验证
     initial_validation = validate_server_effectiveness(
         args, 
-        client_models,  # 传递整个client_models字典
+        client_models,
         server_model, 
         global_classifier,
         global_test_loader, 
         test_data_local_dict
     )
-
 
     for round_idx in range(args.rounds):
         round_start_time = time.time()
@@ -1684,45 +1685,44 @@ def main():
             logger.info("当前处于交替训练阶段")
         else:
             logger.info("当前处于精细调整阶段")
-
-        # 执行训练
+        
+        # 执行训练 - 使用修改后的execute_round方法
         train_results, eval_results, shared_states, training_time = trainer.execute_round(
             round_idx=round_idx, 
             total_rounds=args.rounds
         )
         
-        # 1. 聚合客户端共享层
+        # 聚合客户端共享层
         logger.info("聚合客户端共享层...")
         aggregation_start_time = time.time()
         
         aggregated_shared_state = trainer.aggregate_client_shared_layers(shared_states)
         
-        # 2. 聚合服务器模型
+        # 聚合服务器模型
         logger.info("聚合服务器模型...")
         aggregated_server_model = trainer.aggregate_server_models(eval_results)
 
         logger.info("聚合全局分类器...")
         aggregated_global_classifier = trainer.aggregate_global_classifiers(eval_results)
         
-        # 3. 更新客户端共享层
+        # 更新客户端共享层
         logger.info("更新客户端共享层...")
         trainer.update_client_shared_layers(aggregated_shared_state)
         
-        # 4. 更新服务器模型
+        # 更新服务器模型
         logger.info("更新服务器模型...")
         trainer.update_server_models(aggregated_server_model, aggregated_global_classifier)
         
         aggregation_time = time.time() - aggregation_start_time
         
         # 评估全局模型
-        # 选择一个tier 1的客户端进行评估
         tier1_clients = [cid for cid, resource in client_resources.items() if resource['tier'] == 1]
         if tier1_clients:
             sample_client_id = tier1_clients[0]
         else:
             sample_client_id = list(client_models.keys())[0]
             
-        # 评估全局模型 - 使用修复版本
+        # 评估全局模型
         global_model_accuracy = evaluate_global_model(
             client_models[sample_client_id], server_model, global_classifier, 
             global_test_loader, device)
@@ -1730,12 +1730,6 @@ def main():
         # 计算平均准确率
         avg_local_acc = np.mean([result.get('local_accuracy', 0) for result in eval_results.values()])
         avg_global_acc = np.mean([result.get('global_accuracy', 0) for result in eval_results.values()])
-        
-        # 打印个别客户端性能，用于调试
-        for client_id in range(min(3, args.client_number)):  # 只打印前3个客户端的数据作为样本
-            if client_id in eval_results:
-                logger.info(f"客户端 {client_id} - 本地准确率: {eval_results[client_id]['local_accuracy']:.2f}%, "
-                           f"全局准确率: {eval_results[client_id]['global_accuracy']:.2f}%")
         
         # 更新最佳准确率
         is_best = global_model_accuracy > best_accuracy
@@ -1785,12 +1779,6 @@ def main():
                                  (2 if round_idx < args.initial_phase_rounds + args.alternating_phase_rounds else 3)
             }
             
-            # 记录每个客户端的性能
-            for client_id in range(args.client_number):
-                if client_id in eval_results:
-                    metrics[f"client/{client_id}/local_accuracy"] = eval_results[client_id].get('local_accuracy', 0)
-                    metrics[f"client/{client_id}/global_accuracy"] = eval_results[client_id].get('global_accuracy', 0)
-            
             wandb.log(metrics)
         except Exception as e:
             logger.error(f"记录wandb指标失败: {str(e)}")
@@ -1824,32 +1812,17 @@ def main():
                         client.lr *= args.lr_factor * 0.8  # 精细调整阶段更激进的衰减
                     
                     logger.info(f"客户端 {client_id} 学习率更新为: {client.lr:.6f}")
-        # 每隔3轮进行一次验证
-        if (round_idx + 1) % 3 == 0:
+
+        # 每隔5轮进行一次验证
+        if (round_idx + 1) % 5 == 0:
             round_validation = validate_server_effectiveness(
                 args, 
-                client_models,  # 传递整个client_models字典
+                client_models,
                 server_model, 
                 global_classifier,
                 global_test_loader, 
                 test_data_local_dict
             )
-
-        # 每隔3轮进行一次全局分类器验证
-        if (round_idx + 1) % 3 == 0:
-            logger.info("验证全局分类器...")
-            try:
-                verifier = GlobalClassifierVerifier(
-                    server_model, 
-                    global_classifier,
-                    client_models,
-                    global_test_loader, 
-                    test_data_local_dict,
-                    device=device
-                )
-                verifier.run_all_tests()
-            except Exception as e:
-                logger.error(f"全局分类器验证失败: {str(e)}")
             
             # 记录验证结果
             try:
@@ -1857,10 +1830,10 @@ def main():
                     "round": round_idx + 1,
                     "validation/feature_quality": round_validation['feature_quality'],
                     "validation/heterogeneity_adaptation": round_validation['heterogeneity_adaptation'],
-                    "validation/identity_leakage": round_validation['identity_leakage']
+                    "validation/simple_classifier_acc": round_validation['simple_classifier_acc']
                 })
             except Exception as e:
-                logger.error(f"记录wandb指标失败: {str(e)}")
+                logger.error(f"记录wandb验证指标失败: {str(e)}")
     
     # 训练完成
     logger.info(f"TierHFL串行训练完成! 最佳准确率: {best_accuracy:.2f}%")
